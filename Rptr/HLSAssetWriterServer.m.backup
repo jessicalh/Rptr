@@ -1,0 +1,2004 @@
+//
+//  HLSAssetWriterServer.m
+//  Rptr
+//
+//  Production-ready HLS Server using AVAssetWriter with proper segment handling
+//
+
+#import "HLSAssetWriterServer.h"
+#import "HLSLogger.h"
+#import "RptrLogger.h"
+#import <UIKit/UIKit.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <signal.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+
+#define SEGMENT_DURATION 1.0  // 1 second segments for stability
+#define TARGET_DURATION 2     // Max segment duration for playlist
+#define MAX_SEGMENTS 6        // Keep 6 segments for better buffering
+#define PLAYLIST_WINDOW 3     // 3 segments in live playlist
+#define BUFFER_SIZE 8192
+
+@interface HLSClient : NSObject
+@property (nonatomic, strong) NSString *address;
+@property (nonatomic, assign) NSTimeInterval lastActivity;
+@end
+
+@implementation HLSClient
+@end
+
+@interface HLSSegmentInfo : NSObject
+@property (nonatomic, strong) NSString *filename;
+@property (nonatomic, strong) NSString *path;
+@property (nonatomic, assign) CMTime duration;
+@property (nonatomic, assign) NSInteger sequenceNumber;
+@property (nonatomic, strong) NSDate *createdAt;
+@property (nonatomic, assign) NSUInteger fileSize;
+@end
+
+@implementation HLSSegmentInfo
+@end
+
+@interface HLSAssetWriterServer () <NSStreamDelegate>
+
+// HTTP Server
+@property (nonatomic, strong) dispatch_queue_t serverQueue;
+@property (nonatomic, assign) int serverSocket;
+@property (nonatomic, assign) BOOL running;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, HLSClient *> *clients;
+@property (nonatomic, strong) NSLock *clientsLock;
+
+// Asset Writer
+@property (nonatomic, strong) dispatch_queue_t writerQueue;
+@property (nonatomic, strong) AVAssetWriter *assetWriter;
+@property (nonatomic, strong) AVAssetWriterInput *videoInput;
+@property (nonatomic, strong) AVAssetWriterInput *audioInput;
+@property (nonatomic, assign) BOOL isWriting;
+@property (nonatomic, assign) BOOL sessionStarted;
+
+// Segment Management
+@property (nonatomic, strong) NSString *baseDirectory;
+@property (nonatomic, strong) NSString *segmentDirectory;
+@property (nonatomic, strong) NSMutableArray<HLSSegmentInfo *> *segments;
+@property (nonatomic, strong) NSString *initializationSegmentPath;
+@property (nonatomic, assign) NSInteger currentSegmentIndex;
+@property (nonatomic, assign) NSInteger mediaSequenceNumber;
+
+// Delegate-based segment data storage
+@property (nonatomic, strong) NSData *initializationSegmentData;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSData *> *segmentData;
+@property (nonatomic, strong) NSLock *segmentDataLock;
+@property (nonatomic, strong) NSLock *segmentsLock;
+
+// Timing
+@property (nonatomic, assign) CMTime nextSegmentBoundary;
+@property (nonatomic, assign) CMTime sessionStartTime;
+@property (nonatomic, strong) NSTimer *segmentTimer;
+@property (nonatomic, assign) BOOL waitingForKeyFrame;
+@property (nonatomic, strong) NSDate *currentSegmentStartTime;
+@property (nonatomic, assign) BOOL forceSegmentRotation;
+
+// File Monitoring
+@property (nonatomic, strong) dispatch_source_t fileMonitorSource;
+@property (nonatomic, assign) NSUInteger lastFileSize;
+@property (nonatomic, strong) NSFileHandle *currentFileHandle;
+
+// Performance
+@property (nonatomic, assign) NSInteger framesProcessed;
+@property (nonatomic, assign) NSInteger framesDropped;
+@property (nonatomic, strong) NSDate *streamStartTime;
+
+// Client tracking
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *activeClients;
+@property (nonatomic, strong) NSTimer *clientCleanupTimer;
+
+@end
+
+@implementation HLSAssetWriterServer
+
+- (instancetype)initWithPort:(NSUInteger)port {
+    self = [super init];
+    if (self) {
+        // Set logging level to DEBUG by default
+        [HLSLogger setLogLevel:HLSLogLevelDebug];
+        
+        _port = port ?: 8080;
+        _serverQueue = dispatch_queue_create("com.rptr.hls.server", DISPATCH_QUEUE_SERIAL);
+        _writerQueue = dispatch_queue_create("com.rptr.hls.writer", DISPATCH_QUEUE_SERIAL);
+        _clients = [NSMutableDictionary dictionary];
+        _clientsLock = [[NSLock alloc] init];
+        _segments = [NSMutableArray array];
+        _segmentData = [NSMutableDictionary dictionary];
+        _segmentDataLock = [[NSLock alloc] init];
+        _segmentsLock = [[NSLock alloc] init];
+        _currentSegmentIndex = 0;
+        _mediaSequenceNumber = 0;
+        _waitingForKeyFrame = YES;
+        _sessionStartTime = kCMTimeInvalid;
+        _nextSegmentBoundary = kCMTimeZero;
+        _sessionStarted = NO;
+        _activeClients = [NSMutableDictionary dictionary];
+        
+        // Setup directories
+        [self setupDirectories];
+    }
+    return self;
+}
+
+- (void)setupDirectories {
+    NSString *tempDir = NSTemporaryDirectory();
+    self.baseDirectory = [tempDir stringByAppendingPathComponent:@"HLSStream"];
+    self.segmentDirectory = [self.baseDirectory stringByAppendingPathComponent:@"segments"];
+    
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *error;
+    
+    // Clean up old directory if exists
+    if ([fm fileExistsAtPath:self.baseDirectory]) {
+        [fm removeItemAtPath:self.baseDirectory error:nil];
+    }
+    
+    // Create fresh directories
+    [fm createDirectoryAtPath:self.segmentDirectory
+  withIntermediateDirectories:YES
+                   attributes:nil
+                        error:&error];
+    
+    if (error) {
+        NSLog(@"[HLS] Failed to create directories: %@", error);
+    }
+}
+
+#pragma mark - Server Control
+
+- (BOOL)startServer:(NSError * __autoreleasing *)error {
+    __block BOOL success = YES;
+    __block NSError *blockError = nil;
+    
+    // Ignore SIGPIPE globally
+    signal(SIGPIPE, SIG_IGN);
+    NSLog(@"[HLS] SIGPIPE handler installed");
+    
+    dispatch_sync(self.serverQueue, ^{
+        if (self.running) {
+            return;
+        }
+        
+        // Create socket
+        self.serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+        if (self.serverSocket < 0) {
+            blockError = [NSError errorWithDomain:@"HLSServer" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Failed to create socket"}];
+            success = NO;
+            return;
+        }
+        
+        // Allow socket reuse
+        int yes = 1;
+        setsockopt(self.serverSocket, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        
+        // Bind to port
+        struct sockaddr_in serverAddr;
+        memset(&serverAddr, 0, sizeof(serverAddr));
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons((uint16_t)self.port);
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+        
+        if (bind(self.serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0) {
+            close(self.serverSocket);
+            blockError = [NSError errorWithDomain:@"HLSServer" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Failed to bind socket"}];
+            success = NO;
+            return;
+        }
+        
+        // Start listening
+        if (listen(self.serverSocket, 10) < 0) {
+            close(self.serverSocket);
+            blockError = [NSError errorWithDomain:@"HLSServer" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Failed to listen"}];
+            success = NO;
+            return;
+        }
+        
+        self.running = YES;
+        
+        // Start accept loop
+        dispatch_async(self.serverQueue, ^{
+            [self acceptLoop];
+        });
+        
+        // Setup asset writer
+        NSLog(@"[HLS] About to call setupAssetWriter...");
+        [self setupAssetWriter];
+        NSLog(@"[HLS] setupAssetWriter called");
+        
+        // Create initial empty playlist
+        [self createInitialPlaylist];
+        
+        // Start client cleanup timer on main thread
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.clientCleanupTimer = [NSTimer scheduledTimerWithTimeInterval:5.0 
+                                                                        target:self 
+                                                                      selector:@selector(cleanupInactiveClients) 
+                                                                      userInfo:nil 
+                                                                       repeats:YES];
+        });
+        
+        NSLog(@"[HLS] Server started on port %lu", (unsigned long)self.port);
+        
+        if ([self.delegate respondsToSelector:@selector(hlsServerDidStart:)]) {
+            NSString *url = [NSString stringWithFormat:@"http://localhost:%lu/playlist.m3u8", (unsigned long)self.port];
+            [self.delegate hlsServerDidStart:url];
+        }
+    });
+    
+    if (!success && error) {
+        *error = blockError;
+    }
+    
+    return success;
+}
+
+- (void)stopServer {
+    dispatch_sync(self.serverQueue, ^{
+        if (!self.running) {
+            return;
+        }
+        
+        self.running = NO;
+        
+        // Stop client cleanup timer
+        [self.clientCleanupTimer invalidate];
+        self.clientCleanupTimer = nil;
+        
+        // Stop writer
+        [self stopAssetWriter];
+        
+        // Stop segment timer
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self stopSegmentTimer];
+        });
+        
+        // Close server socket
+        if (self.serverSocket >= 0) {
+            close(self.serverSocket);
+            self.serverSocket = -1;
+        }
+        
+        // Disconnect all clients
+        [self.clientsLock lock];
+        for (NSNumber *socketNum in self.clients.allKeys) {
+            close(socketNum.intValue);
+        }
+        [self.clients removeAllObjects];
+        [self.activeClients removeAllObjects];
+        [self.clientsLock unlock];
+        
+        // Clean up segments
+        [self cleanupAllSegments];
+        
+        NSLog(@"[HLS] Server stopped");
+        
+        if ([self.delegate respondsToSelector:@selector(hlsServerDidStop)]) {
+            [self.delegate hlsServerDidStop];
+        }
+    });
+}
+
+#pragma mark - Asset Writer Setup
+
+- (AVMetadataItem *)metadataItemWithKey:(NSString *)key value:(NSString *)value {
+    AVMutableMetadataItem *item = [AVMutableMetadataItem metadataItem];
+    item.key = key;
+    item.keySpace = AVMetadataKeySpaceCommon;
+    item.value = value;
+    return item;
+}
+
+- (void)setupAssetWriter {
+    NSLog(@"[HLS] setupAssetWriter: Starting...");
+    dispatch_async(self.writerQueue, ^{
+        NSLog(@"[HLS] setupAssetWriter: Inside async block");
+        NSError *error;
+        
+        // Create a new segment file
+        NSString *segmentName = [NSString stringWithFormat:@"segment_%03ld.mp4", (long)self.currentSegmentIndex];
+        NSString *segmentPath = [self.segmentDirectory stringByAppendingPathComponent:segmentName];
+        NSURL *segmentURL = [NSURL fileURLWithPath:segmentPath];
+        
+        // Remove existing file
+        [[NSFileManager defaultManager] removeItemAtURL:segmentURL error:nil];
+        
+        // Create asset writer with delegate-based fMP4 for HLS
+        [HLSLogger logInfo:@"Creating delegate-based asset writer for HLS fMP4"];
+        
+        // Use contentType for delegate-based delivery (iOS 14+)
+        if (@available(iOS 14.0, *)) {
+            self.assetWriter = [[AVAssetWriter alloc] initWithContentType:UTTypeMPEG4Movie];
+            if (self.assetWriter) {
+                // Set Apple HLS profile for proper fMP4 output
+                self.assetWriter.outputFileTypeProfile = AVFileTypeProfileMPEG4AppleHLS;
+                self.assetWriter.delegate = self;
+                // Set required initialSegmentStartTime for delegate-based output
+                self.assetWriter.initialSegmentStartTime = kCMTimeZero;
+                [HLSLogger logInfo:@"Using delegate-based fMP4 approach with Apple HLS profile"];
+                [HLSLogger logDebug:@"Delegate set: %@", self.assetWriter.delegate ? @"YES" : @"NO"];
+            } else {
+                [HLSLogger logError:@"Failed to create AVAssetWriter with contentType"];
+            }
+        } else {
+            // Fallback for older iOS versions
+            self.assetWriter = [[AVAssetWriter alloc] initWithURL:segmentURL fileType:AVFileTypeMPEG4 error:&error];
+        }
+        if (error) {
+            NSLog(@"[HLS] Failed to create asset writer: %@", error);
+            return;
+        }
+        NSLog(@"[HLS] Asset writer created successfully, status: %ld", (long)self.assetWriter.status);
+        
+        // Configure for HLS with fragmented MP4
+        self.assetWriter.shouldOptimizeForNetworkUse = YES;
+        
+        // Set metadata for better streaming
+        NSArray *metadata = @[
+            [self metadataItemWithKey:AVMetadataCommonKeyTitle value:@"HLS Live Stream"],
+            [self metadataItemWithKey:AVMetadataCommonKeyCreator value:@"Rptr"]
+        ];
+        self.assetWriter.metadata = metadata;
+        
+        // Configure for delegate-based fMP4 HLS output
+        if (@available(iOS 14.0, *)) {
+            // Set segment duration for HLS with proper precision
+            self.assetWriter.preferredOutputSegmentInterval = CMTimeMakeWithSeconds(SEGMENT_DURATION, 1000);
+            NSLog(@"[HLS] Set preferredOutputSegmentInterval to %f seconds", SEGMENT_DURATION);
+        } else {
+            // Fallback: use movieFragmentInterval for older iOS
+            self.assetWriter.movieFragmentInterval = CMTimeMakeWithSeconds(0.2, 1000);
+        }
+        
+        // Video settings - optimized for mobile streaming with VBR
+        NSDictionary *videoSettings = @{
+            AVVideoCodecKey: AVVideoCodecTypeH264,
+            AVVideoWidthKey: @(1280),
+            AVVideoHeightKey: @(720),
+            AVVideoCompressionPropertiesKey: @{
+                AVVideoAverageBitRateKey: @(3500000),               // 3.5 Mbps - optimized for 30fps quality
+                AVVideoMaxKeyFrameIntervalKey: @(30),               // 1 second at 30fps
+                AVVideoMaxKeyFrameIntervalDurationKey: @(1.0),      // 1-second keyframe interval
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,  // High profile for better quality
+                AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCABAC,       // CABAC for better compression
+                AVVideoAllowFrameReorderingKey: @(NO),             // Disable B-frames for compatibility
+                AVVideoExpectedSourceFrameRateKey: @(30),          // Expected frame rate
+                AVVideoAverageNonDroppableFrameRateKey: @(30),     // Maintain consistent frame rate
+                // Quality hint for encoder (0.0-1.0, higher is better)
+                AVVideoQualityKey: @(0.85)
+            }
+        };
+        
+        self.videoInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:videoSettings];
+        if (!self.videoInput) {
+            [HLSLogger logError:@"Failed to create video input!"];
+            return;
+        }
+        
+        // Apply orientation transform to match preview layer orientation
+        self.videoInput.transform = [self videoTransformForCurrentOrientation];
+        self.videoInput.expectsMediaDataInRealTime = YES;
+        [HLSLogger logDebug:@"Created video input: %@", self.videoInput];
+        
+        if ([self.assetWriter canAddInput:self.videoInput]) {
+            [self.assetWriter addInput:self.videoInput];
+            [HLSLogger logDebug:@"Added video input to asset writer"];
+        } else {
+            [HLSLogger logError:@"Cannot add video input to asset writer!"];
+            return;
+        }
+        
+        // Audio settings - high quality AAC
+        NSDictionary *audioSettings = @{
+            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
+            AVNumberOfChannelsKey: @(2),
+            AVSampleRateKey: @(48000),    // 48kHz for better quality
+            AVEncoderBitRateKey: @(192000) // 192 kbps for better audio
+        };
+        
+        self.audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:audioSettings];
+        self.audioInput.expectsMediaDataInRealTime = YES;
+        [HLSLogger logDebug:@"Created audio input: %@", self.audioInput];
+        
+        // Add audio input to asset writer
+        if ([self.assetWriter canAddInput:self.audioInput]) {
+            [self.assetWriter addInput:self.audioInput];
+            [HLSLogger logDebug:@"Added audio input to asset writer"];
+        } else {
+            [HLSLogger logError:@"Cannot add audio input to asset writer!"];
+            return;  // Fail if we can't add audio input
+        }
+        
+        // Start writing
+        if ([self.assetWriter startWriting]) {
+            self.waitingForKeyFrame = YES;
+            self.sessionStarted = NO;  // Reset session flag for new writer
+            [self startFileMonitoring:segmentURL];
+            NSLog(@"[HLS] Asset writer started for segment %ld", (long)self.currentSegmentIndex);
+            NSLog(@"[HLS] Writer status after startWriting: %ld", (long)self.assetWriter.status);
+            // Don't set isWriting yet - wait for first frame to start session
+        } else {
+            NSLog(@"[HLS] Failed to start writing: %@", self.assetWriter.error);
+            NSLog(@"[HLS] Writer status: %ld", (long)self.assetWriter.status);
+            
+            // Notify delegate of error
+            if ([self.delegate respondsToSelector:@selector(hlsServer:didEncounterError:)]) {
+                NSError *error = self.assetWriter.error ?: [NSError errorWithDomain:@"HLSServer" 
+                                                                               code:100 
+                                                                           userInfo:@{NSLocalizedDescriptionKey: @"Failed to start AVAssetWriter"}];
+                [self.delegate hlsServer:self didEncounterError:error];
+            }
+        }
+    });
+}
+
+- (void)stopAssetWriter {
+    dispatch_async(self.writerQueue, ^{
+        if (!self.isWriting) {
+            return;
+        }
+        
+        self.isWriting = NO;
+        self.sessionStarted = NO;
+        [self stopFileMonitoring];
+        
+        // Only mark as finished if writer is in correct state
+        if (self.assetWriter && self.assetWriter.status == AVAssetWriterStatusWriting) {
+            if (self.videoInput && self.videoInput.readyForMoreMediaData) {
+                [self.videoInput markAsFinished];
+            }
+            if (self.audioInput && self.audioInput.readyForMoreMediaData) {
+                [self.audioInput markAsFinished];
+            }
+            
+            __weak typeof(self) weakSelf = self;
+            [self.assetWriter finishWritingWithCompletionHandler:^{
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (strongSelf) {
+                    NSLog(@"[HLS] Finished writing segment");
+                    [strongSelf finalizeCurrentSegment];
+                }
+            }];
+        } else {
+            NSLog(@"[HLS] Writer not in correct state to stop. Status: %ld", 
+                  self.assetWriter ? (long)self.assetWriter.status : -1);
+        }
+    });
+}
+
+#pragma mark - Device Orientation Support
+
+- (CGAffineTransform)videoTransformForCurrentOrientation {
+    UIDeviceOrientation orientation = [[UIDevice currentDevice] orientation];
+    CGAffineTransform transform = CGAffineTransformIdentity;
+    
+    // Use the same orientation mapping as ViewController for consistency
+    switch (orientation) {
+        case UIDeviceOrientationPortrait:
+            // Portrait: no additional rotation needed (preview handles this)
+            transform = CGAffineTransformIdentity;
+            [HLSLogger logDebug:@"Video orientation: Portrait"];
+            break;
+        case UIDeviceOrientationPortraitUpsideDown:
+            transform = CGAffineTransformMakeRotation(M_PI);
+            [HLSLogger logDebug:@"Video orientation: Portrait Upside Down"];
+            break;
+        case UIDeviceOrientationLandscapeLeft:
+            // LandscapeLeft device -> LandscapeRight video
+            transform = CGAffineTransformMakeRotation(M_PI_2);
+            [HLSLogger logDebug:@"Video orientation: Landscape Left"];
+            break;
+        case UIDeviceOrientationLandscapeRight:
+            // LandscapeRight device -> LandscapeLeft video  
+            transform = CGAffineTransformMakeRotation(-M_PI_2);
+            [HLSLogger logDebug:@"Video orientation: Landscape Right"];
+            break;
+        default:
+            // Default to portrait
+            transform = CGAffineTransformIdentity;
+            [HLSLogger logDebug:@"Video orientation: Unknown, defaulting to Portrait"];
+            break;
+    }
+    
+    return transform;
+}
+
+#pragma mark - Sample Buffer Processing
+
+- (void)processVideoSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    if (!sampleBuffer) {
+        return;
+    }
+    
+    // Quick state check
+    if (!self.running) {
+        NSLog(@"[HLS] Server not running, ignoring sample buffer");
+        return;
+    }
+    
+    // Validate sample buffer before retaining
+    if (!CMSampleBufferIsValid(sampleBuffer)) {
+        NSLog(@"[HLS] WARNING: Invalid sample buffer received");
+        return;
+    }
+    
+    // Retain the sample buffer for async processing
+    CFRetain(sampleBuffer);
+    
+    dispatch_async(self.writerQueue, ^{
+        // Ensure we release the buffer when done
+        @try {
+        // Validate sample buffer is still valid
+        if (!CMSampleBufferIsValid(sampleBuffer)) {
+            NSLog(@"[HLS] ERROR: Sample buffer became invalid");
+            return;
+        }
+        
+        // Check if we have a writer
+        if (!self.assetWriter) {
+            NSLog(@"[HLS] ERROR: No asset writer available!");
+            return;
+        }
+        
+        // Check if video input exists
+        if (!self.videoInput) {
+            NSLog(@"[HLS] ERROR: No video input available!");
+            return;
+        }
+        
+        // Get presentation time
+        CMTime presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        
+        // Handle first frame - start the session
+        if (!self.sessionStarted) {
+            // Check writer status
+            if (self.assetWriter.status == AVAssetWriterStatusUnknown) {
+                NSLog(@"[HLS] ERROR: Writer not started yet! Call startWriting first.");
+                return;
+            } else if (self.assetWriter.status == AVAssetWriterStatusWriting) {
+                // Writer is ready, start the session
+                NSLog(@"[HLS] First frame - starting session");
+                NSLog(@"[HLS] Asset writer status: %ld", (long)self.assetWriter.status);
+                NSLog(@"[HLS] Video input: %@", self.videoInput);
+                
+                // Initialize timing
+                self.sessionStartTime = presentationTime;
+                self.nextSegmentBoundary = presentationTime;
+                
+                // Ensure valid time
+                if (CMTIME_IS_INVALID(presentationTime)) {
+                    NSLog(@"[HLS] ERROR: Invalid presentation time!");
+                    return;
+                }
+                
+                // Start the session
+                NSLog(@"[HLS] Starting session at source time: %.2f", CMTimeGetSeconds(presentationTime));
+                [self.assetWriter startSessionAtSourceTime:presentationTime];
+                self.sessionStarted = YES;
+                self.isWriting = YES;
+                self.currentSegmentStartTime = [NSDate date];
+                NSLog(@"[HLS] Session started successfully");
+                
+                // Start segment timer as backup
+                [self startSegmentTimer];
+            } else {
+                NSLog(@"[HLS] ERROR: Writer in unexpected state: %ld", (long)self.assetWriter.status);
+                if (self.assetWriter.error) {
+                    NSLog(@"[HLS] Writer error: %@", self.assetWriter.error);
+                }
+                return;
+            }
+        }
+        
+        // Check writer status
+        if (self.assetWriter.status == AVAssetWriterStatusFailed) {
+            NSLog(@"[HLS] Writer failed with error: %@", self.assetWriter.error);
+            self.isWriting = NO;
+            return;
+        }
+        
+        if (self.assetWriter.status != AVAssetWriterStatusWriting) {
+            NSLog(@"[HLS] Writer not ready, status: %ld", (long)self.assetWriter.status);
+            return;
+        }
+        
+        // Check if we need to start a new segment
+        CMTime timeSinceSegmentStart = CMTimeSubtract(presentationTime, self.nextSegmentBoundary);
+        double secondsSinceSegmentStart = CMTimeGetSeconds(timeSinceSegmentStart);
+        
+        if (secondsSinceSegmentStart >= SEGMENT_DURATION || self.forceSegmentRotation) {
+            if (self.forceSegmentRotation) {
+                NSLog(@"[HLS] Forced segment rotation requested");
+            } else {
+                NSLog(@"[HLS] Time for new segment: %.2f seconds since start", secondsSinceSegmentStart);
+            }
+            
+            // Check if this is a key frame
+            CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
+            BOOL isKeyFrame = NO;
+            
+            if (attachments && CFArrayGetCount(attachments) > 0) {
+                CFDictionaryRef attachment = CFArrayGetValueAtIndex(attachments, 0);
+                CFBooleanRef notSync = CFDictionaryGetValue(attachment, kCMSampleAttachmentKey_NotSync);
+                isKeyFrame = (notSync == NULL) || !CFBooleanGetValue(notSync);
+                
+                if (!isKeyFrame && self.framesProcessed % 30 == 0) {
+                    RLogDebug(@"Frame %ld is NOT a key frame", (long)self.framesProcessed);
+                }
+            } else {
+                NSLog(@"[HLS-KEYFRAME] No attachments on sample buffer");
+            }
+            
+            if (isKeyFrame) {
+                NSLog(@"[HLS] Key frame detected, rotating segment at %.2f", CMTimeGetSeconds(presentationTime));
+                self.forceSegmentRotation = NO;
+                [self rotateSegment];
+                return; // Skip this frame, it will be written to the new segment
+            } else if (self.forceSegmentRotation && secondsSinceSegmentStart >= SEGMENT_DURATION + 0.5) {
+                // Force rotation if we've waited a bit for key frame
+                NSLog(@"[HLS] WARNING: Forcing segment rotation after %.2f seconds without key frame", secondsSinceSegmentStart);
+                self.forceSegmentRotation = NO;
+                [self rotateSegment];
+                return;
+            } else {
+                NSLog(@"[HLS] Waiting for key frame to rotate segment (%.2f seconds elapsed)...", secondsSinceSegmentStart);
+            }
+        }
+        
+        // Comprehensive null checks before appending
+        if (!self.videoInput) {
+            NSLog(@"[HLS] ERROR: videoInput is nil!");
+            return;
+        }
+        
+        if (!sampleBuffer) {
+            NSLog(@"[HLS] ERROR: sampleBuffer is nil!");
+            return;
+        }
+        
+        // Verify sample buffer is valid
+        if (!CMSampleBufferIsValid(sampleBuffer)) {
+            NSLog(@"[HLS] ERROR: sampleBuffer is invalid!");
+            return;
+        }
+        
+        // Check if input is ready
+        if (self.videoInput.isReadyForMoreMediaData) {
+            NSLog(@"[HLS] About to append sample buffer - videoInput: %@, sampleBuffer: %p", 
+                  self.videoInput, sampleBuffer);
+            
+            @try {
+                // Final validation before append
+                if (!CMSampleBufferIsValid(sampleBuffer)) {
+                    NSLog(@"[HLS] ERROR: Sample buffer invalid before append");
+                    return;
+                }
+                
+                BOOL success = [self.videoInput appendSampleBuffer:sampleBuffer];
+                if (success) {
+                    self.framesProcessed++;
+                    if (self.framesProcessed == 1) {
+                        RLogHLS(@"Successfully appended first frame!");
+                    } else if (self.framesProcessed % 30 == 0) {
+                        RLogDebug(@"Processed %ld frames", (long)self.framesProcessed);
+                    }
+                } else {
+                    NSLog(@"[HLS] Failed to append sample buffer");
+                    NSLog(@"[HLS] Writer status: %ld", (long)self.assetWriter.status);
+                    NSLog(@"[HLS] Writer error: %@", self.assetWriter.error);
+                    NSLog(@"[HLS] Video input readyForMoreMediaData: %@", self.videoInput.readyForMoreMediaData ? @"YES" : @"NO");
+                    self.framesDropped++;
+                    
+                    // Check if writer failed
+                    if (self.assetWriter.status == AVAssetWriterStatusFailed) {
+                        NSLog(@"[HLS] Writer failed with error: %@", self.assetWriter.error);
+                        NSLog(@"[HLS] Error code: %ld", (long)self.assetWriter.error.code);
+                        NSLog(@"[HLS] Error domain: %@", self.assetWriter.error.domain);
+                        self.isWriting = NO;
+                        
+                        // Try to restart writer
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), self.writerQueue, ^{
+                            NSLog(@"[HLS] Attempting to restart writer...");
+                            self.currentSegmentIndex++;
+                            [self setupAssetWriter];
+                        });
+                    }
+                }
+            } @catch (NSException *exception) {
+                NSLog(@"[HLS] EXCEPTION appending sample buffer: %@", exception);
+                NSLog(@"[HLS] Exception reason: %@", exception.reason);
+                NSLog(@"[HLS] Stack trace: %@", exception.callStackSymbols);
+                self.framesDropped++;
+            }
+        } else {
+            NSLog(@"[HLS] Video input not ready for more data");
+            self.framesDropped++;
+        }
+        } @finally {
+            // Always release the sample buffer
+            if (sampleBuffer) {
+                CFRelease(sampleBuffer);
+            }
+        }
+    });
+}
+
+- (void)processAudioSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    if (!sampleBuffer) {
+        return;
+    }
+    
+    // Quick state check
+    if (!self.running || !self.sessionStarted) {
+        return;
+    }
+    
+    // Validate sample buffer before retaining
+    if (!CMSampleBufferIsValid(sampleBuffer)) {
+        NSLog(@"[HLS] WARNING: Invalid audio sample buffer received");
+        return;
+    }
+    
+    // Retain the sample buffer for async processing  
+    CFRetain(sampleBuffer);
+    
+    dispatch_async(self.writerQueue, ^{
+        @try {
+            // Check if we have audio input
+            if (!self.audioInput) {
+                return;
+            }
+            
+            // Check if audio input is ready
+            if (self.audioInput.isReadyForMoreMediaData) {
+                BOOL success = [self.audioInput appendSampleBuffer:sampleBuffer];
+                if (!success) {
+                    [HLSLogger logDebug:@"Failed to append audio sample buffer"];
+                }
+            }
+        } @finally {
+            // Always release the sample buffer
+            if (sampleBuffer) {
+                CFRelease(sampleBuffer);
+            }
+        }
+    });
+}
+
+- (void)rotateSegment {
+    dispatch_async(self.writerQueue, ^{
+        NSLog(@"[HLS] Rotating segment...");
+        
+        // Check if we can safely finish the current writer
+        if (!self.assetWriter) {
+            NSLog(@"[HLS] ERROR: No writer to rotate");
+            return;
+        }
+        
+        if (self.assetWriter.status != AVAssetWriterStatusWriting) {
+            NSLog(@"[HLS] ERROR: Writer not in writing state, cannot rotate. Status: %ld", (long)self.assetWriter.status);
+            return;
+        }
+        
+        // Stop current writer
+        if (self.videoInput && self.videoInput.readyForMoreMediaData) {
+            [self.videoInput markAsFinished];
+        }
+        if (self.audioInput && self.audioInput.readyForMoreMediaData) {
+            [self.audioInput markAsFinished];
+        }
+        
+        __weak typeof(self) weakSelf = self;
+        [self.assetWriter finishWritingWithCompletionHandler:^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            
+            dispatch_async(strongSelf.writerQueue, ^{
+                // Finalize the completed segment
+                [strongSelf finalizeCurrentSegment];
+                
+                // Update segment boundary
+                strongSelf.nextSegmentBoundary = CMTimeAdd(strongSelf.nextSegmentBoundary, CMTimeMake(SEGMENT_DURATION, 1));
+                
+                // Start new segment
+                strongSelf.currentSegmentIndex++;
+                strongSelf.currentSegmentStartTime = [NSDate date];
+                [strongSelf setupAssetWriter];
+            });
+        }];
+    });
+}
+
+- (void)finalizeCurrentSegment {
+    NSLog(@"[HLS-SEGMENT] Finalizing current segment...");
+    
+    if (!self.assetWriter) {
+        NSLog(@"[HLS-SEGMENT] ERROR: No asset writer to finalize");
+        return;
+    }
+    
+    if (self.assetWriter.status != AVAssetWriterStatusCompleted) {
+        NSLog(@"[HLS-SEGMENT] ERROR: Writer not completed, status: %ld", (long)self.assetWriter.status);
+        return;
+    }
+    
+    // Get segment info
+    NSURL *segmentURL = self.assetWriter.outputURL;
+    NSString *segmentPath = segmentURL.path;
+    NSLog(@"[HLS-SEGMENT] Segment path: %@", segmentPath);
+    
+    // Get file size
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:segmentPath error:nil];
+    NSUInteger fileSize = [attrs fileSize];
+    
+    if (fileSize > 0) {
+        // Calculate actual duration based on writer session
+        CMTime duration = CMTimeMake(SEGMENT_DURATION * 1000, 1000); // More precise timing
+        
+        // Create segment info
+        HLSSegmentInfo *segmentInfo = [[HLSSegmentInfo alloc] init];
+        segmentInfo.filename = segmentURL.lastPathComponent;
+        segmentInfo.path = segmentPath;
+        segmentInfo.duration = duration;
+        segmentInfo.sequenceNumber = self.mediaSequenceNumber++;
+        segmentInfo.createdAt = [NSDate date];
+        segmentInfo.fileSize = fileSize;
+        
+        // Add to segments array
+        [self.segments addObject:segmentInfo];
+        
+        // Remove old segments
+        [self cleanupOldSegments];
+        
+        // Update playlist
+        [self updatePlaylist];
+        
+        NSLog(@"[HLS] Finalized segment %@ (%.2fs, %lu bytes)", 
+              segmentInfo.filename, 
+              CMTimeGetSeconds(segmentInfo.duration),
+              (unsigned long)fileSize);
+        
+        // Verify the file is actually accessible
+        if ([[NSFileManager defaultManager] fileExistsAtPath:segmentPath]) {
+            NSLog(@"[HLS-SEGMENT] Verified segment file exists at: %@", segmentPath);
+        } else {
+            NSLog(@"[HLS-SEGMENT] ERROR: Segment file missing at: %@", segmentPath);
+        }
+    } else {
+        NSLog(@"[HLS] Failed to finalize segment: empty file");
+    }
+    
+    // Clear the writer reference
+    self.assetWriter = nil;
+}
+
+#pragma mark - File Monitoring
+
+- (void)startFileMonitoring:(NSURL *)fileURL {
+    [self stopFileMonitoring];
+    
+    int fd = open(fileURL.path.UTF8String, O_EVTONLY);
+    if (fd < 0) {
+        return;
+    }
+    
+    self.fileMonitorSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE, fd,
+                                                    DISPATCH_VNODE_WRITE | DISPATCH_VNODE_EXTEND,
+                                                    self.writerQueue);
+    
+    dispatch_source_set_event_handler(self.fileMonitorSource, ^{
+        // File has been modified
+        [self checkForNewSegmentData:fileURL];
+    });
+    
+    dispatch_source_set_cancel_handler(self.fileMonitorSource, ^{
+        close(fd);
+    });
+    
+    dispatch_resume(self.fileMonitorSource);
+}
+
+- (void)stopFileMonitoring {
+    if (self.fileMonitorSource) {
+        dispatch_source_cancel(self.fileMonitorSource);
+        self.fileMonitorSource = nil;
+    }
+}
+
+- (void)checkForNewSegmentData:(NSURL *)fileURL {
+    // This method can be used to monitor fragmented MP4 atom creation
+    // For now, we rely on segment rotation timing
+}
+
+#pragma mark - Segment Timer
+
+- (void)startSegmentTimer {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self stopSegmentTimer];
+        // Fire timer slightly before segment duration to ensure timely rotation
+        self.segmentTimer = [NSTimer scheduledTimerWithTimeInterval:SEGMENT_DURATION - 0.05
+                                                              target:self
+                                                            selector:@selector(segmentTimerFired:)
+                                                            userInfo:nil
+                                                             repeats:YES];
+        NSLog(@"[HLS-TIMER] Started segment rotation timer (interval: %.1f)", SEGMENT_DURATION - 0.1);
+    });
+}
+
+- (void)stopSegmentTimer {
+    if (self.segmentTimer) {
+        [self.segmentTimer invalidate];
+        self.segmentTimer = nil;
+        NSLog(@"[HLS-TIMER] Stopped segment rotation timer");
+    }
+}
+
+- (void)segmentTimerFired:(NSTimer *)timer {
+    dispatch_async(self.writerQueue, ^{
+        if (!self.isWriting || !self.sessionStarted) {
+            return;
+        }
+        
+        // Check writer state
+        if (!self.assetWriter || self.assetWriter.status != AVAssetWriterStatusWriting) {
+            NSLog(@"[HLS-TIMER] Writer not ready for rotation, status: %ld", 
+                  self.assetWriter ? (long)self.assetWriter.status : -1);
+            return;
+        }
+        
+        NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime];
+        NSLog(@"[HLS-TIMER] Segment timer fired, elapsed: %.2f seconds", elapsed);
+        
+        if (elapsed >= SEGMENT_DURATION - 0.1) {
+            NSLog(@"[HLS-TIMER] Forcing segment rotation (elapsed: %.2f)", elapsed);
+            self.forceSegmentRotation = YES;
+        }
+    });
+}
+
+#pragma mark - Playlist Management
+
+- (void)createInitialPlaylist {
+    NSLog(@"[HLS-PLAYLIST] Creating initial playlist...");
+    
+    NSString *playlist = [NSString stringWithFormat:@"#EXTM3U\n"
+                        @"#EXT-X-VERSION:7\n"  // Version 7 for fMP4
+                        @"#EXT-X-TARGETDURATION:%d\n"
+                        @"#EXT-X-MEDIA-SEQUENCE:0\n", TARGET_DURATION];
+    
+    NSString *playlistPath = [self.baseDirectory stringByAppendingPathComponent:@"playlist.m3u8"];
+    NSError *error;
+    [playlist writeToFile:playlistPath atomically:YES encoding:NSUTF8StringEncoding error:&error];
+    
+    if (error) {
+        NSLog(@"[HLS-PLAYLIST] Failed to create initial playlist: %@", error);
+    } else {
+        NSLog(@"[HLS-PLAYLIST] Initial playlist created at: %@", playlistPath);
+    }
+}
+
+- (void)updatePlaylist {
+    dispatch_async(self.writerQueue, ^{
+        NSLog(@"[HLS-PLAYLIST] Updating playlist...");
+        [self.segmentsLock lock];
+        NSUInteger segmentCount = self.segments.count;
+        NSLog(@"[HLS-PLAYLIST] Total segments available: %lu", (unsigned long)segmentCount);
+        
+        NSMutableString *playlist = [NSMutableString string];
+        
+        // Header with low-latency HLS tags
+        [playlist appendString:@"#EXTM3U\n"];
+        [playlist appendString:@"#EXT-X-VERSION:7\n"]; // Version 7 for fMP4
+        [playlist appendFormat:@"#EXT-X-TARGETDURATION:%d\n", TARGET_DURATION];
+        [playlist appendString:@"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=6.0\n"]; // Allow skipping old segments
+        [playlist appendString:@"#EXT-X-PART-INF:PART-TARGET=0.5\n"]; // Support for partial segments
+        
+        // Calculate starting sequence number for sliding window
+        NSInteger startIndex = MAX(0, (NSInteger)segmentCount - PLAYLIST_WINDOW);
+        NSInteger startSequence = (startIndex > 0 && segmentCount > startIndex) ? self.segments[startIndex].sequenceNumber : 0;
+        
+        [playlist appendFormat:@"#EXT-X-MEDIA-SEQUENCE:%ld\n", (long)startSequence];
+        
+        // Add initialization segment for fMP4
+        if (self.initializationSegmentData) {
+            [playlist appendString:@"#EXT-X-MAP:URI=\"init.mp4\"\n"];
+        }
+        
+        // Add segments (sliding window)
+        NSLog(@"[HLS-PLAYLIST] Adding segments from index %ld to %lu", (long)startIndex, (unsigned long)segmentCount);
+        for (NSInteger i = startIndex; i < segmentCount; i++) {
+            HLSSegmentInfo *segment = self.segments[i];
+            CGFloat duration = CMTimeGetSeconds(segment.duration);
+            [playlist appendFormat:@"#EXTINF:%.3f,\n", duration];
+            [playlist appendFormat:@"%@\n", segment.filename];
+            NSLog(@"[HLS-PLAYLIST] Added segment: %@ (%.2fs) -> URL: segments/%@", segment.filename, duration, segment.filename);
+        }
+        
+        // For live streams, don't add EXT-X-ENDLIST
+        
+        // Write playlist to file
+        NSString *playlistPath = [self.baseDirectory stringByAppendingPathComponent:@"playlist.m3u8"];
+        NSLog(@"[HLS-PLAYLIST] Writing playlist to: %@", playlistPath);
+        
+        NSError *error;
+        [playlist writeToFile:playlistPath atomically:YES encoding:NSUTF8StringEncoding error:&error];
+        
+        if (error) {
+            NSLog(@"[HLS] Failed to write playlist: %@", error);
+        } else {
+            NSLog(@"[HLS] Updated playlist with %ld segments", (long)(segmentCount - startIndex));
+            NSLog(@"[HLS-PLAYLIST] Playlist content:\n%@", playlist);
+        }
+        
+        [self.segmentsLock unlock];
+    });
+}
+
+- (void)cleanupOldSegments {
+    [self.segmentsLock lock];
+    while (self.segments.count > MAX_SEGMENTS) {
+        HLSSegmentInfo *oldSegment = self.segments.firstObject;
+        
+        // Delete the file
+        [[NSFileManager defaultManager] removeItemAtPath:oldSegment.path error:nil];
+        
+        // Remove from array
+        [self.segments removeObjectAtIndex:0];
+        
+        NSLog(@"[HLS] Removed old segment: %@", oldSegment.filename);
+    }
+    [self.segmentsLock unlock];
+}
+
+- (void)cleanupAllSegments {
+    [self.segmentsLock lock];
+    // Remove all segment files
+    for (HLSSegmentInfo *segment in self.segments) {
+        [[NSFileManager defaultManager] removeItemAtPath:segment.path error:nil];
+    }
+    [self.segments removeAllObjects];
+    [self.segmentsLock unlock];
+    
+    // Remove directories
+    [[NSFileManager defaultManager] removeItemAtPath:self.baseDirectory error:nil];
+}
+
+#pragma mark - HTTP Server
+
+- (void)acceptLoop {
+    while (self.running) {
+        struct sockaddr_in clientAddr;
+        socklen_t clientLen = sizeof(clientAddr);
+        
+        int clientSocket = accept(self.serverSocket, (struct sockaddr *)&clientAddr, &clientLen);
+        if (clientSocket < 0) {
+            if (self.running) {
+                NSLog(@"[HLS] Accept failed");
+            }
+            continue;
+        }
+        
+        // Copy client address for async use
+        struct sockaddr_in *clientAddrCopy = malloc(sizeof(struct sockaddr_in));
+        if (!clientAddrCopy) {
+            NSLog(@"[HLS] ERROR: Failed to allocate memory for client address");
+            close(clientSocket);
+            continue;
+        }
+        memcpy(clientAddrCopy, &clientAddr, sizeof(struct sockaddr_in));
+        
+        // Handle client in background
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            @try {
+                [self handleClient:clientSocket address:clientAddrCopy];
+            } @catch (NSException *exception) {
+                NSLog(@"[HLS] ERROR: Exception handling client: %@", exception);
+                NSLog(@"[HLS] Stack trace: %@", exception.callStackSymbols);
+            } @finally {
+                free(clientAddrCopy);
+            }
+        });
+    }
+}
+
+- (void)handleClient:(int)clientSocket address:(const struct sockaddr_in *)clientAddr {
+    NSLog(@"[HLS-CLIENT] 1. handleClient started for socket: %d", clientSocket);
+    
+    // Use inet_ntop for thread safety
+    char clientIP[INET_ADDRSTRLEN];
+    NSString *clientAddress = @"unknown";
+    
+    if (inet_ntop(AF_INET, &(clientAddr->sin_addr), clientIP, INET_ADDRSTRLEN) != NULL) {
+        clientAddress = [NSString stringWithUTF8String:clientIP];
+    } else {
+        NSLog(@"[HLS] WARNING: Failed to get client IP address: %s", strerror(errno));
+    }
+    
+    // Add client
+    HLSClient *client = [[HLSClient alloc] init];
+    client.address = clientAddress;
+    client.lastActivity = [[NSDate date] timeIntervalSince1970];
+    
+    [self.clientsLock lock];
+    self.clients[@(clientSocket)] = client;
+    
+    // Track active client by IP address
+    BOOL isNewClient = (self.activeClients[clientAddress] == nil);
+    self.activeClients[clientAddress] = [NSDate date];
+    [self.clientsLock unlock];
+    
+    NSLog(@"[HLS] Client connected: %@ (active clients: %lu)", clientAddress, (unsigned long)self.activeClients.count);
+    
+    // Only notify delegate for new clients
+    if (isNewClient && [self.delegate respondsToSelector:@selector(hlsServer:clientConnected:)]) {
+        [self.delegate hlsServer:self clientConnected:clientAddress];
+    }
+    
+    // Read request
+    NSLog(@"[HLS-CLIENT] 2. About to read request from socket %d", clientSocket);
+    char buffer[BUFFER_SIZE];
+    ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+    NSLog(@"[HLS-CLIENT] 3. Read %zd bytes from socket %d", bytesRead, clientSocket);
+    
+    if (bytesRead < 0) {
+        NSLog(@"[HLS] ERROR: Failed to read from client socket: %s", strerror(errno));
+        // Still need to remove client and close socket
+    } else if (bytesRead > 0) {
+        buffer[bytesRead] = '\0';
+        
+        // Validate UTF8 before creating string
+        if (![[NSString alloc] initWithBytes:buffer length:bytesRead encoding:NSUTF8StringEncoding]) {
+            NSLog(@"[HLS] ERROR: Invalid UTF8 in request");
+            [self sendErrorResponse:clientSocket code:400 message:@"Bad Request"];
+            close(clientSocket);
+            return;
+        }
+        
+        NSString *request = [NSString stringWithUTF8String:buffer];
+        NSLog(@"[HLS-CLIENT] 4. Request string created, length: %lu", (unsigned long)[request length]);
+        
+        // Parse request
+        NSLog(@"[HLS-CLIENT] 5. Parsing request...");
+        NSArray *lines = [request componentsSeparatedByString:@"\r\n"];
+        NSLog(@"[HLS-CLIENT] 6. Request has %lu lines", (unsigned long)lines.count);
+        if (lines.count > 0) {
+            NSArray *parts = [lines[0] componentsSeparatedByString:@" "];
+            NSLog(@"[HLS-CLIENT] 7. First line has %lu parts", (unsigned long)parts.count);
+            if (parts.count >= 2) {
+                NSString *method = parts[0];
+                NSString *path = parts[1];
+                NSLog(@"[HLS-CLIENT] 8. Method: %@, Path: %@", method, path);
+                
+                if ([method isEqualToString:@"GET"]) {
+                    NSLog(@"[HLS-CLIENT] 9. Calling handleGETRequest for path: %@", path);
+                    [self handleGETRequest:path socket:clientSocket];
+                    NSLog(@"[HLS-CLIENT] 10. handleGETRequest completed for path: %@", path);
+                } else {
+                    [self sendErrorResponse:clientSocket code:405 message:@"Method Not Allowed"];
+                }
+            }
+        }
+    }
+    
+    // Remove client
+    [self.clientsLock lock];
+    [self.clients removeObjectForKey:@(clientSocket)];
+    [self.clientsLock unlock];
+    
+    // Safe close
+    if (clientSocket >= 0) {
+        shutdown(clientSocket, SHUT_RDWR);
+        close(clientSocket);
+    }
+    
+    if ([self.delegate respondsToSelector:@selector(hlsServer:clientDisconnected:)]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.delegate hlsServer:self clientDisconnected:clientAddress];
+        });
+    }
+}
+
+- (void)handleGETRequest:(NSString *)path socket:(int)clientSocket {
+    NSLog(@"[HLS] GET %@ (socket: %d)", path, clientSocket);
+    NSLog(@"[HLS-DEBUG] handleGETRequest entry - path class: %@", [path class]);
+    
+    // Update client activity
+    [self.clientsLock lock];
+    HLSClient *client = self.clients[@(clientSocket)];
+    if (client && client.address) {
+        self.activeClients[client.address] = [NSDate date];
+    }
+    [self.clientsLock unlock];
+    
+    // Remove query parameters
+    NSRange range = [path rangeOfString:@"?"];
+    if (range.location != NSNotFound) {
+        path = [path substringToIndex:range.location];
+    }
+    
+    // Security check - prevent directory traversal
+    if ([path containsString:@".."] || [path containsString:@"~"]) {
+        [self sendErrorResponse:clientSocket code:403 message:@"Forbidden"];
+        return;
+    }
+    
+    if ([path isEqualToString:@"/"] || [path isEqualToString:@"/playlist.m3u8"]) {
+        [self sendPlaylistResponse:clientSocket];
+    } else if ([path isEqualToString:@"/init.mp4"]) {
+        [self sendInitializationSegmentResponse:clientSocket];
+    } else if ([path hasPrefix:@"/segments/"]) {
+        NSString *segmentName = [path substringFromIndex:10]; // Remove "/segments/"
+        [self sendSegmentResponse:clientSocket segmentName:segmentName];
+    } else if ([path hasSuffix:@".m4s"]) {
+        NSString *segmentName = [path substringFromIndex:1]; // Remove leading "/"
+        [self sendDelegateSegmentResponse:clientSocket segmentName:segmentName];
+    } else if ([path isEqualToString:@"/debug"]) {
+        [self sendDebugResponse:clientSocket];
+    } else if ([path isEqualToString:@"/test"]) {
+        NSLog(@"[HLS-TEST-PAGE] Test page requested on socket %d", clientSocket);
+        [self sendTestPageResponse:clientSocket];
+        NSLog(@"[HLS-TEST-PAGE] Test page response completed for socket %d", clientSocket);
+    } else if ([path isEqualToString:@"/test-external"]) {
+        [self sendExternalTestPageResponse:clientSocket];
+    } else {
+        [self sendErrorResponse:clientSocket code:404 message:@"Not Found"];
+    }
+}
+
+- (void)sendPlaylistResponse:(int)clientSocket {
+    NSLog(@"[HLS-HTTP] === Playlist Request Debug ===");
+    NSLog(@"[HLS-HTTP] Using delegate-based approach: %@", @available(iOS 14.0, *) ? @"YES" : @"NO");
+    NSLog(@"[HLS-HTTP] Initialization segment available: %@", self.initializationSegmentData ? @"YES" : @"NO");
+    [self.segmentDataLock lock];
+    NSUInteger segmentCount = self.segmentData.count;
+    [self.segmentDataLock unlock];
+    NSLog(@"[HLS-HTTP] Media segments in memory: %lu", (unsigned long)segmentCount);
+    [self.segmentsLock lock];
+    NSUInteger arrayCount = self.segments.count;
+    [self.segmentsLock unlock];
+    NSLog(@"[HLS-HTTP] Segments array count: %lu", (unsigned long)arrayCount);
+    
+    NSString *playlistPath = [self.baseDirectory stringByAppendingPathComponent:@"playlist.m3u8"];
+    NSLog(@"[HLS-HTTP] Looking for playlist at: %@", playlistPath);
+    
+    // Check if file exists
+    BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:playlistPath];
+    NSLog(@"[HLS-HTTP] Playlist file exists: %@", fileExists ? @"YES" : @"NO");
+    
+    NSData *playlistData = [NSData dataWithContentsOfFile:playlistPath];
+    
+    if (!playlistData) {
+        NSLog(@"[HLS-HTTP] ERROR: Playlist data is nil");
+        // Check if we have any segments
+        if (self.segments.count == 0) {
+            NSLog(@"[HLS-HTTP] No segments generated yet");
+            // Send a minimal playlist to keep client waiting
+            NSString *minimalPlaylist = @"#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n";
+            playlistData = [minimalPlaylist dataUsingEncoding:NSUTF8StringEncoding];
+        } else {
+            [self sendErrorResponse:clientSocket code:404 message:@"Playlist not available"];
+            return;
+        }
+    } else {
+        NSLog(@"[HLS-HTTP] Playlist size: %lu bytes", (unsigned long)playlistData.length);
+    }
+    
+    // Send headers
+    NSString *headers = [NSString stringWithFormat:
+                        @"HTTP/1.1 200 OK\r\n"
+                        @"Content-Type: application/vnd.apple.mpegurl\r\n"
+                        @"Content-Length: %lu\r\n"
+                        @"Cache-Control: no-cache\r\n"
+                        @"Access-Control-Allow-Origin: *\r\n"
+                        @"Connection: close\r\n"
+                        @"\r\n",
+                        (unsigned long)playlistData.length];
+    
+    send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
+    send(clientSocket, playlistData.bytes, playlistData.length, MSG_NOSIGNAL);
+}
+
+- (void)sendSegmentResponse:(int)clientSocket segmentName:(NSString *)segmentName {
+    NSLog(@"[HLS-HTTP] Segment requested: %@", segmentName);
+    
+    // Validate segment name
+    if (![segmentName hasSuffix:@".mp4"] && ![segmentName hasSuffix:@".m4s"] && ![segmentName hasSuffix:@".ts"]) {
+        NSLog(@"[HLS-HTTP] ERROR: Invalid segment extension for: %@", segmentName);
+        [self sendErrorResponse:clientSocket code:400 message:@"Invalid segment"];
+        return;
+    }
+    
+    NSString *segmentPath = [self.segmentDirectory stringByAppendingPathComponent:segmentName];
+    NSLog(@"[HLS-HTTP] Looking for segment at: %@", segmentPath);
+    
+    // Check if file exists
+    if (![[NSFileManager defaultManager] fileExistsAtPath:segmentPath]) {
+        NSLog(@"[HLS-HTTP] ERROR: Segment not found at path: %@", segmentPath);
+        [self sendErrorResponse:clientSocket code:404 message:@"Segment not found"];
+        return;
+    }
+    
+    // Get file size
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:segmentPath error:nil];
+    NSUInteger fileSize = [attrs fileSize];
+    
+    // Send headers with correct MIME type for fMP4
+    NSString *contentType = @"video/mp4";
+    
+    NSString *headers = [NSString stringWithFormat:
+                        @"HTTP/1.1 200 OK\r\n"
+                        @"Content-Type: %@\r\n"
+                        @"Content-Length: %lu\r\n"
+                        @"Cache-Control: no-cache\r\n"
+                        @"Access-Control-Allow-Origin: *\r\n"
+                        @"Access-Control-Allow-Methods: GET, OPTIONS\r\n"
+                        @"Access-Control-Allow-Headers: Range\r\n"
+                        @"Accept-Ranges: bytes\r\n"
+                        @"Connection: close\r\n"
+                        @"\r\n",
+                        contentType,
+                        (unsigned long)fileSize];
+    
+    NSLog(@"[HLS-HTTP] Sending segment %@ (%lu bytes)", segmentName, (unsigned long)fileSize);
+    
+    send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
+    
+    // Send file data in chunks
+    NSFileHandle *fileHandle = [NSFileHandle fileHandleForReadingAtPath:segmentPath];
+    if (fileHandle) {
+        NSData *chunk;
+        while ((chunk = [fileHandle readDataOfLength:BUFFER_SIZE]).length > 0) {
+            send(clientSocket, chunk.bytes, chunk.length, MSG_NOSIGNAL);
+        }
+        [fileHandle closeFile];
+    }
+}
+
+- (void)sendInitializationSegmentResponse:(int)clientSocket {
+    if (!self.initializationSegmentData) {
+        [self sendErrorResponse:clientSocket code:404 message:@"Initialization segment not available"];
+        return;
+    }
+    
+    NSString *headers = [NSString stringWithFormat:
+                        @"HTTP/1.1 200 OK\r\n"
+                        @"Content-Type: video/mp4\r\n"
+                        @"Content-Length: %lu\r\n"
+                        @"Access-Control-Allow-Origin: *\r\n"
+                        @"Access-Control-Allow-Methods: GET, OPTIONS\r\n"
+                        @"Access-Control-Allow-Headers: Range\r\n"
+                        @"Connection: close\r\n"
+                        @"\r\n",
+                        (unsigned long)self.initializationSegmentData.length];
+    
+    NSLog(@"[HLS-HTTP] Sending initialization segment (%lu bytes)", (unsigned long)self.initializationSegmentData.length);
+    
+    send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
+    send(clientSocket, self.initializationSegmentData.bytes, self.initializationSegmentData.length, MSG_NOSIGNAL);
+}
+
+- (void)sendDelegateSegmentResponse:(int)clientSocket segmentName:(NSString *)segmentName {
+    [self.segmentDataLock lock];
+    NSData *segmentData = [self.segmentData objectForKey:segmentName];
+    [self.segmentDataLock unlock];
+    
+    if (!segmentData) {
+        NSLog(@"[HLS-HTTP] Segment not found: %@", segmentName);
+        [self sendErrorResponse:clientSocket code:404 message:@"Segment not found"];
+        return;
+    }
+    
+    NSString *headers = [NSString stringWithFormat:
+                        @"HTTP/1.1 200 OK\r\n"
+                        @"Content-Type: video/iso.segment\r\n"
+                        @"Content-Length: %lu\r\n"
+                        @"Access-Control-Allow-Origin: *\r\n"
+                        @"Access-Control-Allow-Methods: GET, OPTIONS\r\n"
+                        @"Access-Control-Allow-Headers: Range\r\n"
+                        @"Connection: close\r\n"
+                        @"\r\n",
+                        (unsigned long)segmentData.length];
+    
+    NSLog(@"[HLS-HTTP] Sending delegate segment %@ (%lu bytes)", segmentName, (unsigned long)segmentData.length);
+    
+    send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
+    send(clientSocket, segmentData.bytes, segmentData.length, MSG_NOSIGNAL);
+}
+
+- (void)sendErrorResponse:(int)clientSocket code:(NSInteger)code message:(NSString *)message {
+    NSString *response = [NSString stringWithFormat:
+                         @"HTTP/1.1 %ld %@\r\n"
+                         @"Content-Type: text/plain\r\n"
+                         @"Content-Length: %lu\r\n"
+                         @"Connection: close\r\n"
+                         @"\r\n"
+                         @"%@",
+                         (long)code, message,
+                         (unsigned long)message.length,
+                         message];
+    
+    send(clientSocket, response.UTF8String, response.length, MSG_NOSIGNAL);
+}
+
+- (void)sendDebugResponse:(int)clientSocket {
+    NSMutableString *debug = [NSMutableString string];
+    [debug appendString:@"HLS Server Debug Info\n"];
+    [debug appendString:@"=====================\n\n"];
+    
+    [debug appendFormat:@"Server Status:\n"];
+    [debug appendFormat:@"- Running: %@\n", self.running ? @"YES" : @"NO"];
+    [debug appendFormat:@"- Writing: %@\n", self.isWriting ? @"YES" : @"NO"];
+    [debug appendFormat:@"- Session Started: %@\n", self.sessionStarted ? @"YES" : @"NO"];
+    [debug appendFormat:@"- Current Segment Index: %ld\n", (long)self.currentSegmentIndex];
+    [debug appendFormat:@"- Frames Processed: %ld\n", (long)self.framesProcessed];
+    [debug appendFormat:@"- Frames Dropped: %ld\n\n", (long)self.framesDropped];
+    
+    [debug appendFormat:@"Segments:\n"];
+    [debug appendFormat:@"- Total Segments: %lu\n", (unsigned long)self.segments.count];
+    
+    for (HLSSegmentInfo *segment in self.segments) {
+        [debug appendFormat:@"  - %@ (%.2fs, %lu bytes)\n", 
+               segment.filename, 
+               CMTimeGetSeconds(segment.duration),
+               (unsigned long)segment.fileSize];
+    }
+    
+    [debug appendString:@"\nCurrent Playlist:\n"];
+    NSString *playlistPath = [self.baseDirectory stringByAppendingPathComponent:@"playlist.m3u8"];
+    NSString *playlistContent = [NSString stringWithContentsOfFile:playlistPath encoding:NSUTF8StringEncoding error:nil];
+    if (playlistContent) {
+        [debug appendString:playlistContent];
+    } else {
+        [debug appendString:@"(No playlist file found)"];
+    }
+    
+    NSData *responseData = [debug dataUsingEncoding:NSUTF8StringEncoding];
+    
+    NSString *headers = [NSString stringWithFormat:
+                        @"HTTP/1.1 200 OK\r\n"
+                        @"Content-Type: text/plain\r\n"
+                        @"Content-Length: %lu\r\n"
+                        @"Connection: close\r\n"
+                        @"\r\n",
+                        (unsigned long)responseData.length];
+    
+    send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
+    send(clientSocket, responseData.bytes, responseData.length, MSG_NOSIGNAL);
+}
+
+- (void)sendTestPageResponse:(int)clientSocket {
+    NSLog(@"[HLS-TEST-PAGE] 1. Entering sendTestPageResponse for socket: %d", clientSocket);
+    
+    @try {
+        NSLog(@"[HLS-TEST-PAGE] 2. Starting HTML string creation...");
+        NSString *html = @"<!DOCTYPE html>\n"
+                     @"<html>\n"
+                     @"<head>\n"
+                     @"<title>Ultra-Low Latency HLS Player</title>\n"
+                     @"<meta name='viewport' content='width=device-width, initial-scale=1'>\n"
+                     @"<style>\n"
+                     @"body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }\n"
+                     @"video { width: 100%; max-width: 800px; background: #000; display: block; margin: 0 auto; }\n"
+                     @".status { margin: 10px 0; padding: 10px; background: #e8f5e8; border-left: 4px solid #4CAF50; }\n"
+                     @".status.connecting { background: #fff3cd; border-left-color: #ffc107; }\n"
+                     @".status.error { background: #f8d7da; border-left-color: #dc3545; }\n"
+                     @".stats { margin: 10px 0; padding: 10px; background: #d4edda; font-family: monospace; font-size: 12px; }\n"
+                     @".recording { margin: 10px 0; padding: 10px; background: #cce7ff; }\n"
+                     @".controls { margin: 10px 0; text-align: center; }\n"
+                     @"button { padding: 10px 20px; margin: 5px; font-size: 16px; cursor: pointer; border: none; border-radius: 4px; }\n"
+                     @"#recordBtn { background: #4CAF50; color: white; }\n"
+                     @"#recordBtn:hover { background: #45a049; }\n"
+                     @"#recordBtn.recording { background: #f44336; }\n"
+                     @"#downloadBtn { background: #008CBA; color: white; display: none; text-decoration: none; }\n"
+                     @".connection-indicator { position: fixed; top: 10px; right: 10px; width: 12px; height: 12px; border-radius: 50%; background: #4CAF50; }\n"
+                     @".connection-indicator.connecting { background: #ffc107; }\n"
+                     @".connection-indicator.error { background: #dc3545; }\n"
+                     @"</style>\n"
+                     @"</head>\n"
+                     @"<body>\n"
+                     @"<div class='connection-indicator' id='connectionStatus'></div>\n"
+                     @"<h3>Ultra-Low Latency Stream</h3>\n"
+                     @"<video id='video' muted autoplay playsinline></video>\n"
+                     @"<div class='controls'>\n"
+                     @"<button id='recordBtn' onclick='toggleRecording()'>Start Recording</button>\n"
+                     @"<a id='downloadBtn' href='#' download>Download Recording</a>\n"
+                     @"</div>\n"
+                     @"<div class='recording' id='recordingInfo'>Recording: Ready</div>\n"
+                     @"<div class='status' id='status'>Connecting to stream...</div>\n"
+                     @"<div class='stats' id='stats'>Latency: -- | Buffer: -- | Bitrate: --</div>\n"
+                     @"<script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>\n"
+                     @"<script>\n"
+                     @"var video = document.getElementById('video');\n"
+                     @"var status = document.getElementById('status');\n"
+                     @"var stats = document.getElementById('stats');\n"
+                     @"var connectionStatus = document.getElementById('connectionStatus');\n"
+                     @"var recordingInfo = document.getElementById('recordingInfo');\n"
+                     @"var recordBtn = document.getElementById('recordBtn');\n"
+                     @"var downloadBtn = document.getElementById('downloadBtn');\n"
+                     @"var videoSrc = window.location.origin + '/playlist.m3u8';\n"
+                     @"var hls = null;\n"
+                     @"var mediaRecorder = null;\n"
+                     @"var recordedChunks = [];\n"
+                     @"var isRecording = false;\n"
+                     @"var reconnectTimer = null;\n"
+                     @"var statsInterval = null;\n"
+                     @"var lastSegmentTime = 0;\n"
+                     @"var connectionCheckInterval = null;\n"
+                     @"var hasConnectedOnce = false;\n"
+                     @"\n"
+                     @"function setConnectionStatus(state) {\n"
+                     @"  connectionStatus.className = 'connection-indicator ' + state;\n"
+                     @"  status.className = 'status ' + state;\n"
+                     @"}\n"
+                     @"\n"
+                     @"function initHLS() {\n"
+                     @"  if (hls) {\n"
+                     @"    hls.destroy();\n"
+                     @"  }\n"
+                     @"  \n"
+                     @"  if (!Hls.isSupported()) {\n"
+                     @"    if (video.canPlayType('application/vnd.apple.mpegurl')) {\n"
+                     @"      video.src = videoSrc;\n"
+                     @"      status.innerHTML = 'Using native HLS support';\n"
+                     @"      setConnectionStatus('');\n"
+                     @"    } else {\n"
+                     @"      status.innerHTML = 'HLS not supported in this browser';\n"
+                     @"      setConnectionStatus('error');\n"
+                     @"    }\n"
+                     @"    return;\n"
+                     @"  }\n"
+                     @"  \n"
+                     @"  hls = new Hls({\n"
+                     @"    debug: false,\n"
+                     @"    enableWorker: true,\n"
+                     @"    lowLatencyMode: true,\n"
+                     @"    liveBackBufferLength: 1,\n"
+                     @"    liveSyncDurationCount: 2,\n"
+                     @"    liveMaxLatencyDurationCount: 3,\n"
+                     @"    maxBufferLength: 2,\n"
+                     @"    maxMaxBufferLength: 3,\n"
+                     @"    maxBufferSize: 2 * 1024 * 1024,\n"
+                     @"    maxBufferHole: 0.5,\n"
+                     @"    highBufferWatchdogPeriod: 2,\n"
+                     @"    nudgeOffset: 0.2,\n"
+                     @"    nudgeMaxRetry: 5,\n"
+                     @"    maxFragLookUpTolerance: 0.25,\n"
+                     @"    liveDurationInfinity: true,\n"
+                     @"    startLevel: -1,\n"
+                     @"    fragLoadingTimeOut: 5000,\n"
+                     @"    fragLoadingMaxRetry: 6,\n"
+                     @"    fragLoadingRetryDelay: 500,\n"
+                     @"    manifestLoadingTimeOut: 5000,\n"
+                     @"    manifestLoadingMaxRetry: 3,\n"
+                     @"    manifestLoadingRetryDelay: 500\n"
+                     @"  });\n"
+                     @"  \n"
+                     @"  setConnectionStatus('connecting');\n"
+                     @"  status.innerHTML = 'Connecting to ultra-low latency stream...';\n"
+                     @"  \n"
+                     @"  hls.loadSource(videoSrc);\n"
+                     @"  hls.attachMedia(video);\n"
+                     @"  \n"
+                     @"  hls.on(Hls.Events.MANIFEST_PARSED, function() {\n"
+                     @"    hasConnectedOnce = true;\n"
+                     @"    status.innerHTML = 'Stream connected - Starting playback';\n"
+                     @"    setConnectionStatus('');\n"
+                     @"    video.play().catch(function(e) {\n"
+                     @"      console.log('Autoplay prevented:', e);\n"
+                     @"    });\n"
+                     @"  });\n"
+                     @"  \n"
+                     @"  video.addEventListener('playing', function() {\n"
+                     @"    status.innerHTML = 'Playing - Ultra-low latency mode active';\n"
+                     @"    setConnectionStatus('');\n"
+                     @"  });\n"
+                     @"  \n"
+                     @"  hls.on(Hls.Events.FRAG_LOADED, function(event, data) {\n"
+                     @"    lastSegmentTime = Date.now();\n"
+                     @"  });\n"
+                     @"  \n"
+                     @"  hls.on(Hls.Events.ERROR, function (event, data) {\n"
+                     @"    console.log('HLS error:', data.type, data.details, 'Fatal:', data.fatal);\n"
+                     @"    \n"
+                     @"    if (data.fatal) {\n"
+                     @"      status.innerHTML = 'Connection lost - Reconnecting...';\n"
+                     @"      setConnectionStatus('error');\n"
+                     @"      scheduleReconnect();\n"
+                     @"    } else {\n"
+                     @"      // Non-fatal errors, try to recover\n"
+                     @"      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {\n"
+                     @"        hls.startLoad();\n"
+                     @"      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {\n"
+                     @"        hls.recoverMediaError();\n"
+                     @"      }\n"
+                     @"    }\n"
+                     @"  });\n"
+                     @"}\n"
+                     @"\n"
+                     @"function scheduleReconnect() {\n"
+                     @"  if (!reconnectTimer) {\n"
+                     @"    reconnectTimer = setTimeout(function() {\n"
+                     @"      console.log('Attempting to reconnect...');\n"
+                     @"      setConnectionStatus('connecting');\n"
+                     @"      status.innerHTML = 'Reconnecting...';\n"
+                     @"      initHLS();\n"
+                     @"      reconnectTimer = null;\n"
+                     @"    }, 1000);\n"
+                     @"  }\n"
+                     @"}\n"
+                     @"\n"
+                     @"function startConnectionMonitor() {\n"
+                     @"  if (connectionCheckInterval) {\n"
+                     @"    clearInterval(connectionCheckInterval);\n"
+                     @"  }\n"
+                     @"  \n"
+                     @"  connectionCheckInterval = setInterval(function() {\n"
+                     @"    // Check if we've received data recently\n"
+                     @"    if (Date.now() - lastSegmentTime > 5000 && hasConnectedOnce) {\n"
+                     @"      console.log('No data received for 5 seconds, reconnecting...');\n"
+                     @"      scheduleReconnect();\n"
+                     @"    }\n"
+                     @"  }, 2000);\n"
+                     @"}\n"
+                     @"\n"
+                     @"function updateStats() {\n"
+                     @"  if (!hls || !hls.media) return;\n"
+                     @"  \n"
+                     @"  var buffered = hls.media.buffered;\n"
+                     @"  var bufferLen = buffered.length ? (buffered.end(buffered.length-1) - hls.media.currentTime).toFixed(3) : '0.000';\n"
+                     @"  var currentTime = hls.media.currentTime.toFixed(2);\n"
+                     @"  var level = hls.currentLevel >= 0 ? hls.levels[hls.currentLevel] : null;\n"
+                     @"  var bitrate = level ? Math.round(level.bitrate / 1000) + 'kbps' : '--';\n"
+                     @"  \n"
+                     @"  // Estimate latency based on segment timing\n"
+                     @"  var estimatedLatency = lastSegmentTime > 0 ? ((Date.now() - lastSegmentTime) / 1000).toFixed(3) + 's' : '--';\n"
+                     @"  \n"
+                     @"  stats.innerHTML = 'Latency: ~' + estimatedLatency + ' | Buffer: ' + bufferLen + 's | Bitrate: ' + bitrate + ' | Time: ' + currentTime + 's';\n"
+                     @"}\n"
+                     @"\n"
+                     @"function toggleRecording() {\n"
+                     @"  if (!isRecording) {\n"
+                     @"    startRecording();\n"
+                     @"  } else {\n"
+                     @"    stopRecording();\n"
+                     @"  }\n"
+                     @"}\n"
+                     @"\n"
+                     @"function startRecording() {\n"
+                     @"  if (!video.captureStream) {\n"
+                     @"    recordingInfo.innerHTML = 'Recording not supported in this browser';\n"
+                     @"    return;\n"
+                     @"  }\n"
+                     @"  \n"
+                     @"  recordedChunks = [];\n"
+                     @"  var stream = video.captureStream(30);\n"
+                     @"  \n"
+                     @"  try {\n"
+                     @"    mediaRecorder = new MediaRecorder(stream, {\n"
+                     @"      mimeType: 'video/webm; codecs=vp9'\n"
+                     @"    });\n"
+                     @"  } catch (e) {\n"
+                     @"    try {\n"
+                     @"      mediaRecorder = new MediaRecorder(stream, {\n"
+                     @"        mimeType: 'video/webm'\n"
+                     @"      });\n"
+                     @"    } catch (e2) {\n"
+                     @"      recordingInfo.innerHTML = 'Recording failed: ' + e2.message;\n"
+                     @"      return;\n"
+                     @"    }\n"
+                     @"  }\n"
+                     @"  \n"
+                     @"  mediaRecorder.ondataavailable = function(event) {\n"
+                     @"    if (event.data && event.data.size > 0) {\n"
+                     @"      recordedChunks.push(event.data);\n"
+                     @"    }\n"
+                     @"  };\n"
+                     @"  \n"
+                     @"  mediaRecorder.onstop = function() {\n"
+                     @"    var blob = new Blob(recordedChunks, { type: 'video/webm' });\n"
+                     @"    var url = URL.createObjectURL(blob);\n"
+                     @"    downloadBtn.href = url;\n"
+                     @"    downloadBtn.download = 'stream_' + Date.now() + '.webm';\n"
+                     @"    downloadBtn.style.display = 'inline-block';\n"
+                     @"    recordingInfo.innerHTML = 'Recording saved (' + (blob.size / 1048576).toFixed(2) + ' MB)';\n"
+                     @"  };\n"
+                     @"  \n"
+                     @"  mediaRecorder.start(1000);\n"
+                     @"  isRecording = true;\n"
+                     @"  recordBtn.textContent = 'Stop Recording';\n"
+                     @"  recordBtn.classList.add('recording');\n"
+                     @"  recordingInfo.innerHTML = 'Recording in progress...';\n"
+                     @"}\n"
+                     @"\n"
+                     @"function stopRecording() {\n"
+                     @"  if (mediaRecorder && mediaRecorder.state !== 'inactive') {\n"
+                     @"    mediaRecorder.stop();\n"
+                     @"    isRecording = false;\n"
+                     @"    recordBtn.textContent = 'Start Recording';\n"
+                     @"    recordBtn.classList.remove('recording');\n"
+                     @"  }\n"
+                     @"}\n"
+                     @"\n"
+                     @"// Initialize on load\n"
+                     @"initHLS();\n"
+                     @"startConnectionMonitor();\n"
+                     @"statsInterval = setInterval(updateStats, 200);\n"
+                     @"\n"
+                     @"// Cleanup on page unload\n"
+                     @"window.addEventListener('beforeunload', function() {\n"
+                     @"  if (hls) hls.destroy();\n"
+                     @"  if (reconnectTimer) clearTimeout(reconnectTimer);\n"
+                     @"  if (statsInterval) clearInterval(statsInterval);\n"
+                     @"  if (connectionCheckInterval) clearInterval(connectionCheckInterval);\n"
+                     @"});\n"
+                     @"</script>\n"
+                     @"</body>\n"
+                     @"</html>\n";
+    
+        NSLog(@"[HLS-TEST-PAGE] 3. HTML string created, length: %lu", (unsigned long)[html length]);
+        
+        NSLog(@"[HLS-TEST-PAGE] 4. Converting HTML to NSData...");
+        NSData *htmlData = [html dataUsingEncoding:NSUTF8StringEncoding];
+        if (!htmlData) {
+            NSLog(@"[HLS-TEST-PAGE] ERROR: Failed to encode HTML data");
+            [self sendErrorResponse:clientSocket code:500 message:@"Internal Server Error"];
+            return;
+        }
+        NSLog(@"[HLS-TEST-PAGE] 5. HTML data created, size: %lu bytes", (unsigned long)htmlData.length);
+    
+        NSLog(@"[HLS-TEST-PAGE] 6. Creating HTTP headers...");
+        NSString *headers = [NSString stringWithFormat:
+                            @"HTTP/1.1 200 OK\r\n"
+                            @"Content-Type: text/html\r\n"
+                            @"Content-Length: %lu\r\n"
+                            @"Connection: close\r\n"
+                            @"\r\n",
+                            (unsigned long)htmlData.length];
+        
+        NSLog(@"[HLS-TEST-PAGE] 7. Headers created, length: %lu", (unsigned long)headers.length);
+        
+        // Send with error checking
+        NSLog(@"[HLS-TEST-PAGE] 8. Sending headers...");
+        ssize_t headersSent = send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
+        if (headersSent < 0) {
+            NSLog(@"[HLS-TEST-PAGE] ERROR: Failed to send headers: %s (errno: %d)", strerror(errno), errno);
+            return;
+        }
+        NSLog(@"[HLS-TEST-PAGE] 9. Headers sent: %zd bytes", headersSent);
+    
+        // Send data in chunks to avoid large buffer issues
+        NSLog(@"[HLS-TEST-PAGE] 10. Preparing to send HTML data in chunks...");
+        NSUInteger totalSent = 0;
+        NSUInteger dataLength = htmlData.length;
+        const uint8_t *bytes = htmlData.bytes;
+        
+        NSLog(@"[HLS-TEST-PAGE] 11. Total data to send: %lu bytes", (unsigned long)dataLength);
+        
+        while (totalSent < dataLength) {
+            NSUInteger chunkSize = MIN(8192, dataLength - totalSent);
+            RLogDebug(@"Sending chunk: offset=%lu, size=%lu", (unsigned long)totalSent, (unsigned long)chunkSize);
+            ssize_t sent = send(clientSocket, bytes + totalSent, chunkSize, MSG_NOSIGNAL);
+            if (sent < 0) {
+                NSLog(@"[HLS-TEST-PAGE] ERROR: Failed to send data: %s (errno: %d)", strerror(errno), errno);
+                break;
+            }
+            totalSent += sent;
+            RLogDebug(@"Chunk sent: %zd bytes, total sent: %lu/%lu", sent, (unsigned long)totalSent, (unsigned long)dataLength);
+        }
+        
+        NSLog(@"[HLS-TEST-PAGE] 14. All data sent successfully: %lu bytes", (unsigned long)totalSent);
+        
+    } @catch (NSException *exception) {
+        NSLog(@"[HLS-TEST-PAGE] EXCEPTION: %@", exception);
+        NSLog(@"[HLS-TEST-PAGE] Exception reason: %@", exception.reason);
+        NSLog(@"[HLS-TEST-PAGE] Stack trace: %@", exception.callStackSymbols);
+        [self sendErrorResponse:clientSocket code:500 message:@"Internal Server Error"];
+    } @finally {
+        NSLog(@"[HLS-TEST-PAGE] 15. Exiting sendTestPageResponse for socket: %d", clientSocket);
+    }
+}
+
+- (void)sendExternalTestPageResponse:(int)clientSocket {
+    NSString *html = @"<!DOCTYPE html>\n"
+                     @"<html>\n"
+                     @"<head>\n"
+                     @"<title>HLS External Test</title>\n"
+                     @"<meta name='viewport' content='width=device-width, initial-scale=1'>\n"
+                     @"</head>\n"
+                     @"<body>\n"
+                     @"<h1>Testing with External HLS Stream</h1>\n"
+                     @"<p>This tests HLS.js with a known-good stream to verify the player works.</p>\n"
+                     @"<video id='video' controls autoplay style='width:100%;max-width:800px;'></video>\n"
+                     @"<div id='info'>Loading external test stream...</div>\n"
+                     @"<script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>\n"
+                     @"<script>\n"
+                     @"var video = document.getElementById('video');\n"
+                     @"var testUrl = 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8';\n"
+                     @"if (Hls.isSupported()) {\n"
+                     @"  var hls = new Hls();\n"
+                     @"  hls.loadSource(testUrl);\n"
+                     @"  hls.attachMedia(video);\n"
+                     @"  hls.on(Hls.Events.MANIFEST_PARSED, function() {\n"
+                     @"    document.getElementById('info').innerHTML = 'External stream loaded successfully! HLS.js is working.';\n"
+                     @"  });\n"
+                     @"}\n"
+                     @"</script>\n"
+                     @"</body>\n"
+                     @"</html>\n";
+    
+    NSData *htmlData = [html dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *headers = [NSString stringWithFormat:
+                        @"HTTP/1.1 200 OK\r\n"
+                        @"Content-Type: text/html\r\n"
+                        @"Content-Length: %lu\r\n"
+                        @"Connection: close\r\n"
+                        @"\r\n",
+                        (unsigned long)htmlData.length];
+    
+    send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
+    send(clientSocket, htmlData.bytes, htmlData.length, MSG_NOSIGNAL);
+}
+
+#pragma mark - Utilities
+
+- (NSArray<NSString *> *)getServerURLs {
+    NSMutableArray *urls = [NSMutableArray array];
+    
+    struct ifaddrs *interfaces = NULL;
+    struct ifaddrs *temp_addr = NULL;
+    
+    if (getifaddrs(&interfaces) == 0) {
+        temp_addr = interfaces;
+        while (temp_addr != NULL) {
+            if (temp_addr->ifa_addr != NULL && temp_addr->ifa_addr->sa_family == AF_INET) {
+                char ip[INET_ADDRSTRLEN];
+                if (inet_ntop(AF_INET, &((struct sockaddr_in *)temp_addr->ifa_addr)->sin_addr, ip, INET_ADDRSTRLEN) != NULL) {
+                    NSString *ipString = [NSString stringWithUTF8String:ip];
+                    if (![ipString isEqualToString:@"127.0.0.1"]) {
+                        NSString *url = [NSString stringWithFormat:@"http://%@:%lu/playlist.m3u8", ipString, (unsigned long)self.port];
+                        [urls addObject:url];
+                    }
+                }
+            }
+            temp_addr = temp_addr->ifa_next;
+        }
+        freeifaddrs(interfaces);
+    }
+    
+    return urls;
+}
+
+- (NSUInteger)connectedClients {
+    [self.clientsLock lock];
+    NSUInteger count = self.activeClients.count;
+    [self.clientsLock unlock];
+    return count;
+}
+
+- (void)cleanupInactiveClients {
+    [self.clientsLock lock];
+    NSDate *now = [NSDate date];
+    NSMutableArray *inactiveClients = [NSMutableArray array];
+    
+    // Find clients that haven't been active for 30 seconds
+    for (NSString *clientAddress in self.activeClients.allKeys) {
+        NSDate *lastActivity = self.activeClients[clientAddress];
+        if ([now timeIntervalSinceDate:lastActivity] > 30.0) {
+            [inactiveClients addObject:clientAddress];
+        }
+    }
+    
+    // Remove inactive clients
+    for (NSString *clientAddress in inactiveClients) {
+        [self.activeClients removeObjectForKey:clientAddress];
+        NSLog(@"[HLS] Removing inactive client: %@", clientAddress);
+        
+        // Notify delegate
+        if ([self.delegate respondsToSelector:@selector(hlsServer:clientDisconnected:)]) {
+            [self.delegate hlsServer:self clientDisconnected:clientAddress];
+        }
+    }
+    
+    [self.clientsLock unlock];
+}
+
+- (BOOL)isStreaming {
+    return self.running && self.isWriting;
+}
+
+- (void)dealloc {
+    [self stopServer];
+}
+
+#pragma mark - Debug Helpers
+
+- (void)logWriterState {
+    dispatch_async(self.writerQueue, ^{
+        NSLog(@"[HLS-STATE] === Writer State ===");
+        NSLog(@"[HLS-STATE] Server running: %@", self.running ? @"YES" : @"NO");
+        NSLog(@"[HLS-STATE] Is writing: %@", self.isWriting ? @"YES" : @"NO");
+        NSLog(@"[HLS-STATE] Session started: %@", self.sessionStarted ? @"YES" : @"NO");
+        NSLog(@"[HLS-STATE] Asset writer: %@", self.assetWriter ? @"EXISTS" : @"NIL");
+        if (self.assetWriter) {
+            NSLog(@"[HLS-STATE] Writer status: %ld", (long)self.assetWriter.status);
+            NSLog(@"[HLS-STATE] Writer error: %@", self.assetWriter.error);
+        }
+        NSLog(@"[HLS-STATE] Video input: %@", self.videoInput ? @"EXISTS" : @"NIL");
+        NSLog(@"[HLS-STATE] Frames processed: %ld", (long)self.framesProcessed);
+        NSLog(@"[HLS-STATE] Frames dropped: %ld", (long)self.framesDropped);
+        NSLog(@"[HLS-STATE] Current segment: %ld", (long)self.currentSegmentIndex);
+        NSLog(@"[HLS-STATE] Segments count: %lu", (unsigned long)self.segments.count);
+        NSLog(@"[HLS-STATE] ==================");
+    });
+}
+
+#pragma mark - AVAssetWriterDelegate
+
+- (void)assetWriter:(AVAssetWriter *)writer didOutputSegmentData:(NSData *)segmentData segmentType:(AVAssetSegmentType)segmentType segmentReport:(AVAssetSegmentReport *)segmentReport {
+    NSLog(@"[HLS-DELEGATE] Received segment data: %lu bytes, type: %ld", (unsigned long)segmentData.length, (long)segmentType);
+    
+    dispatch_async(self.writerQueue, ^{
+        if (segmentType == AVAssetSegmentTypeInitialization) {
+            // Store initialization segment
+            self.initializationSegmentData = segmentData;
+            NSLog(@"[HLS-DELEGATE] Stored initialization segment: %lu bytes", (unsigned long)segmentData.length);
+            
+        } else if (segmentType == AVAssetSegmentTypeSeparable) {
+            // Store media segment
+            NSString *segmentName = [NSString stringWithFormat:@"segment_%03ld.m4s", (long)self.currentSegmentIndex];
+            [self.segmentDataLock lock];
+            [self.segmentData setObject:segmentData forKey:segmentName];
+            [self.segmentDataLock unlock];
+            
+            // Create segment info
+            HLSSegmentInfo *segmentInfo = [[HLSSegmentInfo alloc] init];
+            segmentInfo.filename = segmentName;
+            segmentInfo.duration = segmentReport ? segmentReport.trackReports.firstObject.duration : CMTimeMakeWithSeconds(SEGMENT_DURATION, 1);
+            segmentInfo.sequenceNumber = self.mediaSequenceNumber;
+            segmentInfo.createdAt = [NSDate date];
+            segmentInfo.fileSize = segmentData.length;
+            
+            [self.segmentsLock lock];
+            [self.segments addObject:segmentInfo];
+            
+            NSLog(@"[HLS-DELEGATE] Stored media segment: %@ (%lu bytes, %.2fs)", 
+                  segmentName, (unsigned long)segmentData.length, CMTimeGetSeconds(segmentInfo.duration));
+            
+            // Clean up old segments to prevent memory buildup
+            if (self.segments.count > MAX_SEGMENTS) {
+                NSInteger removeCount = self.segments.count - MAX_SEGMENTS;
+                for (NSInteger i = 0; i < removeCount; i++) {
+                    HLSSegmentInfo *oldSegment = self.segments[0];
+                    [self.segmentDataLock lock];
+                    [self.segmentData removeObjectForKey:oldSegment.filename];
+                    [self.segmentDataLock unlock];
+                    [self.segments removeObjectAtIndex:0];
+                    NSLog(@"[HLS-DELEGATE] Removed old segment: %@", oldSegment.filename);
+                }
+            }
+            [self.segmentsLock unlock];
+            
+            self.currentSegmentIndex++;
+            self.mediaSequenceNumber++;
+            
+            // Update playlist
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self updatePlaylist];
+            });
+            
+            // Clean up old segments
+            [self cleanupOldSegments];
+        }
+    });
+}
+
+@end

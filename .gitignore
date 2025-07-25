@@ -1,0 +1,59 @@
+# Claude.md instructions
+CLAUDE.md
+
+# Build artifacts
+build/
+DerivedData/
+*.xcbuild/
+
+# Intermediate files
+*.o
+*.a
+*.dylib
+*.dSYM
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Xcode user data
+*.xcuserstate
+xcuserdata/
+*.xcuserdatad/
+*.xcworkspace/xcuserdata/
+
+# CocoaPods
+Pods/
+*.xcworkspace
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# IDE files
+.idea/
+.vscode/
+*.sublime-*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Thumbnails
+._*
+
+# Files that might appear in the root of a volume
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent

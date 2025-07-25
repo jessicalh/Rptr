@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>{{APP_TITLE}}</title>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<link rel='stylesheet' href='/css/styles.css'>
+<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css' />
+<script>
+// Runtime configuration injected by app
+window.APP_CONFIG = {
+    streamUrl: '{{STREAM_URL}}',
+    serverPort: {{SERVER_PORT}},
+    locationEndpoint: '{{LOCATION_ENDPOINT}}'
+};
+</script>
+</head>
+<body>
+<div class='title-bar'>
+<h3>{{PAGE_TITLE}}</h3>
+</div>
+<div class='connection-indicator' id='connectionStatus'></div>
+<div class='main-container'>
+<div class='video-container'>
+<video id='video' controls autoplay playsinline muted></video>
+</div>
+<div class='map-container'>
+<div id='mapContainer'></div>
+</div>
+</div>
+<div class='controls'>
+<button id='recordBtn' onclick='toggleRecording()'>Start Recording</button>
+<a id='downloadBtn' href='#' download>Download Recording</a>
+</div>
+<div class='recording' id='recordingInfo'>Recording: Ready</div>
+<div style='text-align: center;'>
+  <div class='status' id='status'>{{INITIAL_STATUS}}</div>
+</div>
+<div class='stats' id='stats'>Latency: -- | Buffer: -- | Bitrate: --</div>
+<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>
+<script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>
+<script src='/js/app.js'></script>
+</body>
+</html>
