@@ -1,6 +1,9 @@
 # Claude.md instructions
 CLAUDE.md
 
+# Backup files
+*.backup
+
 # Build artifacts
 build/
 DerivedData/

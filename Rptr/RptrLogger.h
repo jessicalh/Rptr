@@ -29,7 +29,13 @@ typedef NS_OPTIONS(NSUInteger, RptrLogArea) {
     RptrLogAreaHTTP         = 1 << 13, // 0x2000 - HTTP server
     RptrLogAreaError        = 1 << 14, // 0x4000 - Errors (always enabled)
     RptrLogAreaDebug        = 1 << 15, // 0x8000 - Debug info
-    RptrLogAreaAll          = 0xFFFF   // All areas
+    RptrLogAreaAssetWriter  = 1 << 16, // 0x10000 - AVAssetWriter operations
+    RptrLogAreaLocation     = 1 << 17, // 0x20000 - Location services
+    RptrLogAreaSession      = 1 << 18, // 0x40000 - AVCaptureSession management
+    RptrLogAreaDelegate     = 1 << 19, // 0x80000 - Delegate callbacks
+    RptrLogAreaLifecycle    = 1 << 20, // 0x100000 - App lifecycle events
+    RptrLogAreaPerformance  = 1 << 21, // 0x200000 - Performance metrics
+    RptrLogAreaAll          = 0x3FFFFF  // All areas
 };
 
 // Active log areas - modify this to control what gets logged
@@ -50,6 +56,12 @@ typedef NS_ENUM(NSInteger, RptrLogLevel) {
 NS_ASSUME_NONNULL_BEGIN
 
 @interface RptrLogger : NSObject
+
+// Runtime configuration
++ (void)setActiveAreas:(RptrLogArea)areas;
++ (RptrLogArea)activeAreas;
++ (void)setLogLevel:(RptrLogLevel)level;
++ (RptrLogLevel)logLevel;
 
 // Bitmask-based logging method
 + (void)log:(RptrLogArea)area format:(NSString *)format, ... NS_FORMAT_FUNCTION(2,3);

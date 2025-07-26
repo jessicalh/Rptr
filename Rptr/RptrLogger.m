@@ -9,6 +9,27 @@
 
 @implementation RptrLogger
 
+// Static variables for runtime configuration
+static RptrLogArea _activeAreas = RPTR_ACTIVE_LOG_AREAS;
+static RptrLogLevel _currentLogLevel = RPTR_CURRENT_LOG_LEVEL;
+
+// Runtime configuration methods
++ (void)setActiveAreas:(RptrLogArea)areas {
+    _activeAreas = areas;
+}
+
++ (RptrLogArea)activeAreas {
+    return _activeAreas;
+}
+
++ (void)setLogLevel:(RptrLogLevel)level {
+    _currentLogLevel = level;
+}
+
++ (RptrLogLevel)logLevel {
+    return _currentLogLevel;
+}
+
 // Helper to get module name from area
 + (NSString *)moduleNameForArea:(RptrLogArea)area {
     // Return first matching area for simplicity
@@ -28,12 +49,20 @@
     if (area & RptrLogAreaHTTP) return @"HTTP";
     if (area & RptrLogAreaError) return @"ERROR";
     if (area & RptrLogAreaDebug) return @"DEBUG";
+    if (area & RptrLogAreaAssetWriter) return @"WRITER";
+    if (area & RptrLogAreaLocation) return @"LOC";
+    if (area & RptrLogAreaSession) return @"SESSION";
+    if (area & RptrLogAreaDelegate) return @"DELEGATE";
+    if (area & RptrLogAreaLifecycle) return @"LIFECYCLE";
+    if (area & RptrLogAreaPerformance) return @"PERF";
     return @"UNKNOWN";
 }
 
 + (BOOL)isAreaActive:(RptrLogArea)area {
 #if RPTR_LOGGING_ENABLED
-    return (area & RPTR_ACTIVE_LOG_AREAS) != 0;
+    // Always log errors
+    if (area & RptrLogAreaError) return YES;
+    return (area & _activeAreas) != 0;
 #else
     return NO;
 #endif
@@ -67,7 +96,7 @@
 
 + (void)logWithArea:(RptrLogArea)area level:(RptrLogLevel)level format:(NSString *)format arguments:(va_list)args {
 #if RPTR_LOGGING_ENABLED
-    if (level > RPTR_CURRENT_LOG_LEVEL) {
+    if (level > _currentLogLevel) {
         return;
     }
     

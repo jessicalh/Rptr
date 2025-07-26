@@ -662,7 +662,7 @@
 #pragma mark - App Lifecycle
 
 - (void)appWillTerminate:(NSNotification *)notification {
-    RLog(RptrLogAreaHLS, @"App will terminate - stopping HLS server gracefully");
+    RLog(RptrLogAreaHLS | RptrLogAreaLifecycle, @"App will terminate - stopping HLS server gracefully");
     
     // Stop streaming first
     if (self.isStreaming) {
@@ -688,7 +688,7 @@
         }
     }
     
-    RLog(RptrLogAreaHLS, @"App termination cleanup completed");
+    RLog(RptrLogAreaHLS | RptrLogAreaLifecycle, @"App termination cleanup completed");
 }
 
 - (void)didReceiveMemoryWarning:(NSNotification *)notification {
@@ -720,7 +720,7 @@
 }
 
 - (void)appDidEnterBackground:(NSNotification *)notification {
-    RLog(RptrLogAreaHLS, @"App entered background - pausing streaming");
+    RLog(RptrLogAreaHLS | RptrLogAreaLifecycle, @"App entered background - pausing streaming");
     
     // Keep server running but pause streaming to save resources
     if (self.isStreaming) {
@@ -1672,7 +1672,7 @@
     // Request a single location update
     if ([CLLocationManager authorizationStatus] == kCLAuthorizationStatusAuthorizedWhenInUse ||
         [CLLocationManager authorizationStatus] == kCLAuthorizationStatusAuthorizedAlways) {
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Requesting location update");
+        RLog(RptrLogAreaUI | RptrLogAreaLocation | RptrLogAreaDebug, @"Requesting location update");
         
         // Use requestLocation for a single update instead of continuous updates
         if ([self.locationManager respondsToSelector:@selector(requestLocation)]) {
@@ -1685,7 +1685,7 @@
             });
         }
     } else {
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Location permission not granted, skipping update");
+        RLog(RptrLogAreaUI | RptrLogAreaLocation | RptrLogAreaDebug, @"Location permission not granted, skipping update");
     }
 }
 
@@ -1707,7 +1707,7 @@
 }
 
 - (void)locationManager:(CLLocationManager *)manager didFailWithError:(NSError *)error {
-    RLog(RptrLogAreaUI | RptrLogAreaError, @"Location manager failed with error: %@", error.localizedDescription);
+    RLog(RptrLogAreaUI | RptrLogAreaLocation | RptrLogAreaError, @"Location manager failed with error: %@", error.localizedDescription);
 }
 
 - (void)storeCameraPermissionStatus {
@@ -1784,7 +1784,7 @@
         }
     }
     
-    RLog(RptrLogAreaCamera | RptrLogAreaError, @"Session interrupted for camera %@, reason: %ld", sessionID, (long)reason);
+    RLog(RptrLogAreaCamera | RptrLogAreaSession | RptrLogAreaError, @"Session interrupted for camera %@, reason: %ld", sessionID, (long)reason);
     
     switch (reason) {
         case AVCaptureSessionInterruptionReasonVideoDeviceNotAvailableInBackground:
@@ -1806,7 +1806,7 @@
 
 - (void)sessionInterruptionEnded:(NSNotification *)notification {
     AVCaptureSession *session = notification.object;
-    RLog(RptrLogAreaCamera, @"Session interruption ended for: %@", session);
+    RLog(RptrLogAreaCamera | RptrLogAreaSession, @"Session interruption ended for: %@", session);
 }
 
 - (void)sessionRuntimeError:(NSNotification *)notification {
@@ -1830,7 +1830,7 @@
         }
     }
     
-    RLog(RptrLogAreaCamera | RptrLogAreaError, @"Session runtime error for camera %@ (%@): %@", sessionID, cameraName, error.localizedDescription);
+    RLog(RptrLogAreaCamera | RptrLogAreaSession | RptrLogAreaError, @"Session runtime error for camera %@ (%@): %@", sessionID, cameraName, error.localizedDescription);
     RLog(RptrLogAreaError | RptrLogAreaDebug, @"Error domain: %@, code: %ld", error.domain, (long)error.code);
     RLog(RptrLogAreaError | RptrLogAreaDebug, @"Error userInfo: %@", error.userInfo);
     

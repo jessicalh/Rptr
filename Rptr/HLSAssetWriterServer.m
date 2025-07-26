@@ -6,7 +6,6 @@
 //
 
 #import "HLSAssetWriterServer.h"
-#import "HLSLogger.h"
 #import "RptrLogger.h"
 #import <UIKit/UIKit.h>
 #include <sys/socket.h>
@@ -107,8 +106,13 @@
 - (instancetype)initWithPort:(NSUInteger)port {
     self = [super init];
     if (self) {
-        // Set logging level to DEBUG by default
-        [HLSLogger setLogLevel:HLSLogLevelDebug];
+        // Configure logging for HLS server
+        #ifdef DEBUG
+        [RptrLogger setActiveAreas:RptrLogAreaError | RptrLogAreaHLS | RptrLogAreaVideo | 
+                                  RptrLogAreaAudio | RptrLogAreaNetwork | RptrLogAreaSegment |
+                                  RptrLogAreaHTTP | RptrLogAreaAssetWriter | RptrLogAreaTiming];
+        [RptrLogger setLogLevel:RptrLogLevelDebug];
+        #endif
         
         _port = port ?: 8080;
         _serverQueue = dispatch_queue_create("com.rptr.hls.server", DISPATCH_QUEUE_SERIAL);
@@ -353,7 +357,7 @@
         [[NSFileManager defaultManager] removeItemAtURL:segmentURL error:nil];
         
         // Create asset writer with delegate-based fMP4 for HLS
-        [HLSLogger logInfo:@"Creating delegate-based asset writer for HLS fMP4"];
+        RLog(RptrLogAreaHLS | RptrLogAreaAssetWriter, @"Creating delegate-based asset writer for HLS fMP4");
         
         // Use contentType for delegate-based delivery (iOS 14+)
         if (@available(iOS 14.0, *)) {
@@ -364,10 +368,10 @@
                 self.assetWriter.delegate = self;
                 // Set required initialSegmentStartTime for delegate-based output
                 self.assetWriter.initialSegmentStartTime = kCMTimeZero;
-                [HLSLogger logInfo:@"Using delegate-based fMP4 approach with Apple HLS profile"];
-                [HLSLogger logDebug:@"Delegate set: %@", self.assetWriter.delegate ? @"YES" : @"NO"];
+                RLog(RptrLogAreaHLS | RptrLogAreaAssetWriter, @"Using delegate-based fMP4 approach with Apple HLS profile");
+                RLog(RptrLogAreaHLS | RptrLogAreaAssetWriter | RptrLogAreaDebug, @"Delegate set: %@", self.assetWriter.delegate ? @"YES" : @"NO");
             } else {
-                [HLSLogger logError:@"Failed to create AVAssetWriter with contentType"];
+                RLog(RptrLogAreaHLS | RptrLogAreaAssetWriter | RptrLogAreaError, @"Failed to create AVAssetWriter with contentType");
             }
         } else {
             // Fallback for older iOS versions
@@ -423,7 +427,7 @@
         
         self.videoInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:videoSettings];
         if (!self.videoInput) {
-            [HLSLogger logError:@"Failed to create video input!"];
+            RLog(RptrLogAreaVideo | RptrLogAreaError, @"Failed to create video input!");
             return;
         }
         
@@ -433,13 +437,13 @@
         RLog(RptrLogAreaHLS | RptrLogAreaVideo, @"Using identity transform for segment %ld (frames pre-oriented to landscape)", 
              (long)self.currentSegmentIndex);
         self.videoInput.expectsMediaDataInRealTime = YES;
-        [HLSLogger logDebug:@"Created video input: %@", self.videoInput];
+        RLog(RptrLogAreaVideo | RptrLogAreaDebug, @"Created video input: %@", self.videoInput);
         
         if ([self.assetWriter canAddInput:self.videoInput]) {
             [self.assetWriter addInput:self.videoInput];
-            [HLSLogger logDebug:@"Added video input to asset writer"];
+            RLog(RptrLogAreaVideo | RptrLogAreaAssetWriter | RptrLogAreaDebug, @"Added video input to asset writer");
         } else {
-            [HLSLogger logError:@"Cannot add video input to asset writer!"];
+            RLog(RptrLogAreaVideo | RptrLogAreaAssetWriter | RptrLogAreaError, @"Cannot add video input to asset writer!");
             return;
         }
         
@@ -453,14 +457,14 @@
         
         self.audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:audioSettings];
         self.audioInput.expectsMediaDataInRealTime = YES;
-        [HLSLogger logDebug:@"Created audio input: %@", self.audioInput];
+        RLog(RptrLogAreaAudio | RptrLogAreaDebug, @"Created audio input: %@", self.audioInput);
         
         // Add audio input to asset writer
         if ([self.assetWriter canAddInput:self.audioInput]) {
             [self.assetWriter addInput:self.audioInput];
-            [HLSLogger logDebug:@"Added audio input to asset writer"];
+            RLog(RptrLogAreaAudio | RptrLogAreaAssetWriter | RptrLogAreaDebug, @"Added audio input to asset writer");
         } else {
-            [HLSLogger logError:@"Cannot add audio input to asset writer!"];
+            RLog(RptrLogAreaAudio | RptrLogAreaAssetWriter | RptrLogAreaError, @"Cannot add audio input to asset writer!");
             return;  // Fail if we can't add audio input
         }
         
