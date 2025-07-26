@@ -53,4 +53,4 @@ This app is intended for casual, home use only. It does not implement certificat
 
 ## License
 
-[License information to be added]
+MIT License
