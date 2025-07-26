@@ -78,36 +78,39 @@ function initHLS() {
   }
   
   hls = new Hls({
-    debug: true, // Enable debug to see what's happening
+    debug: false, // Disable debug for production
     enableWorker: true,
-    lowLatencyMode: true,
-    liveBackBufferLength: 0, // Don't keep back buffer for live
-    liveSyncDurationCount: 2, // Stay closer to live edge
-    liveMaxLatencyDurationCount: 4,
-    maxBufferLength: 30, // Increase buffer length
-    maxMaxBufferLength: 60,
-    maxBufferSize: 60 * 1024 * 1024, // Increase buffer size
-    maxBufferHole: 0.1, // Reduce buffer hole tolerance
-    highBufferWatchdogPeriod: 2,
-    nudgeOffset: 0.2,
+    lowLatencyMode: false, // Disable aggressive low latency
+    liveBackBufferLength: 18, // Keep 18 seconds of back buffer (6 segments)
+    liveSyncDurationCount: 3, // Stay 3 segments (9 seconds) from edge
+    liveMaxLatencyDurationCount: 6, // Allow up to 6 segments latency (18 seconds)
+    maxBufferLength: 30, // Buffer up to 30 seconds (10 segments)
+    maxMaxBufferLength: 60, // Allow up to 1 minute
+    maxBufferSize: 60 * 1024 * 1024, // 60 MB buffer size
+    maxBufferHole: 0.5, // More tolerant of gaps
+    highBufferWatchdogPeriod: 3,
+    nudgeOffset: 0.5, // Less aggressive nudging
     nudgeMaxRetry: 5,
-    maxFragLookUpTolerance: 0.25,
+    maxFragLookUpTolerance: 0.5,
     liveDurationInfinity: true,
     startLevel: -1,
-    fragLoadingTimeOut: 10000, // Increase timeouts
+    fragLoadingTimeOut: 20000, // Longer timeout for fragments
     fragLoadingMaxRetry: 10,
     fragLoadingRetryDelay: 1000,
     manifestLoadingTimeOut: 10000,
     manifestLoadingMaxRetry: 5,
     manifestLoadingRetryDelay: 1000,
     // Additional settings to prevent stalling
-    initialLiveManifestSize: 1,
+    initialLiveManifestSize: 2, // Wait for 2 segments before starting
     stretchShortVideoTrack: true,
-    forceKeyFrameOnDiscontinuity: true
+    forceKeyFrameOnDiscontinuity: true,
+    // Stall detection settings
+    stallDebounceMs: 1000,
+    jumpThreshold: 0.5
   });
   
   setConnectionStatus('connecting');
-  status.innerHTML = 'Connecting to ultra-low latency stream...';
+  status.innerHTML = 'Connecting to stream...';
   
   console.log('DEBUG: About to load HLS source:', videoSrc);
   hls.loadSource(videoSrc);

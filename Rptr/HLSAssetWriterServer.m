@@ -17,10 +17,10 @@
 #include <signal.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-#define SEGMENT_DURATION 1.0  // 1 second segments for stability
-#define TARGET_DURATION 2     // Max segment duration for playlist
-#define MAX_SEGMENTS 10       // Keep 10 segments for better buffering
-#define PLAYLIST_WINDOW 5     // 5 segments in live playlist
+#define SEGMENT_DURATION 3.0  // 3 second segments - balanced latency/stability
+#define TARGET_DURATION 4     // Max segment duration for playlist
+#define MAX_SEGMENTS 20       // Keep 20 segments (1 minute) for buffering
+#define PLAYLIST_WINDOW 6     // 6 segments (18 seconds) in live playlist
 #define BUFFER_SIZE 8192
 
 @interface HLSClient : NSObject
@@ -1064,7 +1064,8 @@
                         @"#EXT-X-VERSION:7\n"  // Version 7 for fMP4
                         @"#EXT-X-TARGETDURATION:%d\n"
                         @"#EXT-X-MEDIA-SEQUENCE:0\n"
-                        @"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=6.0\n", TARGET_DURATION];
+                        @"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9.0\n"
+                        @"#EXT-X-START:TIME-OFFSET=-9.0\n", TARGET_DURATION];
     
     NSString *playlistPath = [self.baseDirectory stringByAppendingPathComponent:@"playlist.m3u8"];
     NSError *error;
@@ -1086,12 +1087,15 @@
         
         NSMutableString *playlist = [NSMutableString string];
         
-        // Header with low-latency HLS tags
+        // Header with live HLS tags
         [playlist appendString:@"#EXTM3U\n"];
         [playlist appendString:@"#EXT-X-VERSION:7\n"]; // Version 7 for fMP4
         [playlist appendFormat:@"#EXT-X-TARGETDURATION:%d\n", TARGET_DURATION];
-        [playlist appendString:@"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=6.0\n"]; // Allow skipping old segments
-        [playlist appendString:@"#EXT-X-PART-INF:PART-TARGET=0.5\n"]; // Support for partial segments
+        [playlist appendString:@"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9.0\n"]; // Allow skipping old segments
+        [playlist appendString:@"#EXT-X-START:TIME-OFFSET=-9.0\n"]; // Start playback 9 seconds (3 segments) from live edge
+        
+        // Add INDEPENDENT-SEGMENTS tag for better compatibility
+        [playlist appendString:@"#EXT-X-INDEPENDENT-SEGMENTS\n"];
         
         // Important: Do NOT include EXT-X-PLAYLIST-TYPE for live streams
         // Including it (even as EVENT or VOD) will make players treat it as non-live
@@ -1504,7 +1508,7 @@
                     @"#EXT-X-VERSION:6\n"
                     @"#EXT-X-TARGETDURATION:6\n"
                     @"#EXT-X-MEDIA-SEQUENCE:%ld\n"
-                    @"#EXT-X-PLAYLIST-TYPE:EVENT\n",
+                    @"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=6.0\n",
                     (long)self.mediaSequenceNumber];
                 playlistData = [minimalPlaylist dataUsingEncoding:NSUTF8StringEncoding];
             } else {
@@ -2374,7 +2378,9 @@
                      @"  hls = new Hls({\n"
                      @"    debug: false,\n"
                      @"    enableWorker: true,\n"
-                     @"    lowLatencyMode: true\n"
+                     @"    lowLatencyMode: false,\n"
+                     @"    maxBufferLength: 60,\n"
+                     @"    liveSyncDurationCount: 4\n"
                      @"  });\n"
                      @"  \n"
                      @"  setConnectionStatus('connecting');\n"
