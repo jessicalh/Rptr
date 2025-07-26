@@ -41,6 +41,10 @@ temp/
 .vscode/
 *.sublime-*
 
+# Test directories
+RptrTests/
+RptrUITests/
+
 # macOS
 .DS_Store
 .AppleDouble

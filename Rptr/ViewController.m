@@ -115,6 +115,11 @@
                                                      selector:@selector(appDidEnterBackground:)
                                                          name:UIApplicationDidEnterBackgroundNotification
                                                        object:nil];
+            
+            [[NSNotificationCenter defaultCenter] addObserver:self
+                                                     selector:@selector(didReceiveMemoryWarning:)
+                                                         name:UIApplicationDidReceiveMemoryWarningNotification
+                                                       object:nil];
         });
         
         // Only check permissions, don't request them yet
@@ -400,6 +405,18 @@
     // Add video input to session
     if ([session canAddInput:videoInput]) {
         [session addInput:videoInput];
+        
+        // Configure frame rate to 24 fps
+        if ([camera lockForConfiguration:&error]) {
+            // Set the frame rate to 24 fps
+            CMTime frameDuration = CMTimeMake(1, 24);
+            camera.activeVideoMinFrameDuration = frameDuration;
+            camera.activeVideoMaxFrameDuration = frameDuration;
+            [camera unlockForConfiguration];
+            RLog(RptrLogAreaCamera | RptrLogAreaVideo, @"Set frame rate to 24 fps for %@", camera.localizedName);
+        } else {
+            RLog(RptrLogAreaCamera | RptrLogAreaError, @"Could not lock camera for configuration: %@", error.localizedDescription);
+        }
     } else {
         RLog(RptrLogAreaCamera | RptrLogAreaError, @"Cannot add video input to session for %@", camera.localizedName);
         return;
@@ -672,6 +689,34 @@
     }
     
     RLog(RptrLogAreaHLS, @"App termination cleanup completed");
+}
+
+- (void)didReceiveMemoryWarning:(NSNotification *)notification {
+    RLog(RptrLogAreaMemory, @"Received memory warning in ViewController");
+    
+    // Clear any cached CIContext
+    if (self.ciContext) {
+        self.ciContext = nil;
+        RLog(RptrLogAreaMemory, @"Cleared CIContext");
+    }
+    
+    // Clear activity scores to free memory
+    [self.cameraActivityScores removeAllObjects];
+    
+    // If not currently streaming, clear more aggressively
+    if (!self.isStreaming) {
+        // Clear preview layer to free GPU memory
+        if (self.previewLayer) {
+            [self.previewLayer removeFromSuperlayer];
+            self.previewLayer = nil;
+            RLog(RptrLogAreaMemory, @"Removed preview layer to free GPU memory");
+        }
+    }
+    
+    // Force garbage collection of any autorelease pools
+    @autoreleasepool {
+        // This forces the pool to drain
+    }
 }
 
 - (void)appDidEnterBackground:(NSNotification *)notification {
@@ -1823,13 +1868,14 @@
 #pragma mark - AVCaptureVideoDataOutputSampleBufferDelegate
 
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
-    // Retain the sample buffer immediately to prevent deallocation
-    if (sampleBuffer) {
-        CFRetain(sampleBuffer);
-    } else {
-        RLog(RptrLogAreaHLS | RptrLogAreaError, @"ERROR: Received NULL sample buffer");
-        return;
-    }
+    @autoreleasepool {
+        // Retain the sample buffer immediately to prevent deallocation
+        if (sampleBuffer) {
+            CFRetain(sampleBuffer);
+        } else {
+            RLog(RptrLogAreaHLS | RptrLogAreaError, @"ERROR: Received NULL sample buffer");
+            return;
+        }
     
     // Video orientation is now set during configuration, no need to set it here
     
@@ -1950,10 +1996,21 @@
     }
     
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!imageBuffer) {
+        CFRelease(sampleBuffer);
+        return;
+    }
+    
+    // Lock the pixel buffer for reading
+    CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+    
     CIImage *ciImage = [CIImage imageWithCVImageBuffer:imageBuffer];
     
     // Calculate average brightness
     CGFloat brightness = [self calculateBrightnessForImage:ciImage];
+    
+    // Unlock the pixel buffer
+    CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
     
     // Store recent brightness values for motion detection per camera
     static NSMutableDictionary *cameraBrightnessHistory = nil;
@@ -1992,9 +2049,17 @@
     
     // Release the sample buffer that we retained at the beginning
     CFRelease(sampleBuffer);
+    } // End of @autoreleasepool
 }
 
 - (CGFloat)calculateBrightnessForImage:(CIImage *)image {
+    NSParameterAssert(image != nil);
+    
+    if (!image) {
+        RLog(RptrLogAreaVideo | RptrLogAreaError, @"Cannot calculate brightness for nil image");
+        return 0.0;
+    }
+    
     CIVector *extent = [CIVector vectorWithX:image.extent.origin.x
                                             Y:image.extent.origin.y
                                             Z:image.extent.size.width
@@ -2006,11 +2071,18 @@
     
     CIImage *outputImage = filter.outputImage;
     
+    // Create CIContext if needed
+    if (!self.ciContext) {
+        self.ciContext = [CIContext context];
+        NSAssert(self.ciContext != nil, @"Failed to create CIContext");
+    }
+    
     // Render to a 1x1 pixel to get average color
     CGRect outputExtent = CGRectMake(0, 0, 1, 1);
     CGImageRef cgImage = [self.ciContext createCGImage:outputImage fromRect:outputExtent];
     
     if (!cgImage) {
+        RLog(RptrLogAreaVideo | RptrLogAreaError, @"Failed to create CGImage from CIImage");
         return 0;
     }
     

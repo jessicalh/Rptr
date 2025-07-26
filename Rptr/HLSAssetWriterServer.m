@@ -52,7 +52,7 @@
 @property (nonatomic, assign) int serverSocket;
 @property (atomic, assign) BOOL running;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, HLSClient *> *clients;
-@property (nonatomic, strong) NSLock *clientsLock;
+@property (nonatomic, strong) dispatch_queue_t clientsQueue;  // Concurrent queue with barriers instead of lock
 
 // Asset Writer
 @property (nonatomic, strong) dispatch_queue_t writerQueue;
@@ -75,7 +75,8 @@
 @property (nonatomic, strong) NSData *initializationSegmentData;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSData *> *segmentData;
 @property (nonatomic, strong) NSLock *segmentDataLock;
-@property (nonatomic, strong) NSLock *segmentsLock;
+@property (nonatomic, strong) dispatch_queue_t segmentDataQueue;  // Concurrent queue with barriers
+@property (nonatomic, strong) dispatch_queue_t segmentsQueue;      // Concurrent queue with barriers
 
 // Timing
 @property (nonatomic, assign) CMTime nextSegmentBoundary;
@@ -85,15 +86,10 @@
 @property (nonatomic, strong) NSDate *currentSegmentStartTime;
 @property (nonatomic, assign) BOOL forceSegmentRotation;
 
-// File Monitoring
-@property (nonatomic, strong) dispatch_source_t fileMonitorSource;
-@property (nonatomic, assign) NSUInteger lastFileSize;
-@property (nonatomic, strong) NSFileHandle *currentFileHandle;
 
 // Performance
 @property (nonatomic, assign) NSInteger framesProcessed;
 @property (nonatomic, assign) NSInteger framesDropped;
-@property (nonatomic, strong) NSDate *streamStartTime;
 
 // Video orientation
 
@@ -119,11 +115,12 @@
         _propertyQueue = dispatch_queue_create("com.rptr.hls.properties", DISPATCH_QUEUE_CONCURRENT);
         _writerQueue = dispatch_queue_create("com.rptr.hls.writer", DISPATCH_QUEUE_SERIAL);
         _clients = [NSMutableDictionary dictionary];
-        _clientsLock = [[NSLock alloc] init];
+        _clientsQueue = dispatch_queue_create("com.rptr.hls.clients", DISPATCH_QUEUE_CONCURRENT);
         _segments = [NSMutableArray array];
         _segmentData = [NSMutableDictionary dictionary];
         _segmentDataLock = [[NSLock alloc] init];
-        _segmentsLock = [[NSLock alloc] init];
+        _segmentDataQueue = dispatch_queue_create("com.rptr.hls.segmentdata", DISPATCH_QUEUE_CONCURRENT);
+        _segmentsQueue = dispatch_queue_create("com.rptr.hls.segments", DISPATCH_QUEUE_CONCURRENT);
         
         // Generate random 10-character string
         _randomPath = [self generateRandomString:10];
@@ -140,6 +137,12 @@
         
         // Setup directories
         [self setupDirectories];
+        
+        // Register for memory warnings
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(handleMemoryWarning:)
+                                                     name:UIApplicationDidReceiveMemoryWarningNotification
+                                                   object:nil];
     }
     return self;
 }
@@ -301,13 +304,11 @@
         }
         
         // Disconnect all clients
-        [self.clientsLock lock];
-        for (NSNumber *socketNum in self.clients.allKeys) {
+        NSArray *clientSockets = [self allClientSockets];
+        for (NSNumber *socketNum in clientSockets) {
             close(socketNum.intValue);
         }
-        [self.clients removeAllObjects];
-        [self.activeClients removeAllObjects];
-        [self.clientsLock unlock];
+        [self removeAllClients];
         
         // Clean up segments
         [self cleanupAllSegments];
@@ -407,14 +408,14 @@
             AVVideoWidthKey: @(1280),
             AVVideoHeightKey: @(720),
             AVVideoCompressionPropertiesKey: @{
-                AVVideoAverageBitRateKey: @(3500000),               // 3.5 Mbps - optimized for 30fps quality
-                AVVideoMaxKeyFrameIntervalKey: @(30),               // 1 second at 30fps
+                AVVideoAverageBitRateKey: @(1000000),               // 1 Mbps - balanced quality/bandwidth
+                AVVideoMaxKeyFrameIntervalKey: @(24),               // 1 second at 24fps
                 AVVideoMaxKeyFrameIntervalDurationKey: @(1.0),      // 1-second keyframe interval
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,  // High profile for better quality
                 AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCABAC,       // CABAC for better compression
                 AVVideoAllowFrameReorderingKey: @(NO),             // Disable B-frames for compatibility
-                AVVideoExpectedSourceFrameRateKey: @(30),          // Expected frame rate
-                AVVideoAverageNonDroppableFrameRateKey: @(30),     // Maintain consistent frame rate
+                AVVideoExpectedSourceFrameRateKey: @(24),          // Expected frame rate
+                AVVideoAverageNonDroppableFrameRateKey: @(24),     // Maintain consistent frame rate
                 // Quality hint for encoder (0.0-1.0, higher is better)
                 AVVideoQualityKey: @(0.85)
             }
@@ -447,7 +448,7 @@
             AVFormatIDKey: @(kAudioFormatMPEG4AAC),
             AVNumberOfChannelsKey: @(2),
             AVSampleRateKey: @(48000),    // 48kHz for better quality
-            AVEncoderBitRateKey: @(192000) // 192 kbps for better audio
+            AVEncoderBitRateKey: @(96000) // 96 kbps - reasonable audio quality
         };
         
         self.audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:audioSettings];
@@ -467,7 +468,6 @@
         if ([self.assetWriter startWriting]) {
             self.waitingForKeyFrame = YES;
             self.sessionStarted = NO;  // Reset session flag for new writer
-            [self startFileMonitoring:segmentURL];
             RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Asset writer started for segment %ld", (long)self.currentSegmentIndex);
             RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Writer status after startWriting: %ld", (long)self.assetWriter.status);
             // Don't set isWriting yet - wait for first frame to start session
@@ -496,7 +496,6 @@
         
         self.isWriting = NO;
         self.sessionStarted = NO;
-        [self stopFileMonitoring];
         
         // Only mark as finished if writer is in correct state
         if (self.assetWriter && self.assetWriter.status == AVAssetWriterStatusWriting) {
@@ -528,33 +527,34 @@
 #pragma mark - Sample Buffer Processing
 
 - (void)processVideoSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    if (!sampleBuffer) {
-        return;
-    }
-    
-    // Quick state check
-    if (!self.running) {
-        RLog(RptrLogAreaHLS | RptrLogAreaBuffer, @"Server not running, ignoring sample buffer");
-        return;
-    }
-    
-    // Validate sample buffer before processing
-    if (!CMSampleBufferIsValid(sampleBuffer)) {
-        RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"WARNING: Invalid sample buffer received");
-        return;
-    }
-    
-    // Don't retain the buffer - process it immediately
-    // The capture system needs these buffers back quickly for its pool
-    
-    // Quick check if we should process this frame
-    if (!self.assetWriter || !self.videoInput || self.isFinishingWriter) {
-        return;
-    }
-    
-    // Get timing information before async dispatch
-    CMTime presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
-    BOOL isFirstFrame = !self.sessionStarted;
+    @autoreleasepool {
+        if (!sampleBuffer) {
+            return;
+        }
+        
+        // Quick state check
+        if (!self.running) {
+            RLog(RptrLogAreaHLS | RptrLogAreaBuffer, @"Server not running, ignoring sample buffer");
+            return;
+        }
+        
+        // Validate sample buffer before processing
+        if (!CMSampleBufferIsValid(sampleBuffer)) {
+            RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"WARNING: Invalid sample buffer received");
+            return;
+        }
+        
+        // Don't retain the buffer - process it immediately
+        // The capture system needs these buffers back quickly for its pool
+        
+        // Quick check if we should process this frame
+        if (!self.assetWriter || !self.videoInput || self.isFinishingWriter) {
+            return;
+        }
+        
+        // Get timing information before async dispatch
+        CMTime presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        BOOL isFirstFrame = !self.sessionStarted;
     
     // For the first frame, we need format information
     CMFormatDescriptionRef formatDesc = NULL;
@@ -581,8 +581,8 @@
     dispatch_async(self.writerQueue, ^{
         @try {
         // Validate sample buffer is still valid
-        if (!CMSampleBufferIsValid(sampleBuffer)) {
-            RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"ERROR: Sample buffer became invalid");
+        if (!sampleBuffer || !CMSampleBufferIsValid(sampleBuffer)) {
+            RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"ERROR: Sample buffer became invalid or nil");
             return;
         }
         
@@ -597,6 +597,11 @@
             RLog(RptrLogAreaHLS | RptrLogAreaError, @"ERROR: No video input available!");
             return;
         }
+        
+        // Defensive check for writer status
+        NSAssert(self.assetWriter.status != AVAssetWriterStatusCancelled, @"Writer should not be cancelled");
+        NSAssert(self.assetWriter.status != AVAssetWriterStatusUnknown || !self.sessionStarted, 
+                 @"Writer in unknown state after session started");
         
         // Handle first frame - start the session
         if (isFirstFrame) {
@@ -798,9 +803,11 @@
             }
         }
     });
+    } // End of @autoreleasepool
 }
 
 - (void)processAudioSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    @autoreleasepool {
     if (!sampleBuffer) {
         return;
     }
@@ -848,6 +855,7 @@
             }
         }
     });
+    } // End of @autoreleasepool
 }
 
 - (void)rotateSegment {
@@ -995,47 +1003,6 @@
     self.assetWriter = nil;
 }
 
-#pragma mark - File Monitoring
-
-- (void)startFileMonitoring:(NSURL *)fileURL {
-    [self stopFileMonitoring];
-    
-    int fd = open(fileURL.path.UTF8String, O_EVTONLY);
-    if (fd < 0) {
-        return;
-    }
-    
-    self.fileMonitorSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE, fd,
-                                                    DISPATCH_VNODE_WRITE | DISPATCH_VNODE_EXTEND,
-                                                    self.writerQueue);
-    
-    __weak typeof(self) weakSelf = self;
-    dispatch_source_set_event_handler(self.fileMonitorSource, ^{
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        // File has been modified
-        [strongSelf checkForNewSegmentData:fileURL];
-    });
-    
-    dispatch_source_set_cancel_handler(self.fileMonitorSource, ^{
-        close(fd);
-    });
-    
-    dispatch_resume(self.fileMonitorSource);
-}
-
-- (void)stopFileMonitoring {
-    if (self.fileMonitorSource) {
-        dispatch_source_cancel(self.fileMonitorSource);
-        self.fileMonitorSource = nil;
-    }
-}
-
-- (void)checkForNewSegmentData:(NSURL *)fileURL {
-    // This method can be used to monitor fragmented MP4 atom creation
-    // For now, we rely on segment rotation timing
-}
-
 #pragma mark - Segment Timer
 
 - (void)startSegmentTimer {
@@ -1109,8 +1076,8 @@
 - (void)updatePlaylist {
     dispatch_async(self.writerQueue, ^{
         RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaDebug, @"Updating playlist...");
-        [self.segmentsLock lock];
-        NSUInteger segmentCount = self.segments.count;
+        dispatch_sync(self.segmentsQueue, ^{
+            NSUInteger segmentCount = self.segments.count;
         RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Total segments available: %lu", (unsigned long)segmentCount);
         
         NSMutableString *playlist = [NSMutableString string];
@@ -1165,43 +1132,42 @@
             RLog(RptrLogAreaHLS | RptrLogAreaFile, @"Updated playlist with %ld segments", (long)(segmentCount - startIndex));
             RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaDebug, @"Playlist content:\n%@", playlist);
         }
-        
-        [self.segmentsLock unlock];
+        });
     });
 }
 
 - (void)cleanupOldSegments {
-    [self.segmentsLock lock];
-    NSUInteger initialCount = self.segments.count;
-    while (self.segments.count > MAX_SEGMENTS) {
-        HLSSegmentInfo *oldSegment = self.segments.firstObject;
-        NSTimeInterval segmentAge = [[NSDate date] timeIntervalSinceDate:oldSegment.createdAt];
-        
-        // Delete the file
-        [[NSFileManager defaultManager] removeItemAtPath:oldSegment.path error:nil];
-        
-        // Remove from array
-        [self.segments removeObjectAtIndex:0];
-        
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Removed old segment: %@ (#%ld, age: %.1fs) - Segments: %lu -> %lu", 
-               oldSegment.filename, (long)oldSegment.sequenceNumber, segmentAge,
-               (unsigned long)initialCount, (unsigned long)self.segments.count);
-    }
-    [self.segmentsLock unlock];
+    dispatch_barrier_async(self.segmentsQueue, ^{
+        NSUInteger initialCount = self.segments.count;
+        while (self.segments.count > MAX_SEGMENTS) {
+            HLSSegmentInfo *oldSegment = self.segments.firstObject;
+            NSTimeInterval segmentAge = [[NSDate date] timeIntervalSinceDate:oldSegment.createdAt];
+            
+            // Delete the file
+            [[NSFileManager defaultManager] removeItemAtPath:oldSegment.path error:nil];
+            
+            // Remove from array
+            [self.segments removeObjectAtIndex:0];
+            
+            RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Removed old segment: %@ (#%ld, age: %.1fs) - Segments: %lu -> %lu", 
+                   oldSegment.filename, (long)oldSegment.sequenceNumber, segmentAge,
+                   (unsigned long)initialCount, (unsigned long)self.segments.count);
+        }
+    });
 }
 
 - (void)cleanupAllSegments {
-    [self.segmentsLock lock];
-    // Remove all segment files
-    for (HLSSegmentInfo *segment in self.segments) {
-        NSError *error = nil;
-        [[NSFileManager defaultManager] removeItemAtPath:segment.path error:&error];
-        if (error) {
-            RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaError, @"Failed to remove segment %@: %@", segment.filename, error.localizedDescription);
+    dispatch_barrier_async(self.segmentsQueue, ^{
+        // Remove all segment files
+        for (HLSSegmentInfo *segment in self.segments) {
+            NSError *error = nil;
+            [[NSFileManager defaultManager] removeItemAtPath:segment.path error:&error];
+            if (error) {
+                RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaError, @"Failed to remove segment %@: %@", segment.filename, error.localizedDescription);
+            }
         }
-    }
-    [self.segments removeAllObjects];
-    [self.segmentsLock unlock];
+        [self.segments removeAllObjects];
+    });
     
     // Remove initialization segment
     NSString *initSegmentPath = [self.segmentDirectory stringByAppendingPathComponent:@"init.mp4"];
@@ -1266,14 +1232,18 @@
 }
 
 - (void)handleClient:(int)clientSocket address:(const struct sockaddr_in *)clientAddr {
+    NSParameterAssert(clientSocket >= 0);
+    NSParameterAssert(clientAddr != NULL);
+    
     RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"1. handleClient started for socket: %d", clientSocket);
     
     // Use inet_ntop for thread safety
     char clientIP[INET_ADDRSTRLEN];
     NSString *clientAddress = @"unknown";
     
-    if (inet_ntop(AF_INET, &(clientAddr->sin_addr), clientIP, INET_ADDRSTRLEN) != NULL) {
+    if (clientAddr && inet_ntop(AF_INET, &(clientAddr->sin_addr), clientIP, INET_ADDRSTRLEN) != NULL) {
         clientAddress = [NSString stringWithUTF8String:clientIP];
+        NSAssert(clientAddress != nil, @"Client address conversion should not fail");
     } else {
         RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaError, @"WARNING: Failed to get client IP address: %s", strerror(errno));
     }
@@ -1283,20 +1253,21 @@
     client.address = clientAddress;
     client.lastActivity = [[NSDate date] timeIntervalSince1970];
     
-    [self.clientsLock lock];
-    self.clients[@(clientSocket)] = client;
+    [self addClient:client forSocket:clientSocket];
     
     // Track active client by IP address
-    BOOL isNewClient = (self.activeClients[clientAddress] == nil);
-    self.activeClients[clientAddress] = [NSDate date];
-    [self.clientsLock unlock];
+    dispatch_barrier_async(self.clientsQueue, ^{
+        BOOL isNewClient = (self.activeClients[clientAddress] == nil);
+        self.activeClients[clientAddress] = [NSDate date];
+        
+        if (isNewClient && [self.delegate respondsToSelector:@selector(hlsServer:clientConnected:)]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self.delegate hlsServer:self clientConnected:clientAddress];
+            });
+        }
+    });
     
     RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork, @"Client connected: %@ (active clients: %lu)", clientAddress, (unsigned long)self.activeClients.count);
-    
-    // Only notify delegate for new clients
-    if (isNewClient && [self.delegate respondsToSelector:@selector(hlsServer:clientConnected:)]) {
-        [self.delegate hlsServer:self clientConnected:clientAddress];
-    }
     
     // Read request
     RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"2. About to read request from socket %d", clientSocket);
@@ -1350,9 +1321,9 @@
     }
     
     // Remove client
-    [self.clientsLock lock];
-    [self.clients removeObjectForKey:@(clientSocket)];
-    [self.clientsLock unlock];
+    dispatch_barrier_async(self.clientsQueue, ^{
+        [self.clients removeObjectForKey:@(clientSocket)];
+    });
     
     // Safe close
     if (clientSocket >= 0) {
@@ -1372,12 +1343,12 @@
     RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"handleGETRequest entry - path class: %@", [path class]);
     
     // Update client activity
-    [self.clientsLock lock];
-    HLSClient *client = self.clients[@(clientSocket)];
-    if (client && client.address) {
-        self.activeClients[client.address] = [NSDate date];
-    }
-    [self.clientsLock unlock];
+    dispatch_barrier_async(self.clientsQueue, ^{
+        HLSClient *client = self.clients[@(clientSocket)];
+        if (client && client.address) {
+            self.activeClients[client.address] = [NSDate date];
+        }
+    });
     
     // Remove query parameters
     NSRange range = [path rangeOfString:@"?"];
@@ -1486,15 +1457,20 @@
 
 - (void)sendPlaylistResponse:(int)clientSocket {
     RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"=== Playlist Request Debug ===");
-    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Using delegate-based approach: %@", @available(iOS 14.0, *) ? @"YES" : @"NO");
+    BOOL isDelegateAvailable = NO;
+    if (@available(iOS 14.0, *)) {
+        isDelegateAvailable = YES;
+    }
+    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Using delegate-based approach: %@", isDelegateAvailable ? @"YES" : @"NO");
     RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Initialization segment available: %@", self.initializationSegmentData ? @"YES" : @"NO");
     [self.segmentDataLock lock];
     NSUInteger segmentCount = self.segmentData.count;
     [self.segmentDataLock unlock];
     RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Media segments in memory: %lu", (unsigned long)segmentCount);
-    [self.segmentsLock lock];
-    NSUInteger arrayCount = self.segments.count;
-    [self.segmentsLock unlock];
+    __block NSUInteger arrayCount;
+    dispatch_sync(self.segmentsQueue, ^{
+        arrayCount = self.segments.count;
+    });
     RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Segments array count: %lu", (unsigned long)arrayCount);
     
     NSString *playlistPath = [self.baseDirectory stringByAppendingPathComponent:@"playlist.m3u8"];
@@ -1619,14 +1595,32 @@
     
     send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
     
-    // Send file data in chunks
-    NSFileHandle *fileHandle = [NSFileHandle fileHandleForReadingAtPath:segmentPath];
-    if (fileHandle) {
-        NSData *chunk;
-        while ((chunk = [fileHandle readDataOfLength:BUFFER_SIZE]).length > 0) {
-            send(clientSocket, chunk.bytes, chunk.length, MSG_NOSIGNAL);
-        }
-        [fileHandle closeFile];
+    // Use dispatch_data for zero-copy file sending
+    dispatch_queue_t ioQueue = dispatch_queue_create("com.rptr.file.io", DISPATCH_QUEUE_SERIAL);
+    int fd = open(segmentPath.UTF8String, O_RDONLY);
+    
+    if (fd >= 0) {
+        // Map the file into memory (zero-copy)
+        dispatch_read(fd, fileSize, ioQueue, ^(dispatch_data_t data, int error) {
+            close(fd);
+            if (!error && data) {
+                // Send the data using dispatch_data
+                dispatch_data_apply(data, ^bool(dispatch_data_t region, size_t offset, const void *buffer, size_t size) {
+                    size_t totalSent = 0;
+                    while (totalSent < size) {
+                        ssize_t sent = send(clientSocket, (const char *)buffer + totalSent, 
+                                          size - totalSent, MSG_NOSIGNAL);
+                        if (sent <= 0) {
+                            break;
+                        }
+                        totalSent += sent;
+                    }
+                    return true; // Continue iterating
+                });
+            }
+        });
+    } else {
+        RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaError, @"Failed to open segment file: %@", segmentPath);
     }
 }
 
@@ -1650,7 +1644,25 @@
     RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaSegment | RptrLogAreaNetwork, @"Sending initialization segment (%lu bytes)", (unsigned long)self.initializationSegmentData.length);
     
     send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
-    send(clientSocket, self.initializationSegmentData.bytes, self.initializationSegmentData.length, MSG_NOSIGNAL);
+    
+    // Use dispatch_data for efficient memory management
+    dispatch_data_t dispatchData = dispatch_data_create(self.initializationSegmentData.bytes, 
+                                                        self.initializationSegmentData.length,
+                                                        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                                                        DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    
+    dispatch_data_apply(dispatchData, ^bool(dispatch_data_t region, size_t offset, const void *buffer, size_t size) {
+        size_t totalSent = 0;
+        while (totalSent < size) {
+            ssize_t sent = send(clientSocket, (const char *)buffer + totalSent, 
+                              size - totalSent, MSG_NOSIGNAL);
+            if (sent <= 0) {
+                break;
+            }
+            totalSent += sent;
+        }
+        return true;
+    });
 }
 
 - (void)sendDelegateSegmentResponse:(int)clientSocket segmentName:(NSString *)segmentName {
@@ -1684,7 +1696,25 @@
     RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaSegment | RptrLogAreaNetwork, @"Sending delegate segment %@ (%lu bytes)", segmentName, (unsigned long)segmentData.length);
     
     send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
-    send(clientSocket, segmentData.bytes, segmentData.length, MSG_NOSIGNAL);
+    
+    // Use dispatch_data for efficient memory management
+    dispatch_data_t dispatchData = dispatch_data_create(segmentData.bytes, 
+                                                        segmentData.length,
+                                                        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+                                                        DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    
+    dispatch_data_apply(dispatchData, ^bool(dispatch_data_t region, size_t offset, const void *buffer, size_t size) {
+        size_t totalSent = 0;
+        while (totalSent < size) {
+            ssize_t sent = send(clientSocket, (const char *)buffer + totalSent, 
+                              size - totalSent, MSG_NOSIGNAL);
+            if (sent <= 0) {
+                break;
+            }
+            totalSent += sent;
+        }
+        return true;
+    });
 }
 
 - (void)sendErrorResponse:(int)clientSocket code:(NSInteger)code message:(NSString *)message {
@@ -2027,37 +2057,39 @@
 }
 
 - (NSUInteger)connectedClients {
-    [self.clientsLock lock];
-    NSUInteger count = self.activeClients.count;
-    [self.clientsLock unlock];
+    __block NSUInteger count;
+    dispatch_sync(self.clientsQueue, ^{
+        count = self.activeClients.count;
+    });
     return count;
 }
 
 - (void)cleanupInactiveClients {
-    [self.clientsLock lock];
-    NSDate *now = [NSDate date];
-    NSMutableArray *inactiveClients = [NSMutableArray array];
-    
-    // Find clients that haven't been active for 30 seconds
-    for (NSString *clientAddress in self.activeClients.allKeys) {
-        NSDate *lastActivity = self.activeClients[clientAddress];
-        if ([now timeIntervalSinceDate:lastActivity] > 30.0) {
-            [inactiveClients addObject:clientAddress];
-        }
-    }
-    
-    // Remove inactive clients
-    for (NSString *clientAddress in inactiveClients) {
-        [self.activeClients removeObjectForKey:clientAddress];
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork, @"Removing inactive client: %@", clientAddress);
+    dispatch_barrier_async(self.clientsQueue, ^{
+        NSDate *now = [NSDate date];
+        NSMutableArray *inactiveClients = [NSMutableArray array];
         
-        // Notify delegate
-        if ([self.delegate respondsToSelector:@selector(hlsServer:clientDisconnected:)]) {
-            [self.delegate hlsServer:self clientDisconnected:clientAddress];
+        // Find clients that haven't been active for 30 seconds
+        for (NSString *clientAddress in self.activeClients.allKeys) {
+            NSDate *lastActivity = self.activeClients[clientAddress];
+            if ([now timeIntervalSinceDate:lastActivity] > 30.0) {
+                [inactiveClients addObject:clientAddress];
+            }
         }
-    }
-    
-    [self.clientsLock unlock];
+        
+        // Remove inactive clients
+        for (NSString *clientAddress in inactiveClients) {
+            [self.activeClients removeObjectForKey:clientAddress];
+            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork, @"Removing inactive client: %@", clientAddress);
+            
+            // Notify delegate
+            if ([self.delegate respondsToSelector:@selector(hlsServer:clientDisconnected:)]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self.delegate hlsServer:self clientDisconnected:clientAddress];
+                });
+            }
+        }
+    });
 }
 
 - (BOOL)isStreaming {
@@ -2065,11 +2097,92 @@
 }
 
 - (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self stopServer];
+}
+
+#pragma mark - Thread-Safe Accessors
+
+- (void)addClient:(HLSClient *)client forSocket:(int)socket {
+    dispatch_barrier_async(self.clientsQueue, ^{
+        self.clients[@(socket)] = client;
+    });
+}
+
+- (void)removeClientForSocket:(int)socket {
+    dispatch_barrier_async(self.clientsQueue, ^{
+        [self.clients removeObjectForKey:@(socket)];
+    });
+}
+
+- (HLSClient *)clientForSocket:(int)socket {
+    __block HLSClient *client = nil;
+    dispatch_sync(self.clientsQueue, ^{
+        client = self.clients[@(socket)];
+    });
+    return client;
+}
+
+- (NSArray *)allClientSockets {
+    __block NSArray *sockets = nil;
+    dispatch_sync(self.clientsQueue, ^{
+        sockets = [self.clients.allKeys copy];
+    });
+    return sockets;
+}
+
+- (void)removeAllClients {
+    dispatch_barrier_async(self.clientsQueue, ^{
+        [self.clients removeAllObjects];
+        [self.activeClients removeAllObjects];
+    });
+}
+
+#pragma mark - Memory Management
+
+- (void)handleMemoryWarning:(NSNotification *)notification {
+    RLog(RptrLogAreaHLS | RptrLogAreaMemory, @"Received memory warning - cleaning up segments");
+    
+    dispatch_async(self.writerQueue, ^{
+        // Clean up more aggressively during memory pressure
+        [self.segmentDataLock lock];
+        NSUInteger segmentDataCount = self.segmentData.count;
+        
+        // Keep only the most recent 3 segments in memory
+        if (segmentDataCount > 3) {
+            dispatch_sync(self.segmentsQueue, ^{
+                // Sort segments by sequence number to find oldest
+                NSArray *sortedSegments = [self.segments sortedArrayUsingComparator:^NSComparisonResult(HLSSegmentInfo *obj1, HLSSegmentInfo *obj2) {
+                    return [@(obj1.sequenceNumber) compare:@(obj2.sequenceNumber)];
+                }];
+                
+                // Remove all but the most recent 3 segments from memory
+                NSInteger removeCount = sortedSegments.count - 3;
+                if (removeCount > 0) {
+                    for (NSInteger i = 0; i < removeCount; i++) {
+                        HLSSegmentInfo *segment = sortedSegments[i];
+                        [self.segmentData removeObjectForKey:segment.filename];
+                        RLog(RptrLogAreaHLS | RptrLogAreaMemory, @"Removed segment from memory: %@", segment.filename);
+                    }
+                }
+            });
+        }
+        
+        // Clear initialization segment if we're under severe pressure
+        if (segmentDataCount > 5) {
+            self.initializationSegmentData = nil;
+            RLog(RptrLogAreaHLS | RptrLogAreaMemory, @"Cleared initialization segment from memory");
+        }
+        
+        RLog(RptrLogAreaHLS | RptrLogAreaMemory, @"Memory cleanup complete - segments in memory: %lu -> %lu",
+             (unsigned long)segmentDataCount, (unsigned long)self.segmentData.count);
+        [self.segmentDataLock unlock];
+    });
 }
 
 #pragma mark - Debug Helpers
 
+#ifdef DEBUG
 - (void)logWriterState {
     dispatch_async(self.writerQueue, ^{
         RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"=== Writer State ===");
@@ -2089,6 +2202,11 @@
         RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"==================");
     });
 }
+#else
+- (void)logWriterState {
+    // No-op in release builds
+}
+#endif
 
 #pragma mark - AVAssetWriterDelegate
 
@@ -2117,25 +2235,25 @@
             segmentInfo.createdAt = [NSDate date];
             segmentInfo.fileSize = segmentData.length;
             
-            [self.segmentsLock lock];
-            [self.segments addObject:segmentInfo];
-            
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Stored media segment: %@ (%lu bytes, %.2fs)", 
-                  segmentName, (unsigned long)segmentData.length, CMTimeGetSeconds(segmentInfo.duration));
-            
-            // Clean up old segments to prevent memory buildup
-            if (self.segments.count > MAX_SEGMENTS) {
-                NSInteger removeCount = self.segments.count - MAX_SEGMENTS;
-                for (NSInteger i = 0; i < removeCount; i++) {
-                    HLSSegmentInfo *oldSegment = self.segments[0];
-                    [self.segmentDataLock lock];
-                    [self.segmentData removeObjectForKey:oldSegment.filename];
-                    [self.segmentDataLock unlock];
-                    [self.segments removeObjectAtIndex:0];
-                    RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Removed old segment: %@", oldSegment.filename);
+            dispatch_barrier_async(self.segmentsQueue, ^{
+                [self.segments addObject:segmentInfo];
+                
+                RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Stored media segment: %@ (%lu bytes, %.2fs)", 
+                      segmentName, (unsigned long)segmentData.length, CMTimeGetSeconds(segmentInfo.duration));
+                
+                // Clean up old segments to prevent memory buildup
+                if (self.segments.count > MAX_SEGMENTS) {
+                    NSInteger removeCount = self.segments.count - MAX_SEGMENTS;
+                    for (NSInteger i = 0; i < removeCount; i++) {
+                        HLSSegmentInfo *oldSegment = self.segments[0];
+                        [self.segmentDataLock lock];
+                        [self.segmentData removeObjectForKey:oldSegment.filename];
+                        [self.segmentDataLock unlock];
+                        [self.segments removeObjectAtIndex:0];
+                        RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Removed old segment: %@", oldSegment.filename);
+                    }
                 }
-            }
-            [self.segmentsLock unlock];
+            });
             
             self.currentSegmentIndex++;
             self.mediaSequenceNumber++;
@@ -2473,9 +2591,9 @@
     RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Regenerated randomized URL path: %@ (was: %@)", _randomPath, self.previousRandomPath);
     
     // Clear all active clients
-    [self.clientsLock lock];
-    [self.activeClients removeAllObjects];
-    [self.clientsLock unlock];
+    dispatch_barrier_async(self.clientsQueue, ^{
+        [self.activeClients removeAllObjects];
+    });
     
     // Clear the previous path after a delay to allow final 410 responses
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
