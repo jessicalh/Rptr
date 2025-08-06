@@ -81,12 +81,12 @@ function initHLS() {
     debug: false, // Disable debug for production
     enableWorker: true,
     lowLatencyMode: false, // Disable aggressive low latency
-    liveBackBufferLength: 18, // Keep 18 seconds of back buffer (6 segments)
-    liveSyncDurationCount: 3, // Stay 3 segments (9 seconds) from edge
-    liveMaxLatencyDurationCount: 6, // Allow up to 6 segments latency (18 seconds)
-    maxBufferLength: 30, // Buffer up to 30 seconds (10 segments)
-    maxMaxBufferLength: 60, // Allow up to 1 minute
-    maxBufferSize: 60 * 1024 * 1024, // 60 MB buffer size
+    liveBackBufferLength: 24, // Keep 24 seconds of back buffer (6 segments)
+    liveSyncDurationCount: 2, // Stay 2 segments (8 seconds) from edge
+    liveMaxLatencyDurationCount: 6, // Allow up to 6 segments latency (24 seconds)
+    maxBufferLength: 32, // Buffer up to 32 seconds (8 segments)
+    maxMaxBufferLength: 80, // Allow up to 80 seconds (20 segments)
+    maxBufferSize: 30 * 1024 * 1024, // 30 MB buffer size (reduced for mobile)
     maxBufferHole: 0.5, // More tolerant of gaps
     highBufferWatchdogPeriod: 3,
     nudgeOffset: 0.5, // Less aggressive nudging
@@ -94,10 +94,10 @@ function initHLS() {
     maxFragLookUpTolerance: 0.5,
     liveDurationInfinity: true,
     startLevel: -1,
-    fragLoadingTimeOut: 20000, // Longer timeout for fragments
+    fragLoadingTimeOut: 30000, // 30 second timeout for 6-second segments
     fragLoadingMaxRetry: 10,
-    fragLoadingRetryDelay: 1000,
-    manifestLoadingTimeOut: 10000,
+    fragLoadingRetryDelay: 2000, // 2 second retry delay
+    manifestLoadingTimeOut: 15000, // 15 second manifest timeout
     manifestLoadingMaxRetry: 5,
     manifestLoadingRetryDelay: 1000,
     // Additional settings to prevent stalling

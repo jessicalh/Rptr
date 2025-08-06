@@ -181,10 +181,10 @@
     
     // Ensure preview layer fills the view after orientation change
     if (self.previewLayer) {
-        CATransaction.begin;
-        CATransaction.disableActions = YES;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
         self.previewLayer.frame = self.view.bounds;
-        CATransaction.commit;
+        [CATransaction commit];
         RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidAppear - Updated preview layer frame: %@", NSStringFromCGRect(self.previewLayer.frame));
     }
 }
@@ -262,9 +262,13 @@
 
 - (void)setupSingleCameraSession {
     
-    // Get all cameras
-    NSArray<AVCaptureDevice *> *cameras = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
-    RLog(RptrLogAreaCamera, @"Found %lu cameras", (unsigned long)cameras.count);
+    // Get all cameras using AVCaptureDeviceDiscoverySession (iOS 10+)
+    AVCaptureDeviceDiscoverySession *discoverySession = [AVCaptureDeviceDiscoverySession
+        discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
+        mediaType:AVMediaTypeVideo
+        position:AVCaptureDevicePositionUnspecified];
+    NSArray<AVCaptureDevice *> *cameras = discoverySession.devices;
+    RLogVideo(@"Found %lu cameras", (unsigned long)cameras.count);
     
     
     // Set up a session for each camera (but only one will work at a time)
@@ -315,9 +319,12 @@
         RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Native bounds: %@", NSStringFromCGRect(nativeBounds));
         RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Screen scale: %f, native scale: %f", scale, nativeScale);
         
-        // Check current interface orientation
-        UIInterfaceOrientation orientation = [UIApplication sharedApplication].statusBarOrientation;
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Current interface orientation: %ld", (long)orientation);
+        // Check current interface orientation using window scene (iOS 13+)
+        UIInterfaceOrientation orientation = UIInterfaceOrientationUnknown;
+        if (@available(iOS 13.0, *)) {
+            orientation = self.view.window.windowScene.interfaceOrientation;
+        }
+        RLogUI(@"Current interface orientation: %ld", (long)orientation);
         
         // Check if we're in zoomed display mode
         BOOL isZoomed = (screenBounds.size.width * scale != nativeBounds.size.width);
@@ -337,10 +344,10 @@
             RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Camera video dimensions: %d x %d", dimensions.width, dimensions.height);
         }
         
-        // Set the orientation to landscape
+        // Set the orientation to landscape using rotation angle (iOS 17+)
         AVCaptureConnection *previewConnection = self.previewLayer.connection;
-        if (previewConnection && previewConnection.isVideoOrientationSupported) {
-            previewConnection.videoOrientation = AVCaptureVideoOrientationLandscapeRight;
+        if (previewConnection && [previewConnection isVideoRotationAngleSupported:90]) {
+            previewConnection.videoRotationAngle = 90; // 90 degrees for landscape right
         }
         
         // Remove any existing preview layers first
@@ -361,11 +368,11 @@
         RLog(RptrLogAreaUI | RptrLogAreaDebug, @"View layer frame: %@", NSStringFromCGRect(self.view.layer.frame));
         
         // Try setting the layer bounds explicitly
-        CATransaction.begin;
-        CATransaction.disableActions = YES;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
         self.previewLayer.bounds = self.view.layer.bounds;
         self.previewLayer.position = CGPointMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds));
-        CATransaction.commit;
+        [CATransaction commit];
         
         RLog(RptrLogAreaUI | RptrLogAreaDebug, @"After explicit bounds set - Preview layer bounds: %@, position: %@", 
              NSStringFromCGRect(self.previewLayer.bounds), NSStringFromCGPoint(self.previewLayer.position));
@@ -466,11 +473,11 @@
         [session addOutput:dataOutput];
         RLog(RptrLogAreaVideo, @"Video data output added for %@", camera.localizedName);
         
-        // Force landscape orientation on the video connection
+        // Force landscape orientation on the video connection using rotation angle
         AVCaptureConnection *videoConnection = [dataOutput connectionWithMediaType:AVMediaTypeVideo];
-        if (videoConnection && videoConnection.isVideoOrientationSupported) {
-            videoConnection.videoOrientation = AVCaptureVideoOrientationLandscapeRight;
-            RLog(RptrLogAreaVideo | RptrLogAreaHLS, @"Forced landscape orientation on video connection for %@", camera.localizedName);
+        if (videoConnection && [videoConnection isVideoRotationAngleSupported:90]) {
+            videoConnection.videoRotationAngle = 90; // 90 degrees for landscape right
+            RLogVideo(@"Forced landscape orientation (90°) on video connection for %@", camera.localizedName);
         }
     }
     
@@ -598,10 +605,11 @@
     self.locationManager.desiredAccuracy = kCLLocationAccuracyBest;
     
     // Request location permission
-    if ([CLLocationManager authorizationStatus] == kCLAuthorizationStatusNotDetermined) {
+    CLAuthorizationStatus locationStatus = self.locationManager.authorizationStatus;
+    if (locationStatus == kCLAuthorizationStatusNotDetermined) {
         [self.locationManager requestWhenInUseAuthorization];
-    } else if ([CLLocationManager authorizationStatus] == kCLAuthorizationStatusAuthorizedWhenInUse ||
-               [CLLocationManager authorizationStatus] == kCLAuthorizationStatusAuthorizedAlways) {
+    } else if (locationStatus == kCLAuthorizationStatusAuthorizedWhenInUse ||
+               locationStatus == kCLAuthorizationStatusAuthorizedAlways) {
         [self.locationManager startUpdatingLocation];
     }
     
@@ -982,7 +990,7 @@
     ];
     
     // For iPad, we need to set the popover presentation controller
-    if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         activityVC.popoverPresentationController.sourceView = sender;
         activityVC.popoverPresentationController.sourceRect = sender.bounds;
     }
@@ -1396,15 +1404,18 @@
 
 // Interval button functionality has been removed
 
-- (AVCaptureVideoOrientation)videoOrientationFromDeviceOrientation {
-    // Always return landscape right to lock orientation
-    return AVCaptureVideoOrientationLandscapeRight;
+- (CGFloat)videoRotationAngleFromDeviceOrientation {
+    // Always return 90 degrees to lock orientation to landscape right
+    return 90;
 }
 
 // Override interface orientation methods
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-implementations"
 - (BOOL)shouldAutorotate {
     return NO; // Prevent auto-rotation
 }
+#pragma clang diagnostic pop
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
     return UIInterfaceOrientationMaskLandscapeRight;
@@ -1670,8 +1681,9 @@
 
 - (void)requestLocationUpdate {
     // Request a single location update
-    if ([CLLocationManager authorizationStatus] == kCLAuthorizationStatusAuthorizedWhenInUse ||
-        [CLLocationManager authorizationStatus] == kCLAuthorizationStatusAuthorizedAlways) {
+    CLAuthorizationStatus locationStatus = self.locationManager.authorizationStatus;
+    if (locationStatus == kCLAuthorizationStatusAuthorizedWhenInUse ||
+        locationStatus == kCLAuthorizationStatusAuthorizedAlways) {
         RLog(RptrLogAreaUI | RptrLogAreaLocation | RptrLogAreaDebug, @"Requesting location update");
         
         // Use requestLocation for a single update instead of continuous updates
@@ -1700,7 +1712,20 @@
     }
 }
 
+// This method is deprecated in iOS 14.0+, but kept for backwards compatibility
+// For iOS 14.0+, use locationManagerDidChangeAuthorization: instead
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-implementations"
 - (void)locationManager:(CLLocationManager *)manager didChangeAuthorizationStatus:(CLAuthorizationStatus)status {
+    if (status == kCLAuthorizationStatusAuthorizedWhenInUse || status == kCLAuthorizationStatusAuthorizedAlways) {
+        [self.locationManager startUpdatingLocation];
+    }
+}
+#pragma clang diagnostic pop
+
+// iOS 14.0+ authorization change handler
+- (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager API_AVAILABLE(ios(14.0)) {
+    CLAuthorizationStatus status = manager.authorizationStatus;
     if (status == kCLAuthorizationStatusAuthorizedWhenInUse || status == kCLAuthorizationStatusAuthorizedAlways) {
         [self.locationManager startUpdatingLocation];
     }
@@ -1819,7 +1844,11 @@
         if (self.captureSessions[cameraID] == session) {
             sessionID = cameraID;
             // Find camera name
-            NSArray<AVCaptureDevice *> *cameras = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+            AVCaptureDeviceDiscoverySession *discoverySession = [AVCaptureDeviceDiscoverySession
+                discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
+                mediaType:AVMediaTypeVideo
+                position:AVCaptureDevicePositionUnspecified];
+            NSArray<AVCaptureDevice *> *cameras = discoverySession.devices;
             for (AVCaptureDevice *cam in cameras) {
                 if ([cam.uniqueID isEqualToString:cameraID]) {
                     cameraName = cam.localizedName;
@@ -1964,7 +1993,11 @@
         if (self.videoDataOutputs[camID] == output) {
             cameraID = camID;
             // Find the camera device
-            NSArray<AVCaptureDevice *> *cameras = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+            AVCaptureDeviceDiscoverySession *discoverySession = [AVCaptureDeviceDiscoverySession
+                discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
+                mediaType:AVMediaTypeVideo
+                position:AVCaptureDevicePositionUnspecified];
+            NSArray<AVCaptureDevice *> *cameras = discoverySession.devices;
             for (AVCaptureDevice *cam in cameras) {
                 if ([cam.uniqueID isEqualToString:camID]) {
                     camera = cam;
@@ -2160,7 +2193,11 @@
     [self decayAllCameraScores];
     
     // Get all cameras
-    NSArray<AVCaptureDevice *> *cameras = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+    AVCaptureDeviceDiscoverySession *discoverySession = [AVCaptureDeviceDiscoverySession
+        discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
+        mediaType:AVMediaTypeVideo
+        position:AVCaptureDevicePositionUnspecified];
+    NSArray<AVCaptureDevice *> *cameras = discoverySession.devices;
     if (cameras.count < 2) {
         return;
     }
@@ -2237,7 +2274,11 @@
 
 - (void)tryAlternateCameraWithEvaluation {
     // Get all cameras
-    NSArray<AVCaptureDevice *> *cameras = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+    AVCaptureDeviceDiscoverySession *discoverySession = [AVCaptureDeviceDiscoverySession
+        discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
+        mediaType:AVMediaTypeVideo
+        position:AVCaptureDevicePositionUnspecified];
+    NSArray<AVCaptureDevice *> *cameras = discoverySession.devices;
     
     // Find alternate camera
     for (AVCaptureDevice *camera in cameras) {

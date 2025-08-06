@@ -31,10 +31,12 @@ Rptr is a lightweight iOS application that turns your iPhone or iPad into a basi
 ## Technical Details
 
 - Uses HLS (HTTP Live Streaming) protocol
-- Streams at 1 Mbps video / 96 kbps audio
-- 24 fps frame rate
-- H.264 video encoding
-- AAC audio encoding
+- Streams at 600 kbps video / 64 kbps audio (optimized for reliability)
+- 15 fps frame rate (smooth playback with lower bandwidth)
+- H.264 video encoding (Baseline profile for compatibility)
+- AAC audio encoding (Mono for bandwidth efficiency)
+- 960x540 resolution (qHD)
+- 4-second segments for balanced reliability and responsiveness
 
 ## Limitations
 

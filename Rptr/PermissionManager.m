@@ -66,7 +66,9 @@
 }
 
 - (PermissionStatus)locationPermissionStatus {
-    CLAuthorizationStatus status = [CLLocationManager authorizationStatus];
+    // Create a location manager instance to get the authorization status (iOS 14+)
+    CLLocationManager *locationManager = [[CLLocationManager alloc] init];
+    CLAuthorizationStatus status = locationManager.authorizationStatus;
     
     switch (status) {
         case kCLAuthorizationStatusNotDetermined:
@@ -354,7 +356,9 @@
     });
 }
 
-// iOS 13 and earlier
+// iOS 13 and earlier - kept for backwards compatibility
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-implementations"
 - (void)locationManager:(CLLocationManager *)manager didChangeAuthorizationStatus:(CLAuthorizationStatus)status {
     if (status != kCLAuthorizationStatusNotDetermined) {
         dispatch_async(self.locationCallbackQueue, ^{
@@ -371,5 +375,6 @@
         });
     }
 }
+#pragma clang diagnostic pop
 
 @end

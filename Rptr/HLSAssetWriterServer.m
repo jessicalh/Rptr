@@ -2,11 +2,34 @@
 //  HLSAssetWriterServer.m
 //  Rptr
 //
-//  Production-ready HLS Server using AVAssetWriter with proper segment handling
+//  Production-ready HLS (HTTP Live Streaming) Server Implementation
+//  
+//  Architecture Overview:
+//  This class implements a complete HLS server using AVAssetWriter for encoding
+//  and a custom HTTP server for content delivery. It uses fragmented MP4 (fMP4)
+//  format which provides better compression and quality compared to traditional
+//  MPEG-TS segments.
+//
+//  Key Components:
+//  1. HTTP Server - Handles client connections and serves HLS content
+//  2. AVAssetWriter - Encodes video/audio into fMP4 segments
+//  3. Segment Manager - Manages segment lifecycle and playlist generation
+//  4. Memory Manager - Handles segment storage and cleanup
+//
+//  Thread Safety:
+//  - Uses multiple dispatch queues for thread isolation
+//  - Concurrent queues with barriers for read/write operations
+//  - Atomic properties for cross-thread access
+//
+//  Performance Optimizations:
+//  - In-memory segment storage to avoid disk I/O
+//  - Efficient buffer management
+//  - Lazy segment cleanup based on memory pressure
 //
 
 #import "HLSAssetWriterServer.h"
 #import "RptrLogger.h"
+#import "RptrConstants.h"
 #import <UIKit/UIKit.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -17,96 +40,122 @@
 #include <signal.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-#define SEGMENT_DURATION 3.0  // 3 second segments - balanced latency/stability
-#define TARGET_DURATION 4     // Max segment duration for playlist
-#define MAX_SEGMENTS 20       // Keep 20 segments (1 minute) for buffering
-#define PLAYLIST_WINDOW 6     // 6 segments (18 seconds) in live playlist
-#define BUFFER_SIZE 8192
+#pragma mark - Helper Classes
 
+/**
+ * HLSClient
+ * Represents a connected HTTP client consuming the HLS stream
+ * Tracks client address and last activity time for connection management
+ */
 @interface HLSClient : NSObject
-@property (nonatomic, strong) NSString *address;
-@property (nonatomic, assign) NSTimeInterval lastActivity;
+@property (nonatomic, strong) NSString *address;        // Client IP address
+@property (nonatomic, assign) NSTimeInterval lastActivity; // Last request timestamp
 @end
 
 @implementation HLSClient
 @end
 
+/**
+ * HLSSegmentInfo
+ * Metadata for an HLS segment
+ * Stores all information needed to serve and manage segments
+ */
 @interface HLSSegmentInfo : NSObject
-@property (nonatomic, strong) NSString *filename;
-@property (nonatomic, strong) NSString *path;
-@property (nonatomic, assign) CMTime duration;
-@property (nonatomic, assign) NSInteger sequenceNumber;
-@property (nonatomic, strong) NSDate *createdAt;
-@property (nonatomic, assign) NSUInteger fileSize;
+@property (nonatomic, strong) NSString *filename;       // Segment filename (e.g., "segment0.m4s")
+@property (nonatomic, strong) NSString *path;           // Full path to segment file (deprecated - using in-memory)
+@property (nonatomic, assign) CMTime duration;          // Actual duration of the segment
+@property (nonatomic, assign) NSInteger sequenceNumber; // Sequence number for playlist
+@property (nonatomic, strong) NSDate *createdAt;        // Creation timestamp for cleanup
+@property (nonatomic, assign) NSUInteger fileSize;      // Size in bytes for memory management
 @end
 
 @implementation HLSSegmentInfo
 @end
 
+/**
+ * HLSAssetWriterServer Private Interface
+ * 
+ * Internal properties and methods for HLS server implementation
+ * Organized by functional areas for clarity
+ */
 @interface HLSAssetWriterServer () <NSStreamDelegate>
 
-// HTTP Server
-@property (nonatomic, strong) dispatch_queue_t serverQueue;
-@property (nonatomic, strong) dispatch_queue_t propertyQueue;
-@property (nonatomic, assign) int serverSocket;
-@property (atomic, assign) BOOL running;
-@property (nonatomic, strong) NSMutableDictionary<NSNumber *, HLSClient *> *clients;
-@property (nonatomic, strong) dispatch_queue_t clientsQueue;  // Concurrent queue with barriers instead of lock
+#pragma mark - HTTP Server Properties
+// Core HTTP server infrastructure
+@property (nonatomic, strong) dispatch_queue_t serverQueue;     // Serial queue for server operations
+@property (nonatomic, strong) dispatch_queue_t propertyQueue;   // Concurrent queue for property access
+@property (nonatomic, assign) int serverSocket;                 // BSD socket for HTTP server
+@property (atomic, assign) BOOL running;                        // Server running state (atomic for thread safety)
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, HLSClient *> *clients; // Active client connections
+@property (nonatomic, strong) dispatch_queue_t clientsQueue;    // Concurrent queue for client management
 
-// Asset Writer
-@property (nonatomic, strong) dispatch_queue_t writerQueue;
-@property (nonatomic, strong) AVAssetWriter *assetWriter;
-@property (nonatomic, strong) AVAssetWriterInput *videoInput;
-@property (nonatomic, strong) AVAssetWriterInput *audioInput;
-@property (nonatomic, assign) BOOL isWriting;
-@property (nonatomic, assign) BOOL sessionStarted;
-@property (nonatomic, assign) BOOL isFinishingWriter;
+#pragma mark - AVAssetWriter Properties
+// Video/Audio encoding infrastructure
+@property (nonatomic, strong) dispatch_queue_t writerQueue;     // Serial queue for writer operations
+@property (nonatomic, strong) AVAssetWriter *assetWriter;       // Core video/audio encoder
+@property (nonatomic, strong) AVAssetWriterInput *videoInput;   // Video input for H.264 encoding
+@property (nonatomic, strong) AVAssetWriterInput *audioInput;   // Audio input for AAC encoding
+@property (nonatomic, assign) BOOL isWriting;                   // Writer active state
+@property (nonatomic, assign) BOOL sessionStarted;              // Encoding session state
+@property (nonatomic, assign) BOOL isFinishingWriter;           // Prevents concurrent finalization
 
-// Segment Management
-@property (nonatomic, strong) NSString *baseDirectory;
-@property (nonatomic, strong) NSString *segmentDirectory;
-@property (nonatomic, strong) NSMutableArray<HLSSegmentInfo *> *segments;
-@property (nonatomic, strong) NSString *initializationSegmentPath;
-@property (nonatomic, assign) NSInteger currentSegmentIndex;
-@property (nonatomic, assign) NSInteger mediaSequenceNumber;
+#pragma mark - Segment Management Properties
+// HLS segment lifecycle management
+@property (nonatomic, strong) NSString *baseDirectory;          // Base directory for HLS files
+@property (nonatomic, strong) NSString *segmentDirectory;       // Subdirectory for segments
+@property (nonatomic, strong) NSMutableArray<HLSSegmentInfo *> *segments; // Segment metadata array
+@property (nonatomic, strong) NSString *initializationSegmentPath; // Path to init segment (deprecated)
+@property (nonatomic, assign) NSInteger currentSegmentIndex;    // Current segment being written
+@property (nonatomic, assign) NSInteger mediaSequenceNumber;    // HLS media sequence counter
 
-// Delegate-based segment data storage
-@property (nonatomic, strong) NSData *initializationSegmentData;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSData *> *segmentData;
-@property (nonatomic, strong) NSLock *segmentDataLock;
-@property (nonatomic, strong) dispatch_queue_t segmentDataQueue;  // Concurrent queue with barriers
-@property (nonatomic, strong) dispatch_queue_t segmentsQueue;      // Concurrent queue with barriers
+#pragma mark - In-Memory Segment Storage
+// Memory-based segment storage for performance
+@property (nonatomic, strong) NSData *initializationSegmentData; // fMP4 initialization segment
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSData *> *segmentData; // Segment filename -> data
+@property (nonatomic, strong) NSLock *segmentDataLock;          // Lock for segment data access
+@property (nonatomic, strong) dispatch_queue_t segmentDataQueue; // Concurrent queue for segment data
+@property (nonatomic, strong) dispatch_queue_t segmentsQueue;   // Concurrent queue for segment metadata
 
-// Timing
-@property (nonatomic, assign) CMTime nextSegmentBoundary;
-@property (nonatomic, assign) CMTime sessionStartTime;
-@property (nonatomic, strong) NSTimer *segmentTimer;
-@property (nonatomic, assign) BOOL waitingForKeyFrame;
-@property (nonatomic, strong) NSDate *currentSegmentStartTime;
-@property (nonatomic, assign) BOOL forceSegmentRotation;
+#pragma mark - Timing and Synchronization
+// Precise timing for segment boundaries
+@property (nonatomic, assign) CMTime nextSegmentBoundary;       // Next segment start time
+@property (nonatomic, assign) CMTime sessionStartTime;          // Encoding session start
+@property (nonatomic, strong) NSTimer *segmentTimer;            // Timer for segment rotation
+@property (nonatomic, assign) BOOL waitingForKeyFrame;          // Waiting for IDR frame
+@property (nonatomic, strong) NSDate *currentSegmentStartTime;  // Wall clock time for segment
+@property (nonatomic, assign) BOOL forceSegmentRotation;        // Force new segment flag
 
+#pragma mark - Performance Monitoring
+// Statistics and performance tracking
+@property (nonatomic, assign) NSInteger framesProcessed;        // Total frames encoded
+@property (nonatomic, assign) NSInteger framesDropped;          // Frames dropped due to timing
 
-// Performance
-@property (nonatomic, assign) NSInteger framesProcessed;
-@property (nonatomic, assign) NSInteger framesDropped;
+#pragma mark - Client Activity Tracking
+// Monitor active clients for cleanup
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *activeClients; // Client IP -> last activity
+@property (nonatomic, strong) NSTimer *clientCleanupTimer;      // Timer for inactive client cleanup
 
-// Video orientation
-
-// Client tracking
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *activeClients;
-@property (nonatomic, strong) NSTimer *clientCleanupTimer;
-
-// Track previous path for proper error responses
-@property (nonatomic, strong) NSString *previousRandomPath;
+#pragma mark - Security and State
+// Basic security and state management
+@property (nonatomic, strong) NSString *previousRandomPath;     // Previous URL path for migration
 
 @end
 
 @implementation HLSAssetWriterServer
 
+#pragma mark - Initialization and Lifecycle
+
+/**
+ * Designated initializer
+ * Creates a new HLS server instance configured to run on the specified port
+ * 
+ * @param port The TCP port to bind the HTTP server to (0 for default 8080)
+ * @return Configured HLSAssetWriterServer instance
+ */
 - (instancetype)initWithPort:(NSUInteger)port {
     self = [super init];
     if (self) {
-        // Configure logging for HLS server
+        // Configure debug logging based on build configuration
         #ifdef DEBUG
         [RptrLogger setActiveAreas:RptrLogAreaError | RptrLogAreaHLS | RptrLogAreaVideo | 
                                   RptrLogAreaAudio | RptrLogAreaNetwork | RptrLogAreaSegment |
@@ -114,35 +163,46 @@
         [RptrLogger setLogLevel:RptrLogLevelDebug];
         #endif
         
-        _port = port ?: 8080;
-        _serverQueue = dispatch_queue_create("com.rptr.hls.server", DISPATCH_QUEUE_SERIAL);
-        _propertyQueue = dispatch_queue_create("com.rptr.hls.properties", DISPATCH_QUEUE_CONCURRENT);
-        _writerQueue = dispatch_queue_create("com.rptr.hls.writer", DISPATCH_QUEUE_SERIAL);
+        // Initialize server configuration
+        _port = port ?: kRptrDefaultServerPort;
+        
+        // Create dispatch queues for thread isolation
+        // Serial queues ensure operations execute in order
+        _serverQueue = dispatch_queue_create([kRptrServerQueueName UTF8String], DISPATCH_QUEUE_SERIAL);
+        _writerQueue = dispatch_queue_create([kRptrWriterQueueName UTF8String], DISPATCH_QUEUE_SERIAL);
+        
+        // Concurrent queues with barriers for efficient read/write access
+        _propertyQueue = dispatch_queue_create([kRptrPropertyQueueName UTF8String], DISPATCH_QUEUE_CONCURRENT);
+        _clientsQueue = dispatch_queue_create([kRptrClientsQueueName UTF8String], DISPATCH_QUEUE_CONCURRENT);
+        _segmentDataQueue = dispatch_queue_create([kRptrSegmentDataQueueName UTF8String], DISPATCH_QUEUE_CONCURRENT);
+        _segmentsQueue = dispatch_queue_create([kRptrSegmentsQueueName UTF8String], DISPATCH_QUEUE_CONCURRENT);
+        
+        // Initialize collections
         _clients = [NSMutableDictionary dictionary];
-        _clientsQueue = dispatch_queue_create("com.rptr.hls.clients", DISPATCH_QUEUE_CONCURRENT);
         _segments = [NSMutableArray array];
         _segmentData = [NSMutableDictionary dictionary];
         _segmentDataLock = [[NSLock alloc] init];
-        _segmentDataQueue = dispatch_queue_create("com.rptr.hls.segmentdata", DISPATCH_QUEUE_CONCURRENT);
-        _segmentsQueue = dispatch_queue_create("com.rptr.hls.segments", DISPATCH_QUEUE_CONCURRENT);
+        _activeClients = [NSMutableDictionary dictionary];
         
-        // Generate random 10-character string
-        _randomPath = [self generateRandomString:10];
+        // Generate random path for basic URL obscurity
+        // Not cryptographically secure - just prevents casual discovery
+        _randomPath = [self generateRandomString:kRptrRandomPathLength];
         RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Generated randomized URL path: %@", _randomPath);
-        _streamTitle = @"Share Stream";  // Default title
-        _currentSegmentIndex = 0;
-        _mediaSequenceNumber = 0;
-        _waitingForKeyFrame = YES;
+        
+        // Initialize default values
+        _streamTitle = @"Share Stream";  // Default stream title
+        _currentSegmentIndex = 0;        // Start with segment 0
+        _mediaSequenceNumber = 0;        // HLS sequence starts at 0
+        _waitingForKeyFrame = YES;       // Always start segments with keyframe
         _sessionStartTime = kCMTimeInvalid;
         _nextSegmentBoundary = kCMTimeZero;
         _sessionStarted = NO;
         _isFinishingWriter = NO;
-        _activeClients = [NSMutableDictionary dictionary];
         
-        // Setup directories
+        // Setup file system directories
         [self setupDirectories];
         
-        // Register for memory warnings
+        // Register for system notifications
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(handleMemoryWarning:)
                                                      name:UIApplicationDidReceiveMemoryWarningNotification
@@ -151,10 +211,15 @@
     return self;
 }
 
+/**
+ * Creates directory structure for HLS files
+ * Uses temporary directory to avoid filling device storage
+ * Cleans up any existing files from previous sessions
+ */
 - (void)setupDirectories {
     NSString *tempDir = NSTemporaryDirectory();
-    self.baseDirectory = [tempDir stringByAppendingPathComponent:@"HLSStream"];
-    self.segmentDirectory = [self.baseDirectory stringByAppendingPathComponent:@"segments"];
+    self.baseDirectory = [tempDir stringByAppendingPathComponent:kRptrBaseDirectoryName];
+    self.segmentDirectory = [self.baseDirectory stringByAppendingPathComponent:kRptrSegmentDirectoryName];
     
     NSFileManager *fm = [NSFileManager defaultManager];
     NSError *error;
@@ -177,6 +242,21 @@
 
 #pragma mark - Server Control
 
+/**
+ * Starts the HTTP server and begins accepting connections
+ * 
+ * This method:
+ * 1. Creates and configures a TCP socket
+ * 2. Binds to all network interfaces on the specified port
+ * 3. Begins listening for incoming connections
+ * 4. Starts the accept loop on a background queue
+ * 
+ * @param error Output parameter for any errors that occur
+ * @return YES if server started successfully, NO otherwise
+ * 
+ * @note This method is synchronous and thread-safe
+ * @warning Server must be stopped before app termination
+ */
 - (BOOL)startServer:(NSError * __autoreleasing *)error {
     __block BOOL success = YES;
     __block NSError *blockError = nil;
@@ -396,32 +476,43 @@
         // Configure for delegate-based fMP4 HLS output
         if (@available(iOS 14.0, *)) {
             // Set segment duration for HLS with proper precision
-            self.assetWriter.preferredOutputSegmentInterval = CMTimeMakeWithSeconds(SEGMENT_DURATION, 1000);
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Set preferredOutputSegmentInterval to %f seconds", SEGMENT_DURATION);
+            self.assetWriter.preferredOutputSegmentInterval = CMTimeMakeWithSeconds(kRptrSegmentDuration, 1000);
+            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Set preferredOutputSegmentInterval to %f seconds", kRptrSegmentDuration);
         } else {
             // Fallback: use movieFragmentInterval for older iOS
             self.assetWriter.movieFragmentInterval = CMTimeMakeWithSeconds(0.2, 1000);
         }
         
-        // Video settings - optimized for mobile streaming with VBR
-        // Note: Width and height should match the expected output orientation
-        // For landscape video, width > height (1280x720)
-        // For portrait video, width < height (720x1280)
+        // Configure video encoding settings
+        // Research: H.264 Baseline profile provides best compatibility across devices
+        // CAVLC entropy coding is more error-resilient than CABAC for streaming
         NSDictionary *videoSettings = @{
             AVVideoCodecKey: AVVideoCodecTypeH264,
-            AVVideoWidthKey: @(1280),
-            AVVideoHeightKey: @(720),
+            AVVideoWidthKey: @(kRptrVideoWidth),      // 960 pixels (qHD)
+            AVVideoHeightKey: @(kRptrVideoHeight),    // 540 pixels (qHD)
             AVVideoCompressionPropertiesKey: @{
-                AVVideoAverageBitRateKey: @(1000000),               // 1 Mbps - balanced quality/bandwidth
-                AVVideoMaxKeyFrameIntervalKey: @(24),               // 1 second at 24fps
-                AVVideoMaxKeyFrameIntervalDurationKey: @(1.0),      // 1-second keyframe interval
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,  // High profile for better quality
-                AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCABAC,       // CABAC for better compression
-                AVVideoAllowFrameReorderingKey: @(NO),             // Disable B-frames for compatibility
-                AVVideoExpectedSourceFrameRateKey: @(24),          // Expected frame rate
-                AVVideoAverageNonDroppableFrameRateKey: @(24),     // Maintain consistent frame rate
-                // Quality hint for encoder (0.0-1.0, higher is better)
-                AVVideoQualityKey: @(0.85)
+                // Bitrate and quality settings
+                AVVideoAverageBitRateKey: @(kRptrVideoBitrate),     // 600 kbps
+                AVVideoQualityKey: @(kRptrVideoQuality),            // 0.75 quality
+                
+                // Keyframe (IDR) settings for segment boundaries
+                AVVideoMaxKeyFrameIntervalKey: @(kRptrVideoKeyFrameInterval),        // 30 frames
+                AVVideoMaxKeyFrameIntervalDurationKey: @(kRptrVideoKeyFrameDuration), // 2 seconds
+                
+                // H.264 profile and encoding settings
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264BaselineAutoLevel,    // Maximum compatibility
+                AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCAVLC,             // Error resilient
+                AVVideoAllowFrameReorderingKey: @(NO),                              // No B-frames
+                
+                // Frame rate settings
+                AVVideoExpectedSourceFrameRateKey: @(kRptrVideoFrameRate),          // 15 fps
+                AVVideoAverageNonDroppableFrameRateKey: @(kRptrVideoFrameRate),    // Consistent rate
+                
+                // Pixel aspect ratio (square pixels)
+                AVVideoPixelAspectRatioKey: @{
+                    AVVideoPixelAspectRatioHorizontalSpacingKey: @(1),
+                    AVVideoPixelAspectRatioVerticalSpacingKey: @(1)
+                }
             }
         };
         
@@ -447,12 +538,15 @@
             return;
         }
         
-        // Audio settings - high quality AAC
+        // Configure audio encoding settings
+        // Research: AAC-LC provides best quality/size ratio for streaming
+        // Mono audio saves 50% bandwidth with minimal quality impact for voice
         NSDictionary *audioSettings = @{
-            AVFormatIDKey: @(kAudioFormatMPEG4AAC),
-            AVNumberOfChannelsKey: @(2),
-            AVSampleRateKey: @(48000),    // 48kHz for better quality
-            AVEncoderBitRateKey: @(96000) // 96 kbps - reasonable audio quality
+            AVFormatIDKey: @(kAudioFormatMPEG4AAC),              // AAC-LC codec
+            AVNumberOfChannelsKey: @(kRptrAudioChannels),        // Mono (1 channel)
+            AVSampleRateKey: @(kRptrAudioSampleRate),            // 44.1 kHz
+            AVEncoderBitRateKey: @(kRptrAudioBitrate),           // 64 kbps
+            AVEncoderAudioQualityKey: @(AVAudioQualityMedium)    // Balanced quality
         };
         
         self.audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:audioSettings];
@@ -530,6 +624,24 @@
 
 #pragma mark - Sample Buffer Processing
 
+/**
+ * Processes incoming video frames from the capture session
+ * 
+ * This method handles:
+ * 1. Sample buffer validation and retention
+ * 2. Segment boundary detection based on presentation time
+ * 3. Keyframe detection for segment starts
+ * 4. Frame dropping for performance
+ * 5. Writing frames to the current segment
+ * 
+ * Thread Safety: Can be called from any thread, uses internal queues
+ * Performance: Optimized for real-time processing with frame dropping
+ * 
+ * @param sampleBuffer The video sample buffer from AVCaptureVideoDataOutput
+ * 
+ * @note Sample buffers are retained/released automatically
+ * @warning Must be called continuously to avoid segment timeouts
+ */
 - (void)processVideoSampleBuffer:(CMSampleBufferRef)sampleBuffer {
     @autoreleasepool {
         if (!sampleBuffer) {
@@ -692,7 +804,7 @@
         CMTime timeSinceSegmentStart = CMTimeSubtract(presentationTime, self.nextSegmentBoundary);
         double secondsSinceSegmentStart = CMTimeGetSeconds(timeSinceSegmentStart);
         
-        if (secondsSinceSegmentStart >= SEGMENT_DURATION || self.forceSegmentRotation) {
+        if (secondsSinceSegmentStart >= kRptrSegmentDuration || self.forceSegmentRotation) {
             if (self.forceSegmentRotation) {
                 RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Forced segment rotation requested");
             } else {
@@ -712,7 +824,7 @@
                 self.forceSegmentRotation = NO;
                 [self rotateSegment];
                 return; // Skip this frame, it will be written to the new segment
-            } else if (self.forceSegmentRotation && secondsSinceSegmentStart >= SEGMENT_DURATION + 0.5) {
+            } else if (self.forceSegmentRotation && secondsSinceSegmentStart >= kRptrSegmentDuration + kRptrSegmentRotationDelay) {
                 // Force rotation if we've waited a bit for key frame
                 RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"[FORCE ROTATION] No key frame for %.3f seconds, forcing rotation of segment %ld", 
                        secondsSinceSegmentStart, (long)self.currentSegmentIndex);
@@ -862,6 +974,23 @@
     } // End of @autoreleasepool
 }
 
+/**
+ * Rotates to a new segment by finalizing the current segment and preparing the next
+ * 
+ * Segment rotation process:
+ * 1. Marks current inputs as finished to trigger segment completion
+ * 2. Waits for AVAssetWriter to finalize and output segment data
+ * 3. Creates new AVAssetWriter for the next segment
+ * 4. Updates segment index and metadata
+ * 
+ * This method is called when:
+ * - Segment duration is reached
+ * - A keyframe is needed for the new segment
+ * - Force rotation is triggered by the timer
+ * 
+ * @note Executes asynchronously on the writer queue
+ * @warning Do not call directly - use segment timer or boundary detection
+ */
 - (void)rotateSegment {
     dispatch_async(self.writerQueue, ^{
         // Check if we're already finishing the writer or not writing
@@ -907,7 +1036,7 @@
                 [strongSelf finalizeCurrentSegment];
                 
                 // Update segment boundary
-                strongSelf.nextSegmentBoundary = CMTimeAdd(strongSelf.nextSegmentBoundary, CMTimeMake(SEGMENT_DURATION, 1));
+                strongSelf.nextSegmentBoundary = CMTimeAdd(strongSelf.nextSegmentBoundary, CMTimeMakeWithSeconds(kRptrSegmentDuration, 1));
                 
                 // Clear the finishing flag
                 strongSelf.isFinishingWriter = NO;
@@ -928,7 +1057,7 @@
 - (void)finalizeCurrentSegment {
     NSTimeInterval segmentAge = [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime];
     RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Finalizing segment %ld after %.3f seconds (expected: %.1f)", 
-           (long)self.currentSegmentIndex, segmentAge, SEGMENT_DURATION);
+           (long)self.currentSegmentIndex, segmentAge, kRptrSegmentDuration);
     
     if (!self.assetWriter) {
         RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaError, @"ERROR: No asset writer to finalize");
@@ -960,7 +1089,7 @@
     
     if (fileSize > 0) {
         // Calculate actual duration based on writer session
-        CMTime duration = CMTimeMake(SEGMENT_DURATION * 1000, 1000); // More precise timing
+        CMTime duration = CMTimeMakeWithSeconds(kRptrSegmentDuration, 1000); // More precise timing
         
         // Create segment info
         HLSSegmentInfo *segmentInfo = [[HLSSegmentInfo alloc] init];
@@ -1012,13 +1141,13 @@
 - (void)startSegmentTimer {
     dispatch_async(dispatch_get_main_queue(), ^{
         [self stopSegmentTimer];
-        // Fire timer slightly before segment duration to ensure timely rotation
-        self.segmentTimer = [NSTimer scheduledTimerWithTimeInterval:SEGMENT_DURATION - 0.05
+        // Fire timer well before segment duration to ensure timely rotation
+        self.segmentTimer = [NSTimer scheduledTimerWithTimeInterval:kRptrSegmentDuration - kRptrSegmentTimerOffset
                                                               target:self
                                                             selector:@selector(segmentTimerFired:)
                                                             userInfo:nil
                                                              repeats:YES];
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Started segment rotation timer (interval: %.1f)", SEGMENT_DURATION - 0.1);
+        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Started segment rotation timer (interval: %.1f)", kRptrSegmentDuration - kRptrSegmentTimerOffset);
     });
 }
 
@@ -1045,9 +1174,9 @@
         
         NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime];
         RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming | RptrLogAreaDebug, @"[TIMER] Segment timer fired for segment %ld, elapsed: %.3f seconds (target: %.1f)", 
-               (long)self.currentSegmentIndex, elapsed, SEGMENT_DURATION);
+               (long)self.currentSegmentIndex, elapsed, kRptrSegmentDuration);
         
-        if (elapsed >= SEGMENT_DURATION - 0.1) {
+        if (elapsed >= kRptrSegmentDuration - kRptrSegmentTimerOffset) {
             RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"[TIMER] Setting force rotation flag for segment %ld (elapsed: %.3f)", 
                    (long)self.currentSegmentIndex, elapsed);
             self.forceSegmentRotation = YES;
@@ -1061,11 +1190,15 @@
     RLog(RptrLogAreaHLS | RptrLogAreaFile, @"Creating initial playlist...");
     
     NSString *playlist = [NSString stringWithFormat:@"#EXTM3U\n"
-                        @"#EXT-X-VERSION:7\n"  // Version 7 for fMP4
-                        @"#EXT-X-TARGETDURATION:%d\n"
+                        @"#EXT-X-VERSION:6\n"  // Version 6 for better compatibility
+                        @"#EXT-X-TARGETDURATION:%ld\n"
+                        @"#EXT-X-PLAYLIST-TYPE:EVENT\n"
                         @"#EXT-X-MEDIA-SEQUENCE:0\n"
-                        @"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9.0\n"
-                        @"#EXT-X-START:TIME-OFFSET=-9.0\n", TARGET_DURATION];
+                        @"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=8.0\n"
+                        @"#EXT-X-START:TIME-OFFSET=-8.0\n"
+                        @"#EXT-X-INDEPENDENT-SEGMENTS\n"
+                        @"#EXT-X-ALLOW-CACHE:NO\n"
+                        @"#EXT-X-DISCONTINUITY-SEQUENCE:0\n", (long)kRptrTargetDuration];
     
     NSString *playlistPath = [self.baseDirectory stringByAppendingPathComponent:@"playlist.m3u8"];
     NSError *error;
@@ -1089,19 +1222,23 @@
         
         // Header with live HLS tags
         [playlist appendString:@"#EXTM3U\n"];
-        [playlist appendString:@"#EXT-X-VERSION:7\n"]; // Version 7 for fMP4
-        [playlist appendFormat:@"#EXT-X-TARGETDURATION:%d\n", TARGET_DURATION];
-        [playlist appendString:@"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=9.0\n"]; // Allow skipping old segments
-        [playlist appendString:@"#EXT-X-START:TIME-OFFSET=-9.0\n"]; // Start playback 9 seconds (3 segments) from live edge
+        [playlist appendString:@"#EXT-X-VERSION:6\n"]; // Version 6 for better compatibility (still supports fMP4)
+        [playlist appendFormat:@"#EXT-X-TARGETDURATION:%ld\n", (long)kRptrTargetDuration];
+        [playlist appendString:@"#EXT-X-PLAYLIST-TYPE:EVENT\n"]; // Live event that will eventually end
+        [playlist appendString:@"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=8.0\n"]; // Allow skipping old segments
+        [playlist appendString:@"#EXT-X-START:TIME-OFFSET=-8.0\n"]; // Start playback 8 seconds (2 segments) from live edge
         
         // Add INDEPENDENT-SEGMENTS tag for better compatibility
         [playlist appendString:@"#EXT-X-INDEPENDENT-SEGMENTS\n"];
         
-        // Important: Do NOT include EXT-X-PLAYLIST-TYPE for live streams
-        // Including it (even as EVENT or VOD) will make players treat it as non-live
+        // Add cache control for live streams
+        [playlist appendString:@"#EXT-X-ALLOW-CACHE:NO\n"];
+        
+        // Add discontinuity sequence for live streams
+        [playlist appendString:@"#EXT-X-DISCONTINUITY-SEQUENCE:0\n"];
         
         // Calculate starting sequence number for sliding window
-        NSInteger startIndex = MAX(0, (NSInteger)segmentCount - PLAYLIST_WINDOW);
+        NSInteger startIndex = MAX(0, (NSInteger)segmentCount - kRptrPlaylistWindow);
         NSInteger startSequence = (startIndex > 0 && segmentCount > startIndex) ? self.segments[startIndex].sequenceNumber : 0;
         
         [playlist appendFormat:@"#EXT-X-MEDIA-SEQUENCE:%ld\n", (long)startSequence];
@@ -1117,9 +1254,25 @@
         
         // Add segments (sliding window)
         RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Adding segments from index %ld to %lu", (long)startIndex, (unsigned long)segmentCount);
+        
+        // Add program date time for first segment in window
+        if (segmentCount > startIndex && self.segments[startIndex].createdAt) {
+            NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+            [formatter setDateFormat:@"yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"];
+            [formatter setTimeZone:[NSTimeZone timeZoneWithName:@"UTC"]];
+            NSString *dateString = [formatter stringFromDate:self.segments[startIndex].createdAt];
+            [playlist appendFormat:@"#EXT-X-PROGRAM-DATE-TIME:%@\n", dateString];
+        }
+        
         for (NSInteger i = startIndex; i < segmentCount; i++) {
             HLSSegmentInfo *segment = self.segments[i];
             CGFloat duration = CMTimeGetSeconds(segment.duration);
+            
+            // Add discontinuity tag if this is the first segment and not the very first in the stream
+            if (i == startIndex && startIndex > 0) {
+                [playlist appendString:@"#EXT-X-DISCONTINUITY\n"];
+            }
+            
             [playlist appendFormat:@"#EXTINF:%.3f,\n", duration];
             [playlist appendFormat:@"/stream/%@/segments/%@\n", self.randomPath, segment.filename];
             RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Added segment: %@ (%.2fs) -> URL: segments/%@", segment.filename, duration, segment.filename);
@@ -1147,7 +1300,7 @@
 - (void)cleanupOldSegments {
     dispatch_barrier_async(self.segmentsQueue, ^{
         NSUInteger initialCount = self.segments.count;
-        while (self.segments.count > MAX_SEGMENTS) {
+        while (self.segments.count > kRptrMaxSegments) {
             HLSSegmentInfo *oldSegment = self.segments.firstObject;
             NSTimeInterval segmentAge = [[NSDate date] timeIntervalSinceDate:oldSegment.createdAt];
             
@@ -1195,6 +1348,20 @@
 
 #pragma mark - HTTP Server
 
+/**
+ * Main server accept loop - runs on background queue
+ * 
+ * Continuously accepts incoming connections until server stops
+ * Each connection is handled on a separate queue to prevent blocking
+ * 
+ * Thread Model:
+ * - Runs on serverQueue (serial)
+ * - Spawns concurrent handlers for each client
+ * - Uses BSD sockets for maximum control
+ * 
+ * @note This method blocks until server shutdown
+ * @warning Must be called on serverQueue
+ */
 - (void)acceptLoop {
     while (self.running) {
         struct sockaddr_in clientAddr;
@@ -1239,6 +1406,27 @@
     }
 }
 
+/**
+ * Handles a single HTTP client connection
+ * 
+ * Request Processing:
+ * 1. Reads HTTP request from socket
+ * 2. Parses method, path, and headers
+ * 3. Routes to appropriate content handler
+ * 4. Sends response with proper headers
+ * 5. Tracks client activity for monitoring
+ * 
+ * Security:
+ * - Validates random path for basic access control
+ * - Prevents directory traversal attacks
+ * - Limits request size to prevent DoS
+ * 
+ * @param clientSocket Connected client socket descriptor
+ * @param clientAddr Client address structure for logging
+ * 
+ * @note Connection is closed after each request (HTTP/1.0)
+ * @warning Large segments may cause memory spikes
+ */
 - (void)handleClient:(int)clientSocket address:(const struct sockaddr_in *)clientAddr {
     NSParameterAssert(clientSocket >= 0);
     NSParameterAssert(clientAddr != NULL);
@@ -1279,7 +1467,7 @@
     
     // Read request
     RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"2. About to read request from socket %d", clientSocket);
-    char buffer[BUFFER_SIZE];
+    char buffer[kRptrHTTPBufferSize];
     ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
     RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"3. Read %zd bytes from socket %d", bytesRead, clientSocket);
     
@@ -2038,7 +2226,9 @@
 #pragma mark - Utilities
 
 - (NSArray<NSString *> *)getServerURLs {
-    NSMutableArray *urls = [NSMutableArray array];
+    NSMutableArray *cellularURLs = [NSMutableArray array];
+    NSMutableArray *wifiURLs = [NSMutableArray array];
+    NSMutableArray *otherURLs = [NSMutableArray array];
     
     struct ifaddrs *interfaces = NULL;
     struct ifaddrs *temp_addr = NULL;
@@ -2050,15 +2240,49 @@
                 char ip[INET_ADDRSTRLEN];
                 if (inet_ntop(AF_INET, &((struct sockaddr_in *)temp_addr->ifa_addr)->sin_addr, ip, INET_ADDRSTRLEN) != NULL) {
                     NSString *ipString = [NSString stringWithUTF8String:ip];
-                    if (![ipString isEqualToString:@"127.0.0.1"]) {
-                        NSString *url = [NSString stringWithFormat:@"http://%@:%lu/view/%@", ipString, (unsigned long)self.port, self.randomPath];
-                        [urls addObject:url];
+                    NSString *interfaceName = [NSString stringWithUTF8String:temp_addr->ifa_name];
+                    
+                    // Skip loopback and link-local addresses
+                    if ([ipString isEqualToString:@"127.0.0.1"] || [ipString hasPrefix:@"169.254."]) {
+                        temp_addr = temp_addr->ifa_next;
+                        continue;
+                    }
+                    
+                    NSString *url = [NSString stringWithFormat:@"http://%@:%lu/view/%@", ipString, (unsigned long)self.port, self.randomPath];
+                    
+                    // Categorize by interface type
+                    if ([interfaceName hasPrefix:@"pdp_ip"] || 
+                        [interfaceName hasPrefix:@"rmnet"] ||
+                        [interfaceName hasPrefix:@"en2"]) {
+                        // Cellular interface
+                        [cellularURLs addObject:url];
+                        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Found cellular interface %@ with IP %@", interfaceName, ipString);
+                    } else if ([interfaceName isEqualToString:@"en0"]) {
+                        // WiFi interface
+                        [wifiURLs addObject:url];
+                        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Found WiFi interface %@ with IP %@", interfaceName, ipString);
+                    } else {
+                        // Other interfaces (e.g., en1, etc.)
+                        [otherURLs addObject:url];
+                        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Found other interface %@ with IP %@", interfaceName, ipString);
                     }
                 }
             }
             temp_addr = temp_addr->ifa_next;
         }
         freeifaddrs(interfaces);
+    }
+    
+    // Build final array with cellular first, then WiFi, then others
+    NSMutableArray *urls = [NSMutableArray array];
+    [urls addObjectsFromArray:cellularURLs];
+    [urls addObjectsFromArray:wifiURLs];
+    [urls addObjectsFromArray:otherURLs];
+    
+    if (urls.count == 0) {
+        RLog(RptrLogAreaHLS | RptrLogAreaNetwork | RptrLogAreaError, @"No network interfaces found!");
+    } else {
+        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Server URLs ordered by priority: %@", urls);
     }
     
     return urls;
@@ -2238,7 +2462,7 @@
             // Create segment info
             HLSSegmentInfo *segmentInfo = [[HLSSegmentInfo alloc] init];
             segmentInfo.filename = segmentName;
-            segmentInfo.duration = segmentReport ? segmentReport.trackReports.firstObject.duration : CMTimeMakeWithSeconds(SEGMENT_DURATION, 1);
+            segmentInfo.duration = segmentReport ? segmentReport.trackReports.firstObject.duration : CMTimeMakeWithSeconds(kRptrSegmentDuration, 1);
             segmentInfo.sequenceNumber = self.mediaSequenceNumber;
             segmentInfo.createdAt = [NSDate date];
             segmentInfo.fileSize = segmentData.length;
@@ -2250,8 +2474,8 @@
                       segmentName, (unsigned long)segmentData.length, CMTimeGetSeconds(segmentInfo.duration));
                 
                 // Clean up old segments to prevent memory buildup
-                if (self.segments.count > MAX_SEGMENTS) {
-                    NSInteger removeCount = self.segments.count - MAX_SEGMENTS;
+                if (self.segments.count > kRptrMaxSegments) {
+                    NSInteger removeCount = self.segments.count - kRptrMaxSegments;
                     for (NSInteger i = 0; i < removeCount; i++) {
                         HLSSegmentInfo *oldSegment = self.segments[0];
                         [self.segmentDataLock lock];
