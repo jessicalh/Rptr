@@ -1,0 +1,136 @@
+{
+  "app_information": {
+    "name": "Rptr",
+    "subtitle": "Simple HLS Live Streaming",
+    "bundle_id": "com.example.rptr",
+    "sku": "RPTR001",
+    "primary_category": "Photo & Video",
+    "secondary_category": "Utilities",
+    "content_rights": "Does not contain third party content"
+  },
+  
+  "version_information": {
+    "version_number": "1.0",
+    "build_number": "1",
+    "copyright": "© 2024 Rptr. All rights reserved.",
+    "release_notes": "Initial release of Rptr - Simple HLS Live Streaming app for iOS."
+  },
+  
+  "app_description": {
+    "description": "Rptr transforms your iPhone or iPad into a lightweight HLS (HTTP Live Streaming) server, enabling you to stream live video from your device's camera to any web browser on your local network.\n\nKey Features:\n• Stream live video with just one tap\n• No complex setup or configuration required\n• View streams on any device with a web browser\n• Optimized for reliability on various network conditions\n• Location overlay support (optional)\n• Landscape orientation for best viewing experience\n• Low latency streaming with adaptive quality\n\nPerfect for:\n• Home monitoring and casual streaming\n• Sharing live moments with family on the same network\n• Quick video broadcasting without internet dependency\n• Testing and development of streaming applications\n\nRptr is designed for simplicity and ease of use. Simply launch the app, grant necessary permissions, and share the provided URL with devices on your network to start streaming immediately.\n\nNote: This app is intended for local network use only and does not include authentication or encryption. Not suitable for streaming sensitive content over untrusted networks.",
+    
+    "keywords": "HLS,streaming,live,video,camera,broadcast,local,network,HTTP,server",
+    
+    "promotional_text": "Turn your iPhone into a live streaming server! Stream video to any device on your network with zero configuration.",
+    
+    "whats_new": "• Initial release\n• Stream live video to your local network\n• Simple one-tap streaming\n• Optimized for reliability"
+  },
+  
+  "urls": {
+    "support_url": "https://github.com/your-username/rptr/wiki/support",
+    "marketing_url": "https://github.com/your-username/rptr",
+    "privacy_policy_url": "https://github.com/your-username/rptr/blob/main/PRIVACY_POLICY.md"
+  },
+  
+  "contact_information": {
+    "first_name": "Your",
+    "last_name": "Name",
+    "email": "your.email@example.com",
+    "phone": "+1234567890",
+    "address": {
+      "line1": "Your Address",
+      "city": "Your City",
+      "state": "Your State",
+      "postal_code": "12345",
+      "country": "United States"
+    }
+  },
+  
+  "rating": {
+    "age_rating": "4+",
+    "content_descriptions": {
+      "violence": "None",
+      "sexual_content": "None",
+      "profanity": "None",
+      "alcohol_tobacco_drugs": "None",
+      "mature_suggestive": "None",
+      "horror_fear": "None",
+      "medical_treatment": "None",
+      "gambling": "None",
+      "unrestricted_web_access": "No",
+      "gambling_contests": "No"
+    }
+  },
+  
+  "app_review_information": {
+    "first_name": "Your",
+    "last_name": "Name",
+    "phone": "+1234567890",
+    "email": "your.email@example.com",
+    "demo_account": "Not required",
+    "notes": "This app creates a local HLS streaming server. To test:\n1. Launch the app on an iOS device\n2. Grant camera and microphone permissions\n3. The app will display URLs for accessing the stream\n4. Open the URL in a web browser on another device on the same network\n5. The live stream should begin playing automatically\n\nNote: Both devices must be on the same local network."
+  },
+  
+  "screenshots": {
+    "6.9_inch_iphone": {
+      "required": true,
+      "count": "1-10",
+      "size": "1320 x 2868 pixels",
+      "format": "JPG or PNG (no alpha)",
+      "files": []
+    },
+    "6.7_inch_iphone": {
+      "required": false,
+      "count": "1-10",
+      "size": "1290 x 2796 pixels",
+      "format": "JPG or PNG (no alpha)",
+      "files": []
+    },
+    "6.5_inch_iphone": {
+      "required": false,
+      "count": "1-10",
+      "size": "1284 x 2778 pixels or 1242 x 2688 pixels",
+      "format": "JPG or PNG (no alpha)",
+      "files": []
+    },
+    "5.5_inch_iphone": {
+      "required": false,
+      "count": "1-10",
+      "size": "1242 x 2208 pixels",
+      "format": "JPG or PNG (no alpha)",
+      "files": []
+    },
+    "13_inch_ipad": {
+      "required": true,
+      "count": "1-10",
+      "size": "2064 x 2752 pixels",
+      "format": "JPG or PNG (no alpha)",
+      "files": []
+    },
+    "12.9_inch_ipad": {
+      "required": false,
+      "count": "1-10",
+      "size": "2048 x 2732 pixels",
+      "format": "JPG or PNG (no alpha)",
+      "files": []
+    }
+  },
+  
+  "app_previews": {
+    "optional": true,
+    "duration": "15-30 seconds",
+    "format": "M4V, MP4, or MOV",
+    "video_codec": "H.264 or ProRes 422",
+    "max_size": "500 MB"
+  },
+  
+  "pricing": {
+    "price_tier": "Free",
+    "in_app_purchases": false
+  },
+  
+  "availability": {
+    "territories": "All",
+    "release_option": "Manual release after approval"
+  }
+}
