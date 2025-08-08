@@ -17,6 +17,7 @@
 
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
+#import "RptrVideoQualitySettings.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -100,6 +101,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 /** Title displayed in the web interface */
 @property (atomic, strong) NSString *streamTitle;
+
+/** Current video quality settings */
+@property (nonatomic, strong) RptrVideoQualitySettings *qualitySettings;
 
 #pragma mark - Thread-Safe Accessors
 
@@ -186,6 +190,13 @@ NS_ASSUME_NONNULL_BEGIN
  * Use when starting a new streaming session
  */
 - (void)regenerateRandomPath;
+
+/**
+ * Updates video quality settings
+ * @param settings New quality settings to apply
+ * @note This will stop current streaming and require restart
+ */
+- (void)updateQualitySettings:(RptrVideoQualitySettings *)settings;
 
 @end
 

@@ -12,25 +12,30 @@
 #import <arpa/inet.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreImage/CoreImage.h>
+#import <CoreMotion/CoreMotion.h>
 
-@interface ViewController ()
+@interface ViewController () {
+    BOOL _isLockingOrientation;
+    UIDeviceOrientation _lastDeviceOrientation;
+    CMMotionManager *_motionManager;
+}
 
 @end
 
 @implementation ViewController
 
 - (void)loadView {
-    // Create view manually to ensure full screen
-    UIView *view = [[UIView alloc] initWithFrame:[[UIScreen mainScreen] bounds]];
-    view.backgroundColor = [UIColor blackColor];
-    view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.view = view;
+    // Use default view creation
+    [super loadView];
+    self.view.backgroundColor = [UIColor blackColor];
     
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"loadView - Created view with frame: %@", NSStringFromCGRect(view.frame));
+    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"loadView - Using default view creation");
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    
+    // Don't force orientation update - we're locked to landscape right
     
     // Ensure view uses full screen without safe area constraints
     self.edgesForExtendedLayout = UIRectEdgeAll;
@@ -50,6 +55,9 @@
     self.preferredContentSize = [[UIScreen mainScreen] bounds].size;
     
     self.view.backgroundColor = [UIColor blackColor];
+    
+    // Initialize quality mode before any camera setup
+    self.currentQualityMode = RptrVideoQualityModeReliable;
     
     // Log the initial view frame for debugging
     RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLoad - View frame: %@", NSStringFromCGRect(self.view.frame));
@@ -76,8 +84,45 @@
         // Initialize overlay queue for thread-safe pixel buffer operations
         self.overlayQueue = dispatch_queue_create("com.rptr.overlay.queue", DISPATCH_QUEUE_SERIAL);
         
-        // Enable device orientation notifications
-        [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
+        // Initialize motion manager to detect actual device orientation
+        _motionManager = [[CMMotionManager alloc] init];
+        _motionManager.deviceMotionUpdateInterval = 0.2; // Update 5 times per second
+        _lastDeviceOrientation = UIDeviceOrientationPortrait; // Default
+        
+        // Start monitoring device motion to detect orientation
+        if (_motionManager.isDeviceMotionAvailable) {
+            [_motionManager startDeviceMotionUpdatesToQueue:[NSOperationQueue mainQueue]
+                                                withHandler:^(CMDeviceMotion * _Nullable motion, NSError * _Nullable error) {
+                if (!error && motion) {
+                    // Calculate device orientation from gravity vector
+                    CMAcceleration gravity = motion.gravity;
+                    UIDeviceOrientation newOrientation = UIDeviceOrientationPortrait;
+                    
+                    // Determine orientation based on gravity
+                    if (fabs(gravity.x) > fabs(gravity.y)) {
+                        if (gravity.x > 0) {
+                            newOrientation = UIDeviceOrientationLandscapeLeft;
+                        } else {
+                            newOrientation = UIDeviceOrientationLandscapeRight;
+                        }
+                    } else {
+                        if (gravity.y > 0) {
+                            newOrientation = UIDeviceOrientationPortraitUpsideDown;
+                        } else {
+                            newOrientation = UIDeviceOrientationPortrait;
+                        }
+                    }
+                    
+                    if (newOrientation != self->_lastDeviceOrientation) {
+                        self->_lastDeviceOrientation = newOrientation;
+                        RLogVideo(@"Device orientation changed to: %ld", (long)newOrientation);
+                        
+                        // Update camera connections with new rotation
+                        [self updateCameraRotationForOrientation:newOrientation];
+                    }
+                }
+            }];
+        }
         
         // Preload UI components immediately in background
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
@@ -122,8 +167,8 @@
                                                        object:nil];
         });
         
-        // Only check permissions, don't request them yet
-        dispatch_async(dispatch_get_main_queue(), ^{
+        // Delay permission check to ensure view is fully laid out
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [self checkAndSetupIfPermissionsGranted];
         });
 }
@@ -171,13 +216,7 @@
         RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Subview: %@ frame: %@", NSStringFromClass([subview class]), NSStringFromCGRect(subview.frame));
     }
     
-    // Force landscape orientation now that scene is connected
-    [self enforceImmediateLandscapeOrientation];
-    
-    // Force landscape orientation
-    if (@available(iOS 16.0, *)) {
-        [self setNeedsUpdateOfSupportedInterfaceOrientations];
-    }
+    // Landscape orientation is already enforced by Info.plist and supported orientations
     
     // Ensure preview layer fills the view after orientation change
     if (self.previewLayer) {
@@ -192,26 +231,27 @@
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     
-    // Log view hierarchy and transforms
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLayoutSubviews - View bounds: %@", NSStringFromCGRect(self.view.bounds));
+    // Just log what's happening
     RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLayoutSubviews - View frame: %@", NSStringFromCGRect(self.view.frame));
+    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLayoutSubviews - View bounds: %@", NSStringFromCGRect(self.view.bounds));
     RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLayoutSubviews - View transform: %@", NSStringFromCGAffineTransform(self.view.transform));
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLayoutSubviews - View superview: %@", self.view.superview);
-    if (self.view.superview) {
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLayoutSubviews - Superview bounds: %@", NSStringFromCGRect(self.view.superview.bounds));
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLayoutSubviews - Superview frame: %@", NSStringFromCGRect(self.view.superview.frame));
-    }
     
-    // Force view to fill its superview
-    if (self.view.superview && !CGRectEqualToRect(self.view.frame, self.view.superview.bounds)) {
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"View not filling superview, forcing resize");
-        self.view.frame = self.view.superview.bounds;
-    }
-    
-    // Ensure preview layer fills the entire view
-    if (self.previewLayer) {
+    // CRITICAL: Ensure preview layer maintains landscape orientation
+    if (self.previewLayer && !_isLockingOrientation) {
+        _isLockingOrientation = YES;
+        
+        // Force the preview layer to stay in landscape orientation
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        
+        // Reset any transforms that might have been applied
+        self.previewLayer.affineTransform = CGAffineTransformIdentity;
         self.previewLayer.frame = self.view.bounds;
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Preview layer frame updated to: %@", NSStringFromCGRect(self.previewLayer.frame));
+        
+        // Let the motion manager handle rotation - don't set fixed values here
+        
+        [CATransaction commit];
+        _isLockingOrientation = NO;
     }
     
     
@@ -251,7 +291,7 @@
 - (void)setupCameraPreview {
     // Initialize dictionaries for cameras
     self.captureSessions = [NSMutableDictionary dictionary];
-    self.movieFileOutputs = [NSMutableDictionary dictionary];
+    // No movie file outputs needed - this app only streams
     self.videoDataOutputs = [NSMutableDictionary dictionary];
     
     // Only use single camera setup
@@ -262,51 +302,33 @@
 
 - (void)setupSingleCameraSession {
     
-    // Get all cameras using AVCaptureDeviceDiscoverySession (iOS 10+)
+    // Get ONLY the back camera - this is a rear camera only app
     AVCaptureDeviceDiscoverySession *discoverySession = [AVCaptureDeviceDiscoverySession
         discoverySessionWithDeviceTypes:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]
         mediaType:AVMediaTypeVideo
-        position:AVCaptureDevicePositionUnspecified];
+        position:AVCaptureDevicePositionBack];  // REAR CAMERA ONLY
     NSArray<AVCaptureDevice *> *cameras = discoverySession.devices;
-    RLogVideo(@"Found %lu cameras", (unsigned long)cameras.count);
     
-    
-    // Set up a session for each camera (but only one will work at a time)
-    for (NSInteger i = 0; i < cameras.count; i++) {
-        AVCaptureDevice *camera = cameras[i];
-        [self setupSessionForCamera:camera];
-    }
-    
-    // Select initial camera
-    NSString *savedCameraID = [[NSUserDefaults standardUserDefaults] objectForKey:@"SelectedCameraID"];
-    AVCaptureDevice *initialCamera = nil;
-    
-    if (savedCameraID) {
-        for (AVCaptureDevice *camera in cameras) {
-            if ([camera.uniqueID isEqualToString:savedCameraID]) {
-                initialCamera = camera;
-                break;
-            }
-        }
-    }
-    
-    if (!initialCamera) {
-        initialCamera = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-    }
-    
-    if (!initialCamera) {
-        RLog(RptrLogAreaCamera | RptrLogAreaError, @"No cameras available");
+    if (cameras.count == 0) {
+        RLog(RptrLogAreaCamera | RptrLogAreaError, @"No rear camera available");
         return;
     }
     
-    // Set current camera and session
-    self.currentCameraDevice = initialCamera;
-    self.captureSession = self.captureSessions[initialCamera.uniqueID];
-    self.movieFileOutput = self.movieFileOutputs[initialCamera.uniqueID];
-    self.videoDataOutput = self.videoDataOutputs[initialCamera.uniqueID];
+    // Get the rear camera
+    AVCaptureDevice *rearCamera = cameras.firstObject;
+    RLogVideo(@"Using rear camera: %@", rearCamera.localizedName);
     
-    RLog(RptrLogAreaCamera, @"Initial camera selected: %@ (position: %ld, uniqueID: %@)", 
-          initialCamera.localizedName, (long)initialCamera.position, initialCamera.uniqueID);
+    // Set up session for rear camera only
+    [self setupSessionForCamera:rearCamera];
+    
+    // Set current camera and session
+    self.currentCameraDevice = rearCamera;
+    self.captureSession = self.captureSessions[rearCamera.uniqueID];
+    // No movie file output needed - streaming only
+    self.videoDataOutput = self.videoDataOutputs[rearCamera.uniqueID];
+    
+    RLog(RptrLogAreaCamera, @"Rear camera selected: %@ (position: %ld, uniqueID: %@)", 
+          rearCamera.localizedName, (long)rearCamera.position, rearCamera.uniqueID);
     
     // Defer preview layer creation to ensure proper bounds
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -344,11 +366,9 @@
             RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Camera video dimensions: %d x %d", dimensions.width, dimensions.height);
         }
         
-        // Set the orientation to landscape using rotation angle (iOS 17+)
-        AVCaptureConnection *previewConnection = self.previewLayer.connection;
-        if (previewConnection && [previewConnection isVideoRotationAngleSupported:90]) {
-            previewConnection.videoRotationAngle = 90; // 90 degrees for landscape right
-        }
+        // IMPORTANT: Connection might not exist yet when preview layer is first created
+        // We'll set the orientation after adding the layer to the view
+        RLogVideo(@"Preview layer created, will set orientation after adding to view");
         
         // Remove any existing preview layers first
         for (CALayer *layer in [self.view.layer.sublayers copy]) {
@@ -358,6 +378,37 @@
         }
         
         [self.view.layer insertSublayer:self.previewLayer atIndex:0];
+        
+        // CRITICAL: Lock the preview layer transform to prevent automatic rotation
+        // This is the key to preventing the camera from rotating with the device
+        self.previewLayer.affineTransform = CGAffineTransformIdentity;
+        
+        // NOW set the orientation after the layer is added
+        AVCaptureConnection *previewConnection = self.previewLayer.connection;
+        if (previewConnection) {
+            RLogVideo(@"Setting camera orientation AFTER adding preview layer");
+            
+            // CRITICAL: Disable ALL automatic adjustments to prevent device rotation from affecting preview
+            if (previewConnection.isVideoMirroringSupported) {
+                previewConnection.automaticallyAdjustsVideoMirroring = NO;
+                previewConnection.videoMirrored = NO;  // Rear camera shouldn't be mirrored
+            }
+            
+            // Disable video stabilization which can cause orientation issues
+            if ([previewConnection isVideoStabilizationSupported]) {
+                previewConnection.preferredVideoStabilizationMode = AVCaptureVideoStabilizationModeOff;
+                RLogVideo(@"Disabled video stabilization on preview connection");
+            }
+            
+            // CRITICAL: Lock the connection to prevent any automatic rotation
+            previewConnection.enabled = NO;
+            previewConnection.enabled = YES;  // Re-enable after configuration
+            
+            // Don't set a fixed rotation here - let updateCameraRotationForOrientation handle it
+            RLogVideo(@"Preview connection ready for dynamic rotation based on device orientation");
+        } else {
+            RLogError(@"No preview connection available after adding layer!");
+        }
         
         // Force a layout update
         [self.view setNeedsLayout];
@@ -372,6 +423,7 @@
         [CATransaction setDisableActions:YES];
         self.previewLayer.bounds = self.view.layer.bounds;
         self.previewLayer.position = CGPointMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds));
+        // Don't apply transform - use connection rotation instead
         [CATransaction commit];
         
         RLog(RptrLogAreaUI | RptrLogAreaDebug, @"After explicit bounds set - Preview layer bounds: %@, position: %@", 
@@ -384,6 +436,10 @@
     // Start the session for single camera
     [self.captureSession startRunning];
     
+    // Set initial rotation based on current device orientation
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self updateCameraRotationForOrientation:self->_lastDeviceOrientation];
+    });
 }
 
 - (void)setupSessionForCamera:(AVCaptureDevice *)camera {
@@ -392,14 +448,10 @@
     // Create session for this camera
     AVCaptureSession *session = [[AVCaptureSession alloc] init];
     
-    // Use a lower quality preset for secondary camera to reduce resource usage
-    if (camera.position == AVCaptureDevicePositionFront) {
-        session.sessionPreset = AVCaptureSessionPresetMedium;
-        RLog(RptrLogAreaCamera, @"Using Medium preset for front camera to reduce resource usage");
-    } else {
-        session.sessionPreset = AVCaptureSessionPresetHigh;
-        RLog(RptrLogAreaCamera, @"Using High preset for back camera");
-    }
+    // Always use high preset for capture session
+    // The actual encoding resolution is handled by the asset writer
+    session.sessionPreset = AVCaptureSessionPresetHigh;
+    RLog(RptrLogAreaCamera, @"Using High preset for capture session");
     
     // Create video input
     NSError *error = nil;
@@ -413,14 +465,45 @@
     if ([session canAddInput:videoInput]) {
         [session addInput:videoInput];
         
-        // Configure frame rate to 24 fps
+        // Configure frame rate based on quality settings
         if ([camera lockForConfiguration:&error]) {
-            // Set the frame rate to 24 fps
-            CMTime frameDuration = CMTimeMake(1, 24);
+            // Get current quality settings
+            RptrVideoQualitySettings *settings = [RptrVideoQualitySettings settingsForMode:self.currentQualityMode];
+            
+            // Set the frame rate from quality settings
+            CMTime frameDuration = CMTimeMake(1, settings.videoFrameRate);
             camera.activeVideoMinFrameDuration = frameDuration;
             camera.activeVideoMaxFrameDuration = frameDuration;
+            
+            // CRITICAL: Disable automatic adjustments that cause rotation
+            // Try to disable geometric distortion correction if supported
+            if (@available(iOS 13.0, *)) {
+                // Just try to disable it - it will fail silently if not supported
+                @try {
+                    if (camera.isGeometricDistortionCorrectionEnabled) {
+                        camera.geometricDistortionCorrectionEnabled = NO;
+                        RLogVideo(@"Disabled geometric distortion correction");
+                    }
+                } @catch (NSException *exception) {
+                    // Not supported on this device/format
+                }
+            }
+            
+            // Disable auto adjustments
+            if ([camera isAutoFocusRangeRestrictionSupported]) {
+                camera.autoFocusRangeRestriction = AVCaptureAutoFocusRangeRestrictionNone;
+            }
+            
+            // Disable low light boost which can affect orientation
+            if (camera.isLowLightBoostSupported) {
+                camera.automaticallyEnablesLowLightBoostWhenAvailable = NO;
+                RLogVideo(@"Disabled automatic low light boost");
+            }
+            
             [camera unlockForConfiguration];
-            RLog(RptrLogAreaCamera | RptrLogAreaVideo, @"Set frame rate to 24 fps for %@", camera.localizedName);
+            RLog(RptrLogAreaCamera | RptrLogAreaVideo, @"Set frame rate to %d fps for %@ (quality mode: %@)", 
+                 settings.videoFrameRate, camera.localizedName, 
+                 self.currentQualityMode == RptrVideoQualityModeReliable ? @"Reliable" : @"Real-time");
         } else {
             RLog(RptrLogAreaCamera | RptrLogAreaError, @"Could not lock camera for configuration: %@", error.localizedDescription);
         }
@@ -429,33 +512,23 @@
         return;
     }
     
-    // Only add audio input to the primary camera session to avoid conflicts
-    // Audio will be recorded only from one source
-    if (camera.position == AVCaptureDevicePositionBack || 
-        (camera.position == AVCaptureDevicePositionUnspecified && [camera.localizedName containsString:@"Back"])) {
-        AVCaptureDevice *audioDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-        AVCaptureDeviceInput *audioInput = nil;
-        if (audioDevice) {
-            audioInput = [AVCaptureDeviceInput deviceInputWithDevice:audioDevice error:&error];
-            if (error) {
-                RLog(RptrLogAreaAudio | RptrLogAreaError, @"Error creating audio input: %@", error.localizedDescription);
-                error = nil;
-            }
+    // Add audio input for rear camera streaming
+    AVCaptureDevice *audioDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+    AVCaptureDeviceInput *audioInput = nil;
+    if (audioDevice) {
+        audioInput = [AVCaptureDeviceInput deviceInputWithDevice:audioDevice error:&error];
+        if (error) {
+            RLog(RptrLogAreaAudio | RptrLogAreaError, @"Error creating audio input: %@", error.localizedDescription);
+            error = nil;
         }
-        
-        if (audioInput && [session canAddInput:audioInput]) {
-            [session addInput:audioInput];
-            RLog(RptrLogAreaAudio, @"Added audio input to %@ camera session", camera.localizedName);
-        }
-    } else {
-        RLog(RptrLogAreaAudio, @"Skipping audio input for %@ camera to avoid conflicts", camera.localizedName);
     }
     
-    // Add movie file output
-    AVCaptureMovieFileOutput *movieOutput = [[AVCaptureMovieFileOutput alloc] init];
-    if ([session canAddOutput:movieOutput]) {
-        [session addOutput:movieOutput];
+    if (audioInput && [session canAddInput:audioInput]) {
+        [session addInput:audioInput];
+        RLog(RptrLogAreaAudio, @"Added audio input to rear camera session");
     }
+    
+    // No movie file output needed - this app only streams, never records
     
     // Add video data output for motion/light detection and streaming
     AVCaptureVideoDataOutput *dataOutput = [[AVCaptureVideoDataOutput alloc] init];
@@ -473,32 +546,36 @@
         [session addOutput:dataOutput];
         RLog(RptrLogAreaVideo, @"Video data output added for %@", camera.localizedName);
         
-        // Force landscape orientation on the video connection using rotation angle
+        // Set landscape orientation for rear camera streaming
         AVCaptureConnection *videoConnection = [dataOutput connectionWithMediaType:AVMediaTypeVideo];
-        if (videoConnection && [videoConnection isVideoRotationAngleSupported:90]) {
-            videoConnection.videoRotationAngle = 90; // 90 degrees for landscape right
-            RLogVideo(@"Forced landscape orientation (90°) on video connection for %@", camera.localizedName);
+        if (videoConnection) {
+            // CRITICAL: Disable automatic adjustments
+            if (videoConnection.isVideoMirroringSupported) {
+                videoConnection.automaticallyAdjustsVideoMirroring = NO;
+                videoConnection.videoMirrored = NO;  // Rear camera shouldn't be mirrored
+                RLogVideo(@"Disabled automatic video mirroring adjustments");
+            }
+            
+            // Don't set a fixed rotation here - let updateCameraRotationForOrientation handle it
+            RLogVideo(@"Video output connection ready for dynamic rotation based on device orientation");
         }
     }
     
-    // Add audio data output for streaming (only on primary camera)
-    if (camera.position == AVCaptureDevicePositionBack || 
-        (camera.position == AVCaptureDevicePositionUnspecified && [camera.localizedName containsString:@"Back"])) {
-        AVCaptureAudioDataOutput *audioDataOutput = [[AVCaptureAudioDataOutput alloc] init];
-        NSString *audioQueueName = [NSString stringWithFormat:@"audioQueue_%@", safeCameraName];
-        dispatch_queue_t audioQueue = dispatch_queue_create([audioQueueName UTF8String], DISPATCH_QUEUE_SERIAL);
-        [audioDataOutput setSampleBufferDelegate:self queue:audioQueue];
-        
-        if ([session canAddOutput:audioDataOutput]) {
-            [session addOutput:audioDataOutput];
-            self.audioDataOutput = audioDataOutput;
-            RLog(RptrLogAreaAudio | RptrLogAreaHLS, @"Audio data output added for streaming");
-        }
+    // Add audio data output for streaming
+    AVCaptureAudioDataOutput *audioDataOutput = [[AVCaptureAudioDataOutput alloc] init];
+    NSString *audioQueueName = [NSString stringWithFormat:@"audioQueue_%@", safeCameraName];
+    dispatch_queue_t audioQueue = dispatch_queue_create([audioQueueName UTF8String], DISPATCH_QUEUE_SERIAL);
+    [audioDataOutput setSampleBufferDelegate:self queue:audioQueue];
+    
+    if ([session canAddOutput:audioDataOutput]) {
+        [session addOutput:audioDataOutput];
+        self.audioDataOutput = audioDataOutput;
+        RLog(RptrLogAreaAudio | RptrLogAreaHLS, @"Audio data output added for streaming");
     }
     
     // Store in dictionaries
     self.captureSessions[camera.uniqueID] = session;
-    self.movieFileOutputs[camera.uniqueID] = movieOutput;
+    // No movie file output storage needed
     self.videoDataOutputs[camera.uniqueID] = dataOutput;
     
     // Initialize detection properties (do this once in main setup)
@@ -522,6 +599,10 @@
         RLog(RptrLogAreaHLS, @"Initializing HLS server on app launch");
         self.hlsServer = [[HLSAssetWriterServer alloc] initWithPort:8080];
         self.hlsServer.delegate = self;
+        
+        // Set initial quality settings
+        RptrVideoQualitySettings *settings = [RptrVideoQualitySettings settingsForMode:self.currentQualityMode];
+        self.hlsServer.qualitySettings = settings;
         
         NSError *error = nil;
         BOOL started = [self.hlsServer startServer:&error];
@@ -661,6 +742,17 @@
     titleButton.tintColor = [UIColor whiteColor];
     [titleButton addTarget:self action:@selector(titleButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:titleButton];
+    
+    // Quality toggle button - positioned above share button
+    self.qualityButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 250, streamButtonSize, streamButtonSize)];
+    self.qualityButton.backgroundColor = [[UIColor systemPurpleColor] colorWithAlphaComponent:0.8];
+    self.qualityButton.layer.cornerRadius = streamButtonSize / 2;
+    [self.qualityButton setImage:[UIImage systemImageNamed:@"speedometer"] forState:UIControlStateNormal];
+    self.qualityButton.tintColor = [UIColor whiteColor];
+    [self.qualityButton addTarget:self action:@selector(qualityButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.qualityButton];
+    
+    // Quality mode already initialized in viewDidLoad
 }
 
 
@@ -757,6 +849,12 @@
     
     // Remove all observers
     [[NSNotificationCenter defaultCenter] removeObserver:self];
+    
+    // Stop motion manager
+    if (_motionManager) {
+        [_motionManager stopDeviceMotionUpdates];
+        _motionManager = nil;
+    }
     
     // Stop HLS server
     if (self.hlsServer) {
@@ -1183,6 +1281,7 @@
     RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Delegate: %@", self.videoDataOutput.sampleBufferDelegate);
     RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"isStreaming: %@", self.isStreaming ? @"YES" : @"NO");
     
+    
     // Check all video data outputs
     RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Checking all video data outputs:");
     for (NSString *cameraID in self.videoDataOutputs) {
@@ -1327,8 +1426,7 @@
             break;
         }
         
-        self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS: Port %lu", 
-                                     (unsigned long)self.hlsServer.port];
+        [self updateStreamInfoLabel];
         self.streamInfoLabel.hidden = NO;
         
         // Log the URLs but don't show alert - it might be blocking
@@ -1371,22 +1469,14 @@
 - (void)hlsServer:(id)server clientConnected:(NSString *)clientAddress {
     dispatch_async(dispatch_get_main_queue(), ^{
         RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Client connected: %@", clientAddress);
-        self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS: %lu clients", 
-                                     (unsigned long)self.hlsServer.connectedClients];
+        [self updateStreamInfoLabel];
     });
 }
 
 - (void)hlsServer:(id)server clientDisconnected:(NSString *)clientAddress {
     dispatch_async(dispatch_get_main_queue(), ^{
         RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Client disconnected: %@", clientAddress);
-        NSUInteger clientCount = self.hlsServer.connectedClients;
-        if (clientCount > 0) {
-            self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS: %lu clients", 
-                                         (unsigned long)clientCount];
-        } else {
-            self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS: Port %lu", 
-                                         (unsigned long)self.hlsServer.port];
-        }
+        [self updateStreamInfoLabel];
     });
 }
 
@@ -1402,58 +1492,154 @@
     });
 }
 
-// Interval button functionality has been removed
-
-- (CGFloat)videoRotationAngleFromDeviceOrientation {
-    // Always return 90 degrees to lock orientation to landscape right
-    return 90;
+- (void)qualityButtonTapped:(UIButton *)sender {
+    // Don't allow quality changes while streaming
+    if (self.isStreaming) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Cannot Change Quality"
+                                                                       message:@"Stop streaming to change quality settings"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    
+    // Toggle quality mode
+    RptrVideoQualityMode newMode = (self.currentQualityMode == RptrVideoQualityModeReliable) ? 
+                                   RptrVideoQualityModeRealtime : RptrVideoQualityModeReliable;
+    
+    // Create new settings
+    RptrVideoQualitySettings *newSettings = [RptrVideoQualitySettings settingsForMode:newMode];
+    
+    // Show confirmation
+    NSString *title = [NSString stringWithFormat:@"Switch to %@ Mode?", newSettings.modeName];
+    NSString *message = newSettings.modeDescription;
+    
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Switch" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [self switchToQualityMode:newMode];
+    }]];
+    
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
-// Override interface orientation methods
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-implementations"
-- (BOOL)shouldAutorotate {
-    return NO; // Prevent auto-rotation
+- (void)switchToQualityMode:(RptrVideoQualityMode)mode {
+    self.currentQualityMode = mode;
+    
+    // Update button appearance
+    UIColor *buttonColor = (mode == RptrVideoQualityModeReliable) ? 
+                          [UIColor systemPurpleColor] : [UIColor systemRedColor];
+    self.qualityButton.backgroundColor = [buttonColor colorWithAlphaComponent:0.8];
+    
+    // Update HLS server settings
+    RptrVideoQualitySettings *settings = [RptrVideoQualitySettings settingsForMode:mode];
+    [self.hlsServer updateQualitySettings:settings];
+    
+    // Update capture session preset
+    if (self.captureSession) {
+        [self.captureSession beginConfiguration];
+        self.captureSession.sessionPreset = settings.sessionPreset;
+        [self.captureSession commitConfiguration];
+    }
+    
+    // Update camera frame rate for all cameras
+    for (NSString *cameraID in self.captureSessions) {
+        AVCaptureDevice *camera = [AVCaptureDevice deviceWithUniqueID:cameraID];
+        if (camera) {
+            NSError *error = nil;
+            if ([camera lockForConfiguration:&error]) {
+                CMTime frameDuration = CMTimeMake(1, settings.videoFrameRate);
+                camera.activeVideoMinFrameDuration = frameDuration;
+                camera.activeVideoMaxFrameDuration = frameDuration;
+                [camera unlockForConfiguration];
+                RLogVideo(@"Updated frame rate to %d fps for %@", settings.videoFrameRate, camera.localizedName);
+            } else {
+                RLogError(@"Could not update frame rate for %@: %@", camera.localizedName, error.localizedDescription);
+            }
+        }
+    }
+    
+    // Update stream info label
+    [self updateStreamInfoLabel];
+    
+    RLogUI(@"Switched to %@ quality mode", settings.modeName);
 }
-#pragma clang diagnostic pop
 
+- (void)updateStreamInfoLabel {
+    if (!self.isStreaming) {
+        self.streamInfoLabel.text = @"";
+        return;
+    }
+    
+    NSString *qualityMode = (self.currentQualityMode == RptrVideoQualityModeReliable) ? @"Reliable" : @"Real-time";
+    NSUInteger clientCount = self.hlsServer.connectedClients;
+    
+    if (clientCount > 0) {
+        self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS %@: %lu clients", 
+                                     qualityMode, (unsigned long)clientCount];
+    } else {
+        self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS %@: Port %lu", 
+                                     qualityMode, (unsigned long)self.hlsServer.port];
+    }
+}
+
+// Override interface orientation methods for landscape-only app
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskLandscapeRight;
+    return UIInterfaceOrientationMaskLandscapeRight; // Lock to single orientation
 }
 
 - (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
     return UIInterfaceOrientationLandscapeRight;
 }
 
+- (BOOL)shouldAutorotate {
+    return NO; // Prevent any rotation
+}
+
+// Override motion handling to prevent any orientation changes
+- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    // Do NOT call super - we don't want any size transitions
+    // This prevents the system from trying to adjust our view for orientation changes
+    RLogUI(@"Blocking view transition to size: %@", NSStringFromCGSize(size));
+}
+
+- (void)viewWillLayoutSubviews {
+    [super viewWillLayoutSubviews];
+    
+    // Force landscape dimensions regardless of device orientation
+    if (self.view.frame.size.width < self.view.frame.size.height) {
+        // We're in portrait mode but should be landscape
+        CGFloat temp = self.view.frame.size.width;
+        self.view.frame = CGRectMake(0, 0, self.view.frame.size.height, temp);
+        RLogUI(@"Forced landscape dimensions in viewWillLayoutSubviews");
+    }
+}
+
+// Override to prevent any automatic view adjustments based on orientation
+- (void)viewSafeAreaInsetsDidChange {
+    // Do NOT call super - prevent safe area adjustments
+    RLogUI(@"Blocking safe area insets change");
+}
+
+- (BOOL)prefersHomeIndicatorAutoHidden {
+    return YES;
+}
+
+- (UIRectEdge)preferredScreenEdgesDeferringSystemGestures {
+    return UIRectEdgeAll;
+}
+
+- (BOOL)prefersStatusBarHidden {
+    return YES;
+}
+
 // Override to fix UIAlertController performance issues
 // This helps prevent the ~700ms delay when presenting/dismissing alerts
 - (BOOL)canBecomeFirstResponder {
     return YES;
-}
-
-#pragma mark - Orientation Enforcement
-
-- (void)enforceImmediateLandscapeOrientation {
-    // Force device orientation change immediately
-    if (@available(iOS 16.0, *)) {
-        // iOS 16+ approach - request geometry update
-        NSArray *connectedScenes = [UIApplication sharedApplication].connectedScenes.allObjects;
-        UIWindowScene *windowScene = (UIWindowScene *)connectedScenes.firstObject;
-        if (windowScene) {
-            UIWindowSceneGeometryPreferencesIOS *geometryPreferences = [[UIWindowSceneGeometryPreferencesIOS alloc] init];
-            geometryPreferences.interfaceOrientations = UIInterfaceOrientationMaskLandscapeRight;
-            
-            [windowScene requestGeometryUpdateWithPreferences:geometryPreferences errorHandler:^(NSError * _Nonnull error) {
-                RLog(RptrLogAreaUI | RptrLogAreaError, @"Failed to enforce landscape orientation: %@", error.localizedDescription);
-            }];
-        }
-    } else {
-        // iOS 15 and earlier - use device orientation
-        [[UIDevice currentDevice] setValue:@(UIInterfaceOrientationLandscapeRight) forKey:@"orientation"];
-    }
-    
-    // Also ensure the view controller reports correct orientation
-    [self setNeedsUpdateOfSupportedInterfaceOrientations];
 }
 
 
@@ -1582,6 +1768,102 @@
 }
 
 #pragma mark - Helper Methods
+
+- (void)updateCameraRotationForOrientation:(UIDeviceOrientation)orientation {
+    // Calculate the rotation angle needed to compensate for device orientation
+    CGFloat rotationAngle = 0.0;
+    
+    // We want the video to always appear in landscape right orientation
+    // So we need to rotate based on current device orientation
+    switch (orientation) {
+        case UIDeviceOrientationPortrait:
+            rotationAngle = 90.0;  // Rotate 90 degrees to get to landscape right
+            break;
+        case UIDeviceOrientationPortraitUpsideDown:
+            rotationAngle = 270.0; // Rotate 270 degrees
+            break;
+        case UIDeviceOrientationLandscapeLeft:
+            rotationAngle = 180.0; // Rotate 180 degrees (device is opposite of desired)
+            break;
+        case UIDeviceOrientationLandscapeRight:
+            rotationAngle = 0.0;   // No rotation needed - already correct
+            break;
+        default:
+            rotationAngle = 90.0;  // Default to portrait compensation
+            break;
+    }
+    
+    RLogVideo(@"Updating camera rotation to %.0f degrees for device orientation %ld", rotationAngle, (long)orientation);
+    
+    // Update preview connection
+    if (self.previewLayer) {
+        AVCaptureConnection *previewConnection = self.previewLayer.connection;
+        if (previewConnection) {
+            if (@available(iOS 17.0, *)) {
+                if ([previewConnection isVideoRotationAngleSupported:rotationAngle]) {
+                    previewConnection.videoRotationAngle = rotationAngle;
+                    RLogVideo(@"Updated preview rotation to %.0f degrees", rotationAngle);
+                }
+            } else {
+                // For iOS 16 and below, map angle to orientation
+                AVCaptureVideoOrientation videoOrientation = AVCaptureVideoOrientationLandscapeRight;
+                switch ((int)rotationAngle) {
+                    case 0:
+                        videoOrientation = AVCaptureVideoOrientationLandscapeRight;
+                        break;
+                    case 90:
+                        videoOrientation = AVCaptureVideoOrientationPortrait;
+                        break;
+                    case 180:
+                        videoOrientation = AVCaptureVideoOrientationLandscapeLeft;
+                        break;
+                    case 270:
+                        videoOrientation = AVCaptureVideoOrientationPortraitUpsideDown;
+                        break;
+                }
+                if (previewConnection.isVideoOrientationSupported) {
+                    previewConnection.videoOrientation = videoOrientation;
+                    RLogVideo(@"Updated preview orientation to %ld", (long)videoOrientation);
+                }
+            }
+        }
+    }
+    
+    // Update video data output connection
+    for (NSString *cameraID in self.videoDataOutputs) {
+        AVCaptureVideoDataOutput *output = self.videoDataOutputs[cameraID];
+        AVCaptureConnection *connection = [output connectionWithMediaType:AVMediaTypeVideo];
+        if (connection) {
+            if (@available(iOS 17.0, *)) {
+                if ([connection isVideoRotationAngleSupported:rotationAngle]) {
+                    connection.videoRotationAngle = rotationAngle;
+                    RLogVideo(@"Updated video output rotation to %.0f degrees", rotationAngle);
+                }
+            } else {
+                // Same mapping for iOS 16 and below
+                AVCaptureVideoOrientation videoOrientation = AVCaptureVideoOrientationLandscapeRight;
+                switch ((int)rotationAngle) {
+                    case 0:
+                        videoOrientation = AVCaptureVideoOrientationLandscapeRight;
+                        break;
+                    case 90:
+                        videoOrientation = AVCaptureVideoOrientationPortrait;
+                        break;
+                    case 180:
+                        videoOrientation = AVCaptureVideoOrientationLandscapeLeft;
+                        break;
+                    case 270:
+                        videoOrientation = AVCaptureVideoOrientationPortraitUpsideDown;
+                        break;
+                }
+                if (connection.isVideoOrientationSupported) {
+                    connection.videoOrientation = videoOrientation;
+                    RLogVideo(@"Updated video output orientation to %ld", (long)videoOrientation);
+                }
+            }
+        }
+    }
+}
 
 - (NSString *)getIPAddress {
     NSString *address = @"Not Connected";
@@ -1752,47 +2034,6 @@
     [self.view addSubview:messageLabel];
 }
 
-- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
-    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
-    
-    // Force layout update before animation to prevent duplication
-    [self.view setNeedsLayout];
-    [self.view layoutIfNeeded];
-    
-    [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext> context) {
-        // Clear any drawing artifacts
-        [self.view.layer setNeedsDisplay];
-        
-        self.previewLayer.frame = self.view.bounds;
-        
-        // Update info labels position
-        self.locationLabel.frame = CGRectMake(size.width - 210, 65, 200, 22);
-        self.utcTimeLabel.frame = CGRectMake(size.width - 210, 90, 200, 22);
-        self.streamInfoLabel.frame = CGRectMake(size.width - 210, 115, 200, 22);
-        
-        // Update endpoint labels and copy buttons
-        CGFloat yOffset = 40;
-        for (NSInteger i = 0; i < self.endpointLabels.count; i++) {
-            UILabel *label = self.endpointLabels[i];
-            UIButton *button = self.endpointCopyButtons[i];
-            
-            label.frame = CGRectMake(size.width - 280, yOffset, 250, 20);
-            button.frame = CGRectMake(size.width - 25, yOffset, 20, 20);
-            
-            yOffset += 22;
-        }
-        
-        // Update stream button position
-        CGFloat streamButtonSize = 44;
-        self.streamButton.frame = CGRectMake(20, size.height - streamButtonSize - 50, streamButtonSize, streamButtonSize);
-        
-        // Interval button removed
-    } completion:^(id<UIViewControllerTransitionCoordinatorContext> context) {
-        // Force final layout update after rotation to clean up any artifacts
-        [self.view setNeedsDisplay];
-        [CATransaction flush];
-    }];
-}
 
 
 #pragma mark - Session Notifications
@@ -1907,6 +2148,26 @@
         }
     
     // Video orientation is now set during configuration, no need to set it here
+    
+    // Debug: Log sample buffer dimensions
+    if (output == self.videoDataOutput) {
+        static int dimensionLogCount = 0;
+        if (dimensionLogCount < 5) {
+            CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
+            if (formatDesc) {
+                CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(formatDesc);
+                RLogVideo(@"Sample buffer dimensions: %d x %d (frame %d)", dimensions.width, dimensions.height, dimensionLogCount + 1);
+                
+                // Check connection rotation
+                CGFloat rotation = 0;
+                if (@available(iOS 17.0, *)) {
+                    rotation = connection.videoRotationAngle;
+                }
+                RLogVideo(@"Connection rotation angle: %.0f degrees", rotation);
+            }
+            dimensionLogCount++;
+        }
+    }
     
     // Debug: Log any call to this method
     static int totalCalls = 0;

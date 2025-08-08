@@ -199,6 +199,9 @@
         _sessionStarted = NO;
         _isFinishingWriter = NO;
         
+        // Initialize with default quality settings
+        _qualitySettings = [RptrVideoQualitySettings reliableSettings];
+        
         // Setup file system directories
         [self setupDirectories];
         
@@ -476,8 +479,8 @@
         // Configure for delegate-based fMP4 HLS output
         if (@available(iOS 14.0, *)) {
             // Set segment duration for HLS with proper precision
-            self.assetWriter.preferredOutputSegmentInterval = CMTimeMakeWithSeconds(kRptrSegmentDuration, 1000);
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Set preferredOutputSegmentInterval to %f seconds", kRptrSegmentDuration);
+            self.assetWriter.preferredOutputSegmentInterval = CMTimeMakeWithSeconds(self.qualitySettings.segmentDuration, 1000);
+            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Set preferredOutputSegmentInterval to %f seconds", self.qualitySettings.segmentDuration);
         } else {
             // Fallback: use movieFragmentInterval for older iOS
             self.assetWriter.movieFragmentInterval = CMTimeMakeWithSeconds(0.2, 1000);
@@ -488,16 +491,16 @@
         // CAVLC entropy coding is more error-resilient than CABAC for streaming
         NSDictionary *videoSettings = @{
             AVVideoCodecKey: AVVideoCodecTypeH264,
-            AVVideoWidthKey: @(kRptrVideoWidth),      // 960 pixels (qHD)
-            AVVideoHeightKey: @(kRptrVideoHeight),    // 540 pixels (qHD)
+            AVVideoWidthKey: @(self.qualitySettings.videoWidth),
+            AVVideoHeightKey: @(self.qualitySettings.videoHeight),
             AVVideoCompressionPropertiesKey: @{
                 // Bitrate and quality settings
-                AVVideoAverageBitRateKey: @(kRptrVideoBitrate),     // 600 kbps
-                AVVideoQualityKey: @(kRptrVideoQuality),            // 0.75 quality
+                AVVideoAverageBitRateKey: @(self.qualitySettings.videoBitrate),
+                AVVideoQualityKey: @(self.qualitySettings.videoQuality),
                 
                 // Keyframe (IDR) settings for segment boundaries
-                AVVideoMaxKeyFrameIntervalKey: @(kRptrVideoKeyFrameInterval),        // 30 frames
-                AVVideoMaxKeyFrameIntervalDurationKey: @(kRptrVideoKeyFrameDuration), // 2 seconds
+                AVVideoMaxKeyFrameIntervalKey: @(self.qualitySettings.videoKeyFrameInterval),
+                AVVideoMaxKeyFrameIntervalDurationKey: @(self.qualitySettings.videoKeyFrameDuration),
                 
                 // H.264 profile and encoding settings
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264BaselineAutoLevel,    // Maximum compatibility
@@ -505,8 +508,8 @@
                 AVVideoAllowFrameReorderingKey: @(NO),                              // No B-frames
                 
                 // Frame rate settings
-                AVVideoExpectedSourceFrameRateKey: @(kRptrVideoFrameRate),          // 15 fps
-                AVVideoAverageNonDroppableFrameRateKey: @(kRptrVideoFrameRate),    // Consistent rate
+                AVVideoExpectedSourceFrameRateKey: @(self.qualitySettings.videoFrameRate),
+                AVVideoAverageNonDroppableFrameRateKey: @(self.qualitySettings.videoFrameRate),
                 
                 // Pixel aspect ratio (square pixels)
                 AVVideoPixelAspectRatioKey: @{
@@ -522,10 +525,9 @@
             return;
         }
         
-        // Use identity transform since video is already in landscape orientation
-        // The AVCaptureConnection is configured to output landscape frames
+        // Use identity transform - rotation is handled at capture level
         self.videoInput.transform = CGAffineTransformIdentity;
-        RLog(RptrLogAreaHLS | RptrLogAreaVideo, @"Using identity transform for segment %ld (frames pre-oriented to landscape)", 
+        RLog(RptrLogAreaHLS | RptrLogAreaVideo, @"Using identity transform for segment %ld - rotation handled at capture", 
              (long)self.currentSegmentIndex);
         self.videoInput.expectsMediaDataInRealTime = YES;
         RLog(RptrLogAreaVideo | RptrLogAreaDebug, @"Created video input: %@", self.videoInput);
@@ -543,9 +545,9 @@
         // Mono audio saves 50% bandwidth with minimal quality impact for voice
         NSDictionary *audioSettings = @{
             AVFormatIDKey: @(kAudioFormatMPEG4AAC),              // AAC-LC codec
-            AVNumberOfChannelsKey: @(kRptrAudioChannels),        // Mono (1 channel)
-            AVSampleRateKey: @(kRptrAudioSampleRate),            // 44.1 kHz
-            AVEncoderBitRateKey: @(kRptrAudioBitrate),           // 64 kbps
+            AVNumberOfChannelsKey: @(self.qualitySettings.audioChannels),
+            AVSampleRateKey: @(self.qualitySettings.audioSampleRate),
+            AVEncoderBitRateKey: @(self.qualitySettings.audioBitrate),
             AVEncoderAudioQualityKey: @(AVAudioQualityMedium)    // Balanced quality
         };
         
@@ -804,7 +806,7 @@
         CMTime timeSinceSegmentStart = CMTimeSubtract(presentationTime, self.nextSegmentBoundary);
         double secondsSinceSegmentStart = CMTimeGetSeconds(timeSinceSegmentStart);
         
-        if (secondsSinceSegmentStart >= kRptrSegmentDuration || self.forceSegmentRotation) {
+        if (secondsSinceSegmentStart >= self.qualitySettings.segmentDuration || self.forceSegmentRotation) {
             if (self.forceSegmentRotation) {
                 RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Forced segment rotation requested");
             } else {
@@ -824,7 +826,7 @@
                 self.forceSegmentRotation = NO;
                 [self rotateSegment];
                 return; // Skip this frame, it will be written to the new segment
-            } else if (self.forceSegmentRotation && secondsSinceSegmentStart >= kRptrSegmentDuration + kRptrSegmentRotationDelay) {
+            } else if (self.forceSegmentRotation && secondsSinceSegmentStart >= self.qualitySettings.segmentDuration + self.qualitySettings.segmentRotationDelay) {
                 // Force rotation if we've waited a bit for key frame
                 RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"[FORCE ROTATION] No key frame for %.3f seconds, forcing rotation of segment %ld", 
                        secondsSinceSegmentStart, (long)self.currentSegmentIndex);
@@ -1036,7 +1038,7 @@
                 [strongSelf finalizeCurrentSegment];
                 
                 // Update segment boundary
-                strongSelf.nextSegmentBoundary = CMTimeAdd(strongSelf.nextSegmentBoundary, CMTimeMakeWithSeconds(kRptrSegmentDuration, 1));
+                strongSelf.nextSegmentBoundary = CMTimeAdd(strongSelf.nextSegmentBoundary, CMTimeMakeWithSeconds(self.qualitySettings.segmentDuration, 1));
                 
                 // Clear the finishing flag
                 strongSelf.isFinishingWriter = NO;
@@ -1057,7 +1059,7 @@
 - (void)finalizeCurrentSegment {
     NSTimeInterval segmentAge = [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime];
     RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Finalizing segment %ld after %.3f seconds (expected: %.1f)", 
-           (long)self.currentSegmentIndex, segmentAge, kRptrSegmentDuration);
+           (long)self.currentSegmentIndex, segmentAge, self.qualitySettings.segmentDuration);
     
     if (!self.assetWriter) {
         RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaError, @"ERROR: No asset writer to finalize");
@@ -1069,7 +1071,23 @@
         return;
     }
     
-    // Get segment info
+    // Check if we're using delegate-based writing (iOS 14+)
+    BOOL isDelegateBased = NO;
+    if (@available(iOS 14.0, *)) {
+        isDelegateBased = (self.assetWriter.outputURL == nil);
+    }
+    
+    if (isDelegateBased) {
+        // For delegate-based writing, segments are handled via delegate callbacks
+        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Using delegate-based segment delivery - segments handled via delegate");
+        
+        // The actual segment data has already been delivered via the delegate method
+        // Just clean up the writer reference
+        self.assetWriter = nil;
+        return;
+    }
+    
+    // File-based writing path (for older iOS versions)
     NSURL *segmentURL = self.assetWriter.outputURL;
     NSString *segmentPath = segmentURL.path;
     RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaFile, @"Segment path: %@", segmentPath);
@@ -1089,7 +1107,7 @@
     
     if (fileSize > 0) {
         // Calculate actual duration based on writer session
-        CMTime duration = CMTimeMakeWithSeconds(kRptrSegmentDuration, 1000); // More precise timing
+        CMTime duration = CMTimeMakeWithSeconds(self.qualitySettings.segmentDuration, 1000); // More precise timing
         
         // Create segment info
         HLSSegmentInfo *segmentInfo = [[HLSSegmentInfo alloc] init];
@@ -1142,12 +1160,12 @@
     dispatch_async(dispatch_get_main_queue(), ^{
         [self stopSegmentTimer];
         // Fire timer well before segment duration to ensure timely rotation
-        self.segmentTimer = [NSTimer scheduledTimerWithTimeInterval:kRptrSegmentDuration - kRptrSegmentTimerOffset
+        self.segmentTimer = [NSTimer scheduledTimerWithTimeInterval:self.qualitySettings.segmentDuration - self.qualitySettings.segmentTimerOffset
                                                               target:self
                                                             selector:@selector(segmentTimerFired:)
                                                             userInfo:nil
                                                              repeats:YES];
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Started segment rotation timer (interval: %.1f)", kRptrSegmentDuration - kRptrSegmentTimerOffset);
+        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Started segment rotation timer (interval: %.1f)", self.qualitySettings.segmentDuration - self.qualitySettings.segmentTimerOffset);
     });
 }
 
@@ -1174,9 +1192,9 @@
         
         NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime];
         RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming | RptrLogAreaDebug, @"[TIMER] Segment timer fired for segment %ld, elapsed: %.3f seconds (target: %.1f)", 
-               (long)self.currentSegmentIndex, elapsed, kRptrSegmentDuration);
+               (long)self.currentSegmentIndex, elapsed, self.qualitySettings.segmentDuration);
         
-        if (elapsed >= kRptrSegmentDuration - kRptrSegmentTimerOffset) {
+        if (elapsed >= self.qualitySettings.segmentDuration - self.qualitySettings.segmentTimerOffset) {
             RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"[TIMER] Setting force rotation flag for segment %ld (elapsed: %.3f)", 
                    (long)self.currentSegmentIndex, elapsed);
             self.forceSegmentRotation = YES;
@@ -1194,11 +1212,14 @@
                         @"#EXT-X-TARGETDURATION:%ld\n"
                         @"#EXT-X-PLAYLIST-TYPE:EVENT\n"
                         @"#EXT-X-MEDIA-SEQUENCE:0\n"
-                        @"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=8.0\n"
-                        @"#EXT-X-START:TIME-OFFSET=-8.0\n"
+                        @"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=%.1f\n"
+                        @"#EXT-X-START:TIME-OFFSET=-%.1f\n"
                         @"#EXT-X-INDEPENDENT-SEGMENTS\n"
                         @"#EXT-X-ALLOW-CACHE:NO\n"
-                        @"#EXT-X-DISCONTINUITY-SEQUENCE:0\n", (long)kRptrTargetDuration];
+                        @"#EXT-X-DISCONTINUITY-SEQUENCE:0\n", 
+                        (long)self.qualitySettings.targetDuration,
+                        self.qualitySettings.segmentDuration * 2,
+                        self.qualitySettings.segmentDuration * 2];
     
     NSString *playlistPath = [self.baseDirectory stringByAppendingPathComponent:@"playlist.m3u8"];
     NSError *error;
@@ -1223,10 +1244,10 @@
         // Header with live HLS tags
         [playlist appendString:@"#EXTM3U\n"];
         [playlist appendString:@"#EXT-X-VERSION:6\n"]; // Version 6 for better compatibility (still supports fMP4)
-        [playlist appendFormat:@"#EXT-X-TARGETDURATION:%ld\n", (long)kRptrTargetDuration];
+        [playlist appendFormat:@"#EXT-X-TARGETDURATION:%ld\n", (long)self.qualitySettings.targetDuration];
         [playlist appendString:@"#EXT-X-PLAYLIST-TYPE:EVENT\n"]; // Live event that will eventually end
-        [playlist appendString:@"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=8.0\n"]; // Allow skipping old segments
-        [playlist appendString:@"#EXT-X-START:TIME-OFFSET=-8.0\n"]; // Start playback 8 seconds (2 segments) from live edge
+        [playlist appendFormat:@"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=%.1f\n", self.qualitySettings.segmentDuration * 2]; // Allow skipping old segments
+        [playlist appendFormat:@"#EXT-X-START:TIME-OFFSET=-%.1f\n", self.qualitySettings.segmentDuration * 2]; // Start playback 2 segments from live edge
         
         // Add INDEPENDENT-SEGMENTS tag for better compatibility
         [playlist appendString:@"#EXT-X-INDEPENDENT-SEGMENTS\n"];
@@ -1238,7 +1259,7 @@
         [playlist appendString:@"#EXT-X-DISCONTINUITY-SEQUENCE:0\n"];
         
         // Calculate starting sequence number for sliding window
-        NSInteger startIndex = MAX(0, (NSInteger)segmentCount - kRptrPlaylistWindow);
+        NSInteger startIndex = MAX(0, (NSInteger)segmentCount - self.qualitySettings.playlistWindow);
         NSInteger startSequence = (startIndex > 0 && segmentCount > startIndex) ? self.segments[startIndex].sequenceNumber : 0;
         
         [playlist appendFormat:@"#EXT-X-MEDIA-SEQUENCE:%ld\n", (long)startSequence];
@@ -1300,7 +1321,7 @@
 - (void)cleanupOldSegments {
     dispatch_barrier_async(self.segmentsQueue, ^{
         NSUInteger initialCount = self.segments.count;
-        while (self.segments.count > kRptrMaxSegments) {
+        while (self.segments.count > self.qualitySettings.maxSegments) {
             HLSSegmentInfo *oldSegment = self.segments.firstObject;
             NSTimeInterval segmentAge = [[NSDate date] timeIntervalSinceDate:oldSegment.createdAt];
             
@@ -1467,7 +1488,7 @@
     
     // Read request
     RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"2. About to read request from socket %d", clientSocket);
-    char buffer[kRptrHTTPBufferSize];
+    char buffer[self.qualitySettings.httpBufferSize];
     ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
     RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"3. Read %zd bytes from socket %d", bytesRead, clientSocket);
     
@@ -2462,7 +2483,7 @@
             // Create segment info
             HLSSegmentInfo *segmentInfo = [[HLSSegmentInfo alloc] init];
             segmentInfo.filename = segmentName;
-            segmentInfo.duration = segmentReport ? segmentReport.trackReports.firstObject.duration : CMTimeMakeWithSeconds(kRptrSegmentDuration, 1);
+            segmentInfo.duration = segmentReport ? segmentReport.trackReports.firstObject.duration : CMTimeMakeWithSeconds(self.qualitySettings.segmentDuration, 1);
             segmentInfo.sequenceNumber = self.mediaSequenceNumber;
             segmentInfo.createdAt = [NSDate date];
             segmentInfo.fileSize = segmentData.length;
@@ -2474,8 +2495,8 @@
                       segmentName, (unsigned long)segmentData.length, CMTimeGetSeconds(segmentInfo.duration));
                 
                 // Clean up old segments to prevent memory buildup
-                if (self.segments.count > kRptrMaxSegments) {
-                    NSInteger removeCount = self.segments.count - kRptrMaxSegments;
+                if (self.segments.count > self.qualitySettings.maxSegments) {
+                    NSInteger removeCount = self.segments.count - self.qualitySettings.maxSegments;
                     for (NSInteger i = 0; i < removeCount; i++) {
                         HLSSegmentInfo *oldSegment = self.segments[0];
                         [self.segmentDataLock lock];
@@ -2890,6 +2911,49 @@
     // The atomic property ensures thread safety for simple assignment
     self.streamTitle = title;
     RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Stream title updated to: %@", title);
+}
+
+- (void)updateQualitySettings:(RptrVideoQualitySettings *)settings {
+    if (!settings) {
+        RLogError(@"Cannot update quality settings: nil settings provided");
+        return;
+    }
+    
+    // Stop current streaming if active
+    BOOL wasStreaming = self.isStreaming;
+    if (wasStreaming) {
+        [self stopStreaming];
+    }
+    
+    // Update quality settings
+    self.qualitySettings = settings;
+    
+    RLogInfo(@"Updated video quality settings to %@ mode", settings.modeName);
+    RLogDebug(@"New settings - Video: %ldx%ld @ %ld fps, %ld kbps", 
+              (long)settings.videoWidth, (long)settings.videoHeight,
+              (long)settings.videoFrameRate, (long)(settings.videoBitrate / 1000));
+    RLogDebug(@"New settings - Audio: %ld kbps, %ld Hz, %ld channels",
+              (long)(settings.audioBitrate / 1000), (long)settings.audioSampleRate,
+              (long)settings.audioChannels);
+    RLogDebug(@"New settings - Segments: %.1f seconds, max %ld segments",
+              settings.segmentDuration, (long)settings.maxSegments);
+    
+    // Clear any existing segments
+    dispatch_barrier_async(self.segmentsQueue, ^{
+        [self.segments removeAllObjects];
+    });
+    
+    dispatch_barrier_async(self.segmentDataQueue, ^{
+        [self.segmentData removeAllObjects];
+    });
+    
+    // Notify delegate if streaming was interrupted
+    if (wasStreaming && self.delegate && [self.delegate respondsToSelector:@selector(hlsServer:didEncounterError:)]) {
+        NSError *error = [NSError errorWithDomain:kRptrErrorDomainHLSServer
+                                            code:100
+                                        userInfo:@{NSLocalizedDescriptionKey: @"Streaming stopped for quality change"}];
+        [self.delegate hlsServer:self didEncounterError:error];
+    }
 }
 
 @end

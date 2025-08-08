@@ -28,14 +28,22 @@
     if ([scene isKindOfClass:[UIWindowScene class]]) {
         UIWindowScene *windowScene = (UIWindowScene *)scene;
         self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
-        self.window.frame = windowScene.coordinateSpace.bounds;
         self.window.backgroundColor = [UIColor blackColor];
         
-        // Create view controller programmatically instead of from storyboard
+        // CRITICAL: Disable window-level orientation adjustments
+        if (@available(iOS 16.0, *)) {
+            // Lock the window to landscape right orientation
+            UIWindowSceneGeometryPreferencesIOS *geometryPreferences = [[UIWindowSceneGeometryPreferencesIOS alloc] init];
+            geometryPreferences.interfaceOrientations = UIInterfaceOrientationMaskLandscapeRight;
+            [windowScene requestGeometryUpdateWithPreferences:geometryPreferences errorHandler:^(NSError * _Nonnull error) {
+                if (error) {
+                    RLogError(@"Failed to lock window orientation: %@", error.localizedDescription);
+                }
+            }];
+        }
+        
+        // Create view controller normally
         ViewController *rootViewController = [[ViewController alloc] init];
-        rootViewController.view.frame = self.window.bounds;
-        rootViewController.view.backgroundColor = [UIColor blackColor];
-        rootViewController.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         self.window.rootViewController = rootViewController;
         
         // Log window hierarchy
@@ -53,18 +61,37 @@
         // Remove any constraints that might be affecting the window
         self.window.translatesAutoresizingMaskIntoConstraints = YES;
         rootViewController.view.translatesAutoresizingMaskIntoConstraints = YES;
+        
+        // Force landscape right immediately on window creation
+        if (@available(iOS 16.0, *)) {
+            UIWindowSceneGeometryPreferencesIOS *geometryPreferences = [[UIWindowSceneGeometryPreferencesIOS alloc] init];
+            geometryPreferences.interfaceOrientations = UIInterfaceOrientationMaskLandscapeRight;
+            [windowScene requestGeometryUpdateWithPreferences:geometryPreferences errorHandler:^(NSError * _Nonnull error) {
+                if (error) {
+                    RLogError(@"Failed to set initial landscape orientation: %@", error.localizedDescription);
+                }
+            }];
+        }
     }
     
-    // Force landscape orientation as early as possible to prevent portrait flash
+    // Check if we need to force landscape orientation
     if (@available(iOS 16.0, *)) {
         if ([scene isKindOfClass:[UIWindowScene class]]) {
             UIWindowScene *windowScene = (UIWindowScene *)scene;
-            UIWindowSceneGeometryPreferencesIOS *geometryPreferences = [[UIWindowSceneGeometryPreferencesIOS alloc] init];
-            geometryPreferences.interfaceOrientations = UIInterfaceOrientationMaskLandscape;
             
-            [windowScene requestGeometryUpdateWithPreferences:geometryPreferences errorHandler:^(NSError * _Nonnull error) {
-                RLog(RptrLogAreaUI | RptrLogAreaError, @"SceneDelegate: Failed to set initial landscape orientation: %@", error.localizedDescription);
-            }];
+            // Only force orientation if not already in landscape
+            if (windowScene.interfaceOrientation != UIInterfaceOrientationLandscapeLeft &&
+                windowScene.interfaceOrientation != UIInterfaceOrientationLandscapeRight) {
+                
+                UIWindowSceneGeometryPreferencesIOS *geometryPreferences = [[UIWindowSceneGeometryPreferencesIOS alloc] init];
+                geometryPreferences.interfaceOrientations = UIInterfaceOrientationMaskLandscapeRight;  // Lock to single orientation
+                
+                [windowScene requestGeometryUpdateWithPreferences:geometryPreferences errorHandler:^(NSError * _Nonnull error) {
+                    RLogError(@"SceneDelegate: Failed to set landscape orientation: %@", error.localizedDescription);
+                }];
+            } else {
+                RLogDebug(@"SceneDelegate: Already in landscape orientation (%ld)", (long)windowScene.interfaceOrientation);
+            }
         }
     }
     

@@ -22,6 +22,29 @@
     
     // Keyboard preloading moved to ViewController to avoid startup flash
     
+    // CRITICAL: Force landscape orientation at app launch
+    // This ensures the app starts in landscape mode regardless of device orientation
+    if (@available(iOS 16.0, *)) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            NSArray *connectedScenes = [[[UIApplication sharedApplication] connectedScenes] allObjects];
+            for (UIScene *scene in connectedScenes) {
+                if ([scene isKindOfClass:[UIWindowScene class]]) {
+                    UIWindowScene *windowScene = (UIWindowScene *)scene;
+                    UIWindowSceneGeometryPreferencesIOS *geometryPreferences = [[UIWindowSceneGeometryPreferencesIOS alloc] init];
+                    geometryPreferences.interfaceOrientations = UIInterfaceOrientationMaskLandscapeRight;
+                    [windowScene requestGeometryUpdateWithPreferences:geometryPreferences errorHandler:^(NSError * _Nonnull error) {
+                        if (error) {
+                            RLogError(@"Failed to set initial orientation: %@", error.localizedDescription);
+                        }
+                    }];
+                }
+            }
+        });
+    } else {
+        // For iOS < 16, try to force orientation
+        [[UIDevice currentDevice] setValue:@(UIInterfaceOrientationLandscapeRight) forKey:@"orientation"];
+    }
+    
     return YES;
 }
 
@@ -43,8 +66,8 @@
 }
 
 - (UIInterfaceOrientationMask)application:(UIApplication *)application supportedInterfaceOrientationsForWindow:(UIWindow *)window {
-    // Support both landscape orientations to match Info.plist
-    return UIInterfaceOrientationMaskLandscape;
+    // Lock to landscape right only - no rotation between landscape orientations
+    return UIInterfaceOrientationMaskLandscapeRight;
 }
 
 

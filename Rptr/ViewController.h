@@ -9,6 +9,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreLocation/CoreLocation.h>
 #import "HLSAssetWriterServer.h"
+#import "RptrVideoQualitySettings.h"
 
 @interface ViewController : UIViewController <AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, CLLocationManagerDelegate, HLSAssetWriterServerDelegate>
 
@@ -54,6 +55,10 @@
 @property (nonatomic, strong) UIButton *streamButton;
 @property (nonatomic, strong) UILabel *streamStatusLabel;
 @property (nonatomic, assign) BOOL isStreaming;
+
+// Quality Settings
+@property (nonatomic, strong) UIButton *qualityButton;
+@property (nonatomic, assign) RptrVideoQualityMode currentQualityMode;
 
 
 // Streaming indicators
