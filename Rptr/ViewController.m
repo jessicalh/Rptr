@@ -140,8 +140,6 @@
             });
         });
         
-        // Load saved interval or default to 15 seconds
-        // Interval functionality removed
         
         // Move notification observers to background to avoid blocking startup
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -269,13 +267,6 @@
     if (self.streamButton) {
         CGFloat streamButtonSize = 44;
         self.streamButton.frame = CGRectMake(20, self.view.frame.size.height - streamButtonSize - 50, streamButtonSize, streamButtonSize);
-    }
-    
-    // Update info labels position
-    if (self.locationLabel) {
-        self.locationLabel.frame = CGRectMake(self.view.frame.size.width - 210, 65, 200, 22);
-        self.utcTimeLabel.frame = CGRectMake(self.view.frame.size.width - 210, 90, 200, 22);
-        self.streamInfoLabel.frame = CGRectMake(self.view.frame.size.width - 210, 115, 200, 22);
     }
     
     // Update endpoint labels and copy buttons
@@ -462,7 +453,7 @@
     AVCaptureSession *session = [[AVCaptureSession alloc] init];
     
     // Always use high preset for capture session
-    // The actual encoding resolution is handled by the asset writer
+    // The actual encoding resolution is handled by the HLS server
     session.sessionPreset = AVCaptureSessionPresetHigh;
     RLog(RptrLogAreaInfo, @"Using High preset for capture session");
     
@@ -574,18 +565,6 @@
         }
     }
     
-    // Add audio data output for streaming
-    AVCaptureAudioDataOutput *audioDataOutput = [[AVCaptureAudioDataOutput alloc] init];
-    NSString *audioQueueName = [NSString stringWithFormat:@"audioQueue_%@", safeCameraName];
-    dispatch_queue_t audioQueue = dispatch_queue_create([audioQueueName UTF8String], DISPATCH_QUEUE_SERIAL);
-    [audioDataOutput setSampleBufferDelegate:self queue:audioQueue];
-    
-    if ([session canAddOutput:audioDataOutput]) {
-        [session addOutput:audioDataOutput];
-        self.audioDataOutput = audioDataOutput;
-        RLog(RptrLogAreaProtocol, @"Audio data output added for streaming");
-    }
-    
     // Store in dictionaries
     self.captureSessions[camera.uniqueID] = session;
     // No movie file output storage needed
@@ -684,60 +663,6 @@
     self.streamingLED.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
     [self.view addSubview:self.streamingLED];
     
-    // Audio level meter container
-    self.audioLevelMeter = [[UIView alloc] initWithFrame:CGRectMake(40, 40, 100, 12)];
-    self.audioLevelMeter.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.3];
-    self.audioLevelMeter.layer.cornerRadius = 6;
-    self.audioLevelMeter.layer.borderWidth = 1;
-    self.audioLevelMeter.layer.borderColor = [[UIColor colorWithWhite:0.3 alpha:0.5] CGColor];
-    self.audioLevelMeter.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
-    self.audioLevelMeter.hidden = YES; // Hidden by default
-    [self.view addSubview:self.audioLevelMeter];
-    
-    // Create audio level bars
-    self.audioLevelBars = [NSMutableArray array];
-    for (int i = 0; i < 10; i++) {
-        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(2 + (i * 10), 2, 8, 8)];
-        bar.backgroundColor = [UIColor greenColor];
-        bar.layer.cornerRadius = 1;
-        bar.alpha = 0.3; // Dim by default
-        [self.audioLevelMeter addSubview:bar];
-        [self.audioLevelBars addObject:bar];
-    }
-    
-    // Location label
-    self.locationLabel = [[UILabel alloc] initWithFrame:CGRectMake(self.view.frame.size.width - 210, 65, 200, 22)];
-    self.locationLabel.textColor = [UIColor whiteColor];
-    self.locationLabel.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
-    self.locationLabel.textAlignment = NSTextAlignmentRight;
-    self.locationLabel.text = @"Location: --";
-    self.locationLabel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-    self.locationLabel.layer.shouldRasterize = YES;
-    self.locationLabel.layer.rasterizationScale = [UIScreen mainScreen].scale;
-    [self.view addSubview:self.locationLabel];
-    
-    // UTC Time label
-    self.utcTimeLabel = [[UILabel alloc] initWithFrame:CGRectMake(self.view.frame.size.width - 210, 90, 200, 22)];
-    self.utcTimeLabel.textColor = [UIColor whiteColor];
-    self.utcTimeLabel.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
-    self.utcTimeLabel.textAlignment = NSTextAlignmentRight;
-    [self updateUTCTime];
-    self.utcTimeLabel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-    self.utcTimeLabel.layer.shouldRasterize = YES;
-    self.utcTimeLabel.layer.rasterizationScale = [UIScreen mainScreen].scale;
-    [self.view addSubview:self.utcTimeLabel];
-    
-    // Stream info label
-    self.streamInfoLabel = [[UILabel alloc] initWithFrame:CGRectMake(self.view.frame.size.width - 210, 115, 200, 22)];
-    self.streamInfoLabel.textColor = [UIColor whiteColor];
-    self.streamInfoLabel.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
-    self.streamInfoLabel.textAlignment = NSTextAlignmentRight;
-    self.streamInfoLabel.text = @"";
-    self.streamInfoLabel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-    self.streamInfoLabel.layer.shouldRasterize = YES;
-    self.streamInfoLabel.layer.rasterizationScale = [UIScreen mainScreen].scale;
-    self.streamInfoLabel.hidden = YES;
-    [self.view addSubview:self.streamInfoLabel];
     
     // Feedback display label (lower right corner)
     CGFloat feedbackWidth = 300;
@@ -768,7 +693,6 @@
     self.isDisplayingFeedback = NO;
     
     // Start UTC timer
-    self.utcTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(updateUTCTime) userInfo:nil repeats:YES];
     
     // Setup location manager
     self.locationManager = [[CLLocationManager alloc] init];
@@ -791,11 +715,7 @@
                                                             userInfo:nil 
                                                              repeats:YES];
     
-    // Camera button removed - stream button will take its place
-    
-    // Interval button removed
-    
-    // MPEG-4 Stream button - positioned where camera button was
+    // Stream button
     CGFloat streamButtonSize = 44;
     self.streamButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 50, streamButtonSize, streamButtonSize)];
     self.streamButton.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.8];
@@ -805,44 +725,6 @@
     [self.streamButton addTarget:self action:@selector(streamButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.streamButton];
     
-    // Share button - positioned above regenerate button
-    self.shareButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 200, streamButtonSize, streamButtonSize)];
-    self.shareButton.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.8];
-    self.shareButton.layer.cornerRadius = streamButtonSize / 2;
-    [self.shareButton setImage:[UIImage systemImageNamed:@"square.and.arrow.up"] forState:UIControlStateNormal];
-    self.shareButton.tintColor = [UIColor whiteColor];
-    [self.shareButton addTarget:self action:@selector(shareButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.shareButton];
-    
-    // Regenerate URL button - positioned above title button
-    UIButton *regenerateButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 150, streamButtonSize, streamButtonSize)];
-    regenerateButton.backgroundColor = [[UIColor systemOrangeColor] colorWithAlphaComponent:0.8];
-    regenerateButton.layer.cornerRadius = streamButtonSize / 2;
-    [regenerateButton setImage:[UIImage systemImageNamed:@"arrow.triangle.2.circlepath"] forState:UIControlStateNormal];
-    regenerateButton.tintColor = [UIColor whiteColor];
-    [regenerateButton addTarget:self action:@selector(regenerateButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:regenerateButton];
-    
-    // Title button - positioned above stream button
-    self.titleButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 100, streamButtonSize, streamButtonSize)];
-    self.titleButton.backgroundColor = [[UIColor systemGrayColor] colorWithAlphaComponent:0.8];
-    self.titleButton.layer.cornerRadius = streamButtonSize / 2;
-    [self.titleButton setTitle:@"T" forState:UIControlStateNormal];
-    self.titleButton.titleLabel.font = [UIFont boldSystemFontOfSize:20];
-    self.titleButton.tintColor = [UIColor whiteColor];
-    [self.titleButton addTarget:self action:@selector(titleButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.titleButton];
-    
-    // Quality toggle button - positioned above share button
-    self.qualityButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 250, streamButtonSize, streamButtonSize)];
-    self.qualityButton.backgroundColor = [[UIColor systemPurpleColor] colorWithAlphaComponent:0.8];
-    self.qualityButton.layer.cornerRadius = streamButtonSize / 2;
-    [self.qualityButton setImage:[UIImage systemImageNamed:@"speedometer"] forState:UIControlStateNormal];
-    self.qualityButton.tintColor = [UIColor whiteColor];
-    [self.qualityButton addTarget:self action:@selector(qualityButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.qualityButton];
-    
-    // Quality mode already initialized in viewDidLoad
 }
 
 
@@ -933,9 +815,6 @@
     for (AVCaptureVideoDataOutput *output in self.videoDataOutputs.allValues) {
         [output setSampleBufferDelegate:nil queue:nil];
     }
-    if (self.audioDataOutput) {
-        [self.audioDataOutput setSampleBufferDelegate:nil queue:nil];
-    }
     
     // Remove all observers
     [[NSNotificationCenter defaultCenter] removeObserver:self];
@@ -959,8 +838,6 @@
     }
     
     // Invalidate timers
-    [self.utcTimer invalidate];
-    [self.burstTimer invalidate];
     [self.cameraEvaluationTimer invalidate];
     [self.locationUpdateTimer invalidate];
     
@@ -973,9 +850,6 @@
 
 #pragma mark - Camera Selection
 
-// Camera switching functionality has been removed
-
-// Clock icon has been removed
 
 - (UIImage *)broadcastIcon {
     CGSize size = CGSizeMake(30, 30);
@@ -1141,57 +1015,6 @@
     }
 }
 
-- (void)shareButtonTapped:(UIButton *)sender {
-    // Construct the full stream URL
-    NSArray<NSString *> *urls = [self.hlsServer getServerURLs];
-    if (urls.count == 0) {
-        return;
-    }
-    
-    NSString *urlString = urls.firstObject;
-    NSURL *url = [NSURL URLWithString:urlString];
-    NSString *baseURL = [NSString stringWithFormat:@"%@://%@:%@", 
-                        url.scheme ?: @"http",
-                        url.host ?: @"localhost",
-                        url.port ?: @(self.hlsServer.port)];
-    
-    NSString *fullStreamURL = [NSString stringWithFormat:@"%@/view/%@", baseURL, self.hlsServer.randomPath];
-    
-    // Create activity items
-    NSMutableArray *activityItems = [NSMutableArray array];
-    
-    // Add the URL
-    [activityItems addObject:fullStreamURL];
-    
-    // Add a message with the title if available
-    if (self.hlsServer.streamTitle && self.hlsServer.streamTitle.length > 0) {
-        NSString *shareMessage = [NSString stringWithFormat:@"Watch \"%@\" live: %@", self.hlsServer.streamTitle, fullStreamURL];
-        [activityItems addObject:shareMessage];
-    }
-    
-    // Create the activity view controller
-    UIActivityViewController *activityVC = [[UIActivityViewController alloc] initWithActivityItems:activityItems
-                                                                             applicationActivities:nil];
-    
-    // Configure excluded activities (optional)
-    activityVC.excludedActivityTypes = @[
-        UIActivityTypeAddToReadingList,
-        UIActivityTypeAssignToContact,
-        UIActivityTypePrint,
-        UIActivityTypeSaveToCameraRoll
-    ];
-    
-    // For iPad, we need to set the popover presentation controller
-    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
-        activityVC.popoverPresentationController.sourceView = sender;
-        activityVC.popoverPresentationController.sourceRect = sender.bounds;
-    }
-    
-    // Present the share sheet
-    [self presentViewController:activityVC animated:YES completion:^{
-        RLog(RptrLogAreaInfo, @"Share sheet presented with URL: %@", fullStreamURL);
-    }];
-}
 
 - (void)preloadUIComponents {
     // Only preload if we haven't already
@@ -1247,111 +1070,7 @@
     });
 }
 
-- (void)titleButtonTapped:(UIButton *)sender {
-    // Disable the button immediately to prevent multiple taps
-    sender.enabled = NO;
-    
-    // Check if we're already presenting something
-    if (self.presentedViewController) {
-        RLogWarning(@"Already presenting a view controller, ignoring title button tap");
-        sender.enabled = YES;
-        return;
-    }
-    
-    // Get current title directly - atomic property access is fast
-    NSString *currentTitle = [self.hlsServer getStreamTitle];
-    
-    // Create the alert controller on main thread
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Set Stream Title"
-                                                                   message:@"Enter a title for your stream"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    
-    // Configure the text field
-    __weak typeof(self) weakSelf = self;
-    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = @"Stream Title";
-        textField.text = currentTitle ?: @"";
-        textField.autocorrectionType = UITextAutocorrectionTypeNo;
-        textField.autocapitalizationType = UITextAutocapitalizationTypeSentences;
-        textField.enablesReturnKeyAutomatically = YES;
-        textField.returnKeyType = UIReturnKeyDone;
-    }];
-    
-    // Create the set action
-    UIAlertAction *setAction = [UIAlertAction actionWithTitle:@"Set" 
-                                                        style:UIAlertActionStyleDefault 
-                                                      handler:^(UIAlertAction *action) {
-        NSString *newTitle = alert.textFields.firstObject.text;
-        if (newTitle.length > 0 && weakSelf) {
-            // Update the title using thread-safe method
-            [weakSelf.hlsServer setStreamTitleAsync:newTitle];
-            RLog(RptrLogAreaInfo, @"Stream title updated to: %@", newTitle);
-            
-        }
-    }];
-    
-    // Create the cancel action
-    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"Cancel" 
-                                                            style:UIAlertActionStyleCancel 
-                                                          handler:nil];
-    
-    // Add actions
-    [alert addAction:cancelAction];
-    [alert addAction:setAction];
-    
-    // Present the alert
-    [self presentViewController:alert animated:YES completion:^{
-        // Re-enable the button after presentation
-        sender.enabled = YES;
-    }];
-}
 
-- (void)regenerateButtonTapped:(UIButton *)sender {
-    // Create confirmation alert
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Regenerate Stream URL?"
-                                                                   message:@"This will create a new stream URL and disconnect all current viewers. You will need to share the new URL with anyone watching."
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    
-    // Create the regenerate action
-    UIAlertAction *regenerateAction = [UIAlertAction actionWithTitle:@"Regenerate" 
-                                                               style:UIAlertActionStyleDestructive 
-                                                             handler:^(UIAlertAction *action) {
-        // Force stop streaming if active
-        if (self.isStreaming) {
-            RLog(RptrLogAreaInfo, @"Stopping streaming before URL regeneration");
-            [self stopStreaming];
-        }
-        
-        // Regenerate the random path
-        [self.hlsServer regenerateRandomPath];
-        
-        
-        // Update the displayed URLs
-        [self updateStreamingURLs];
-        
-        RLog(RptrLogAreaInfo, @"Stream URL regenerated");
-        
-        // Show a brief confirmation
-        UIAlertController *confirmAlert = [UIAlertController alertControllerWithTitle:@"URL Regenerated"
-                                                                            message:@"New stream URL created. All viewers have been disconnected. Streaming has been stopped."
-                                                                     preferredStyle:UIAlertControllerStyleAlert];
-        UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil];
-        [confirmAlert addAction:okAction];
-        [self presentViewController:confirmAlert animated:YES completion:nil];
-    }];
-    
-    // Create the cancel action
-    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"Cancel" 
-                                                            style:UIAlertActionStyleCancel 
-                                                          handler:nil];
-    
-    // Add actions
-    [alert addAction:cancelAction];
-    [alert addAction:regenerateAction];
-    
-    // Present the alert
-    [self presentViewController:alert animated:YES completion:nil];
-}
 
 - (void)startStreaming {
     RLog(RptrLogAreaProtocol, @"startStreaming called");
@@ -1371,16 +1090,6 @@
         // Prepare the asset writer for streaming (needed after URL regeneration)
         [self.hlsServer prepareForStreaming];
     }
-    
-    // Disable title button during streaming
-    self.titleButton.enabled = NO;
-    self.titleButton.backgroundColor = [[UIColor systemGrayColor] colorWithAlphaComponent:0.4];
-    self.titleButton.alpha = 0.6;
-    
-    // Disable share button during streaming (for privacy)
-    self.shareButton.enabled = NO;
-    self.shareButton.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.4];
-    self.shareButton.alpha = 0.6;
     
     // Start streaming based on server type
     if (self.useDIYServer) {
@@ -1405,9 +1114,6 @@
     
     // Update LED to green
     self.streamingLED.backgroundColor = [UIColor colorWithRed:0.0 green:1.0 blue:0.0 alpha:1.0];
-    
-    // Show audio meter
-    self.audioLevelMeter.hidden = NO;
     
     // Debug: Verify video data output is ready
     RLog(RptrLogAreaProtocol, @"============ STREAMING STARTED ============");
@@ -1468,23 +1174,9 @@
     // Update UI
     self.streamButton.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.8];
     [self.streamButton.layer removeAnimationForKey:@"pulse"];
-    self.streamInfoLabel.hidden = YES;
-    
-    // Re-enable title button
-    self.titleButton.enabled = YES;
-    self.titleButton.backgroundColor = [[UIColor systemGrayColor] colorWithAlphaComponent:0.8];
-    self.titleButton.alpha = 1.0;
-    
-    // Re-enable share button
-    self.shareButton.enabled = YES;
-    self.shareButton.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.8];
-    self.shareButton.alpha = 1.0;
     
     // Update LED to gray
     self.streamingLED.backgroundColor = [UIColor colorWithRed:0.5 green:0.5 blue:0.5 alpha:1.0];
-    
-    // Hide audio meter
-    self.audioLevelMeter.hidden = YES;
     
     // Clear feedback display and queue
     [self clearFeedbackDisplay];
@@ -1538,9 +1230,7 @@
     [self.endpointCopyButtons removeAllObjects];
     RLog(RptrLogAreaProtocol, @"Old labels removed");
     
-    // Create endpoint label for /view with random path
-    NSString *viewPath = [NSString stringWithFormat:@"/view/%@", self.hlsServer.randomPath];
-    NSArray *endpoints = @[viewPath];
+    // Simplified URL display - just show http://ip:port
     CGFloat yOffset = 40;
     
     RLog(RptrLogAreaProtocol, @"Creating labels for %lu URLs", (unsigned long)urls.count);
@@ -1553,61 +1243,57 @@
                             url.host ?: @"localhost",
                             url.port ?: @(self.hlsServer.port)];
         
-        // Create labels for each endpoint
-        for (NSString *endpoint in endpoints) {
-            NSString *fullURL = [baseURL stringByAppendingString:endpoint];
-            
-            // Calculate the actual text size
-            UIFont *urlFont = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
-            NSDictionary *attributes = @{NSFontAttributeName: urlFont};
-            CGSize textSize = [fullURL sizeWithAttributes:attributes];
-            
-            // Add some padding to the width
-            CGFloat labelWidth = textSize.width + 10;
-            CGFloat labelX = self.view.frame.size.width - labelWidth - 30; // 30 for copy button
-            
-            // Create label with calculated width
-            UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(labelX, yOffset, labelWidth, 22)];
-            label.text = fullURL;
-            label.textColor = [UIColor whiteColor];
-            label.font = urlFont;
-            label.textAlignment = NSTextAlignmentRight;
-            label.adjustsFontSizeToFitWidth = NO;  // Don't shrink font
-            label.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-            [self.view addSubview:label];
-            [self.endpointLabels addObject:label];
-            
-            // Create copy button
-            UIButton *copyButton = [UIButton buttonWithType:UIButtonTypeCustom];
-            copyButton.frame = CGRectMake(self.view.frame.size.width - 25, yOffset, 20, 22);
-            
-            // Use system image instead of custom drawing to avoid ANR
-            if (@available(iOS 13.0, *)) {
-                UIImage *copyImage = [UIImage systemImageNamed:@"doc.on.doc"];
-                UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightRegular];
-                copyImage = [copyImage imageByApplyingSymbolConfiguration:config];
-                [copyButton setImage:copyImage forState:UIControlStateNormal];
-            } else {
-                // Fallback for older iOS versions
-                [copyButton setImage:[self copyIcon] forState:UIControlStateNormal];
-            }
-            copyButton.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.2];
-            copyButton.layer.cornerRadius = 4;
-            copyButton.tag = self.endpointLabels.count - 1;
-            [copyButton addTarget:self action:@selector(copyButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-            copyButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-            [self.view addSubview:copyButton];
-            [self.endpointCopyButtons addObject:copyButton];
-            
-            yOffset += 22;
+        // Just show the base URL
+        NSString *fullURL = baseURL;
+        
+        // Calculate the actual text size
+        UIFont *urlFont = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
+        NSDictionary *attributes = @{NSFontAttributeName: urlFont};
+        CGSize textSize = [fullURL sizeWithAttributes:attributes];
+        
+        // Add some padding to the width
+        CGFloat labelWidth = textSize.width + 10;
+        CGFloat labelX = self.view.frame.size.width - labelWidth - 30; // 30 for copy button
+        
+        // Create label with calculated width
+        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(labelX, yOffset, labelWidth, 22)];
+        label.text = fullURL;
+        label.textColor = [UIColor whiteColor];
+        label.font = urlFont;
+        label.textAlignment = NSTextAlignmentRight;
+        label.adjustsFontSizeToFitWidth = NO;  // Don't shrink font
+        label.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+        [self.view addSubview:label];
+        [self.endpointLabels addObject:label];
+        
+        // Create copy button
+        UIButton *copyButton = [UIButton buttonWithType:UIButtonTypeCustom];
+        copyButton.frame = CGRectMake(self.view.frame.size.width - 25, yOffset, 20, 22);
+        
+        // Use system image instead of custom drawing to avoid ANR
+        if (@available(iOS 13.0, *)) {
+            UIImage *copyImage = [UIImage systemImageNamed:@"doc.on.doc"];
+            UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightRegular];
+            copyImage = [copyImage imageByApplyingSymbolConfiguration:config];
+            [copyButton setImage:copyImage forState:UIControlStateNormal];
+        } else {
+            // Fallback for older iOS versions
+            [copyButton setImage:[self copyIcon] forState:UIControlStateNormal];
         }
+        copyButton.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.2];
+        copyButton.layer.cornerRadius = 4;
+        copyButton.tag = self.endpointLabels.count - 1;
+        [copyButton addTarget:self action:@selector(copyButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+        copyButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+        [self.view addSubview:copyButton];
+        [self.endpointCopyButtons addObject:copyButton];
+        
+        yOffset += 22;
         
         // Only show first URL's endpoints
         break;
     }
     
-    [self updateStreamInfoLabel];
-    self.streamInfoLabel.hidden = NO;
     
     // Log the URLs but don't show alert - it might be blocking
     RLog(RptrLogAreaProtocol, @"Stream started - URLs:");
@@ -1638,7 +1324,6 @@
 
 - (void)hlsServerDidStop {
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.streamInfoLabel.hidden = YES;
         
         // Remove endpoint labels and buttons
         for (UILabel *label in self.endpointLabels) {
@@ -1655,7 +1340,6 @@
 - (void)hlsServer:(id)server clientConnected:(NSString *)clientAddress {
     dispatch_async(dispatch_get_main_queue(), ^{
         RLog(RptrLogAreaProtocol, @"Client connected: %@", clientAddress);
-        [self updateStreamInfoLabel];
         
     });
 }
@@ -1663,7 +1347,6 @@
 - (void)hlsServer:(id)server clientDisconnected:(NSString *)clientAddress {
     dispatch_async(dispatch_get_main_queue(), ^{
         RLog(RptrLogAreaProtocol, @"Client disconnected: %@", clientAddress);
-        [self updateStreamInfoLabel];
         
     });
 }
@@ -1681,106 +1364,7 @@
     });
 }
 
-- (void)qualityButtonTapped:(UIButton *)sender {
-    // Don't allow quality changes while streaming
-    if (self.isStreaming) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Cannot Change Quality"
-                                                                       message:@"Stop streaming to change quality settings"
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:alert animated:YES completion:nil];
-        return;
-    }
-    
-    // Toggle quality mode
-    RptrVideoQualityMode newMode = (self.currentQualityMode == RptrVideoQualityModeReliable) ? 
-                                   RptrVideoQualityModeRealtime : RptrVideoQualityModeReliable;
-    
-    // Create new settings
-    RptrVideoQualitySettings *newSettings = [RptrVideoQualitySettings settingsForMode:newMode];
-    
-    // Show confirmation
-    NSString *title = [NSString stringWithFormat:@"Switch to %@ Mode?", newSettings.modeName];
-    NSString *message = newSettings.modeDescription;
-    
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
-                                                                   message:message
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Switch" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        [self switchToQualityMode:newMode];
-    }]];
-    
-    [self presentViewController:alert animated:YES completion:nil];
-}
 
-- (void)switchToQualityMode:(RptrVideoQualityMode)mode {
-    self.currentQualityMode = mode;
-    
-    // Update button appearance
-    UIColor *buttonColor = (mode == RptrVideoQualityModeReliable) ? 
-                          [UIColor systemPurpleColor] : [UIColor systemRedColor];
-    self.qualityButton.backgroundColor = [buttonColor colorWithAlphaComponent:0.8];
-    
-    // Update HLS server settings
-    RptrVideoQualitySettings *settings = [RptrVideoQualitySettings settingsForMode:mode];
-    [self.hlsServer updateQualitySettings:settings];
-    
-    // Update capture session preset
-    if (self.captureSession) {
-        [self.captureSession beginConfiguration];
-        self.captureSession.sessionPreset = settings.sessionPreset;
-        [self.captureSession commitConfiguration];
-    }
-    
-    // Update camera frame rate for all cameras
-    for (NSString *cameraID in self.captureSessions) {
-        AVCaptureDevice *camera = [AVCaptureDevice deviceWithUniqueID:cameraID];
-        if (camera) {
-            NSError *error = nil;
-            if ([camera lockForConfiguration:&error]) {
-                CMTime frameDuration = CMTimeMake(1, (int32_t)settings.videoFrameRate);
-                camera.activeVideoMinFrameDuration = frameDuration;
-                camera.activeVideoMaxFrameDuration = frameDuration;
-                [camera unlockForConfiguration];
-                RLogVideo(@"Updated frame rate to %ld fps for %@", (long)settings.videoFrameRate, camera.localizedName);
-            } else {
-                RLogError(@"Could not update frame rate for %@: %@", camera.localizedName, error.localizedDescription);
-            }
-        }
-    }
-    
-    // Update stream info label
-    [self updateStreamInfoLabel];
-    
-    RLogUI(@"Switched to %@ quality mode", settings.modeName);
-}
-
-- (void)updateStreamInfoLabel {
-    if (!self.isStreaming) {
-        self.streamInfoLabel.text = @"";
-        return;
-    }
-    
-    NSString *qualityMode = (self.currentQualityMode == RptrVideoQualityModeReliable) ? @"Reliable" : @"Real-time";
-    
-    if (self.useDIYServer) {
-        // DIY server info
-        self.streamInfoLabel.text = [NSString stringWithFormat:@"DIY HLS %@: Port 8080", qualityMode];
-    } else {
-        // Original server info
-        NSUInteger clientCount = self.hlsServer.connectedClients;
-        
-        if (clientCount > 0) {
-            self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS %@: %lu clients", 
-                                         qualityMode, (unsigned long)clientCount];
-        } else {
-            self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS %@: Port %lu", 
-                                         qualityMode, (unsigned long)self.hlsServer.port];
-        }
-    }
-}
 
 - (void)displayDIYStreamingURLs {
     // Get network interfaces
@@ -1789,15 +1373,15 @@
     // Get primary IP address
     NSString *ipAddress = [self getIPAddress];
     if (ipAddress && ![ipAddress isEqualToString:@"error"]) {
-        // Show the secure view URL with random path, like the original server
-        NSString *url = [NSString stringWithFormat:@"http://%@:8080/view/%@", ipAddress, self.diyHLSServer.randomPath];
+        // Show simplified URL - just IP and port
+        NSString *url = [NSString stringWithFormat:@"http://%@:8080", ipAddress];
         [urls addObject:url];
-        RLogDIY(@"Streaming URL: %@", url);
+        RLogDIY(@"Streaming URL: http://%@:8080/view/%@", ipAddress, self.diyHLSServer.randomPath);
     } else {
         // Fallback to localhost
-        NSString *url = [NSString stringWithFormat:@"http://localhost:8080/view/%@", self.diyHLSServer.randomPath];
+        NSString *url = @"http://localhost:8080";
         [urls addObject:url];
-        RLogDIY(@"Using localhost URL (no network IP found): %@", url);
+        RLogDIY(@"Using localhost URL (no network IP found): http://localhost:8080/view/%@", self.diyHLSServer.randomPath);
     }
     
     // Clear existing endpoint labels
@@ -1855,8 +1439,6 @@
         break;
     }
     
-    [self updateStreamInfoLabel];
-    self.streamInfoLabel.hidden = NO;
     
     // Log the URLs
     RLogDIY(@"DIY HLS Stream URLs:");
@@ -1984,10 +1566,6 @@
     // Get overlay text
     // Get clean location text without label prefix
     NSString *locationText = @"Loc: --";
-    if (self.locationLabel.text && ![self.locationLabel.text isEqualToString:@"Location: --"]) {
-        // Extract just the coordinates
-        locationText = [NSString stringWithFormat:@"Loc: %@", self.locationLabel.text];
-    }
     
     NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
     formatter.dateFormat = @"dd-MM-yy HH:mm:ss";
@@ -2260,12 +1838,6 @@
     return address;
 }
 
-- (void)updateUTCTime {
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    formatter.dateFormat = @"dd-MM-yy HH:mm:ss";
-    formatter.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
-    self.utcTimeLabel.text = [NSString stringWithFormat:@"%@ UTC", [formatter stringFromDate:[NSDate date]]];
-}
 
 - (void)requestLocationUpdate {
     // Request a single location update
@@ -2293,21 +1865,12 @@
     CLLocation *location = locations.lastObject;
     if (location) {
         self.currentLocation = location;
-        NSString *latLon = [NSString stringWithFormat:@"%.4f, %.4f", location.coordinate.latitude, location.coordinate.longitude];
-        self.locationLabel.text = latLon;
         
         // Stop updates if we're using the fallback method (older iOS versions)
         if (![self.locationManager respondsToSelector:@selector(requestLocation)]) {
             [self.locationManager stopUpdatingLocation];
         }
         
-        // Broadcast location update via WebSocket
-        // NSDictionary *locationData = @{
-        //     @"latitude": @(location.coordinate.latitude),
-        //     @"longitude": @(location.coordinate.longitude),
-        //     @"accuracy": @(location.horizontalAccuracy),
-        //     @"timestamp": @(location.timestamp.timeIntervalSince1970)
-        // };
     }
 }
 
@@ -2557,24 +2120,6 @@
                 }
             }
         }
-    }
-    
-    // Handle audio output for streaming
-    if (self.isStreaming && output == self.audioDataOutput) {
-        HLSAssetWriterServer *hlsServer = self.hlsServer; // Local strong reference
-        if (hlsServer && sampleBuffer && CMSampleBufferIsValid(sampleBuffer)) {
-            @try {
-                [hlsServer processAudioSampleBuffer:sampleBuffer];
-                
-                // Calculate audio level for meter
-                [self calculateAudioLevelFromSampleBuffer:sampleBuffer];
-            } @catch (NSException *exception) {
-                RLog(RptrLogAreaError, @"Exception processing audio frame: %@", exception);
-                // Don't stop streaming on single frame error
-            }
-        }
-        CFRelease(sampleBuffer);
-        return; // Audio doesn't need activity monitoring
     }
     
     
@@ -3105,66 +2650,6 @@
 }
 
 
-- (void)calculateAudioLevelFromSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    CMItemCount numSamples = CMSampleBufferGetNumSamples(sampleBuffer);
-    if (numSamples == 0) return;
-    
-    CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
-    if (!blockBuffer) return;
-    
-    size_t length;
-    char *dataPointer;
-    OSStatus status = CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &length, &dataPointer);
-    if (status != noErr) return;
-    
-    // Assuming 16-bit PCM audio
-    int16_t *samples = (int16_t *)dataPointer;
-    size_t sampleCount = length / sizeof(int16_t);
-    
-    float sum = 0.0;
-    for (size_t i = 0; i < sampleCount; i++) {
-        float sample = samples[i] / 32768.0f; // Normalize to -1.0 to 1.0
-        sum += sample * sample;
-    }
-    
-    float rms = sqrtf(sum / sampleCount);
-    float db = 20.0f * log10f(rms);
-    
-    // Convert to 0-1 range (assuming -40dB to 0dB range)
-    float normalizedLevel = (db + 40.0f) / 40.0f;
-    normalizedLevel = fmaxf(0.0f, fminf(1.0f, normalizedLevel));
-    
-    self.currentAudioLevel = normalizedLevel;
-    
-    // Update UI on main thread
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self updateAudioLevelMeter];
-    });
-}
-
-- (void)updateAudioLevelMeter {
-    if (!self.isStreaming || self.audioLevelMeter.hidden) return;
-    
-    NSInteger activeBars = (NSInteger)(self.currentAudioLevel * self.audioLevelBars.count);
-    
-    for (NSInteger i = 0; i < self.audioLevelBars.count; i++) {
-        UIView *bar = self.audioLevelBars[i];
-        if (i < activeBars) {
-            bar.alpha = 1.0;
-            // Color gradient from green to yellow to red
-            if (i < 6) {
-                bar.backgroundColor = [UIColor greenColor];
-            } else if (i < 8) {
-                bar.backgroundColor = [UIColor yellowColor];
-            } else {
-                bar.backgroundColor = [UIColor redColor];
-            }
-        } else {
-            bar.alpha = 0.3;
-            bar.backgroundColor = [UIColor greenColor];
-        }
-    }
-}
 
 
 - (void)displayNextFeedback {
@@ -3391,7 +2876,6 @@
 - (void)diyServer:(RptrDIYHLSServer *)server didStartOnPort:(NSInteger)port {
     RLogDIY(@"[DELEGATE] Server started on port %ld", (long)port);
     dispatch_async(dispatch_get_main_queue(), ^{
-        // self.hlsServerStatus = [NSString stringWithFormat:@"DIY Server on :%ld", (long)port];
         RLogDIY(@"[UI] Server status would update here");
     });
 }
@@ -3409,7 +2893,6 @@ didGenerateMediaSegment:(NSData *)segment
          sequenceNumber, duration, (unsigned long)segment.length);
     
     dispatch_async(dispatch_get_main_queue(), ^{
-        // self.segmentCount = sequenceNumber + 1;
         RLogDIY(@"[UI] Segment count: %u", sequenceNumber + 1);
     });
 }
@@ -3421,7 +2904,6 @@ didGenerateMediaSegment:(NSData *)segment
 - (void)diyServerDidStop:(RptrDIYHLSServer *)server {
     RLogDIY(@"[DELEGATE] Server stopped");
     dispatch_async(dispatch_get_main_queue(), ^{
-        // self.hlsServerStatus = @"DIY Server Stopped";
         RLogDIY(@"[UI] Server stopped status would update here");
     });
 }

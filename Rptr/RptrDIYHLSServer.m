@@ -67,6 +67,10 @@
 @property (nonatomic, assign) NSInteger frameRate;
 @property (nonatomic, assign) NSInteger bitrate;
 
+// Parameter sets
+@property (nonatomic, strong) NSData *sps;
+@property (nonatomic, strong) NSData *pps;
+
 @end
 
 @implementation RptrDIYHLSServer
@@ -142,7 +146,7 @@
 - (void)setupMuxer {
     self.muxer = [[RptrFMP4Muxer alloc] init];
     
-    // Configure video track
+    // Configure video track only
     RptrFMP4TrackConfig *videoTrack = [[RptrFMP4TrackConfig alloc] init];
     videoTrack.trackID = 1;
     videoTrack.mediaType = @"video";
@@ -152,7 +156,7 @@
     
     [self.muxer addTrack:videoTrack];
     
-    RLogDIY(@"[DIY-HLS] fMP4 muxer configured");
+    RLogDIY(@"[DIY-HLS] fMP4 muxer configured for video-only streaming");
 }
 
 #pragma mark - Server Control
@@ -299,6 +303,8 @@
             // Handle CORS preflight
             [self sendCORSResponse:clientSocket];
         }
+    } else if ([path isEqualToString:[NSString stringWithFormat:@"/stream/%@/master.m3u8", self.randomPath]]) {
+        [self sendMasterPlaylist:clientSocket];
     } else if ([path isEqualToString:[NSString stringWithFormat:@"/stream/%@/playlist.m3u8", self.randomPath]]) {
         [self sendPlaylist:clientSocket];
     } else if ([path isEqualToString:[NSString stringWithFormat:@"/stream/%@/init.mp4", self.randomPath]]) {
@@ -316,6 +322,38 @@
 
 #pragma mark - HTTP Responses
 
+- (void)sendMasterPlaylist:(int)clientSocket {
+    // Master playlist with explicit CODECS for Safari native HLS
+    // avc1.42001f = H.264 Baseline Profile Level 3.1 (for Safari compatibility)
+    NSMutableString *playlist = [NSMutableString string];
+    [playlist appendString:@"#EXTM3U\n"];
+    [playlist appendString:@"#EXT-X-VERSION:6\n"];
+    [playlist appendString:@"#EXT-X-INDEPENDENT-SEGMENTS\n"];
+    
+    // Explicitly declare the codec for Safari
+    // Use actual resolution from our encoder (960x540)
+    // Using Apple's codec format: avc1.640020 (Main Profile, Level 3.2)
+    // This matches Apple's bipbop sample for 960x540
+    // Video-only HLS stream
+    [playlist appendFormat:@"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=600000,BANDWIDTH=2000000,CODECS=\"avc1.640020\",RESOLUTION=960x540,FRAME-RATE=15.000\n"];
+    [playlist appendFormat:@"/stream/%@/playlist.m3u8\n", self.randomPath];
+    
+    NSData *playlistData = [playlist dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *response = [NSString stringWithFormat:
+        @"HTTP/1.1 200 OK\r\n"
+        @"Content-Type: application/vnd.apple.mpegurl\r\n"
+        @"Content-Length: %lu\r\n"
+        @"Cache-Control: no-cache\r\n"
+        @"Access-Control-Allow-Origin: *\r\n"
+        @"\r\n",
+        (unsigned long)playlistData.length];
+    
+    send(clientSocket, response.UTF8String, response.length, MSG_NOSIGNAL);
+    send(clientSocket, playlistData.bytes, playlistData.length, MSG_NOSIGNAL);
+    
+    RLogDIY(@"[DIY-HLS] Sent master playlist with CODECS=\"avc1.640020,mp4a.40.2\"");
+}
+
 - (void)sendPlaylist:(int)clientSocket {
     RLogDIY(@"[DIY-HLS] Sending playlist - segments count: %lu, has init: %@", 
             (unsigned long)self.segments.count, 
@@ -328,6 +366,9 @@
     [playlist appendString:@"#EXT-X-VERSION:6\n"];
     [playlist appendFormat:@"#EXT-X-TARGETDURATION:%d\n", (int)ceil(self.segmentDuration)];
     [playlist appendFormat:@"#EXT-X-MEDIA-SEQUENCE:%u\n", self.mediaSequenceNumber];
+    // Add explicit codec for Safari native HLS - Baseline Profile 3.1 (0x42001f)
+    // Safari requires explicit CODECS attribute for native HLS playback
+    [playlist appendString:@"#EXT-X-INDEPENDENT-SEGMENTS\n"];
     [playlist appendFormat:@"#EXT-X-MAP:URI=\"/stream/%@/init.mp4\"\n", self.randomPath];
     
     for (DIYSegmentInfo *segment in self.segments) {
@@ -906,7 +947,7 @@
     }
     
     if (![self.encoder startEncoding]) {
-        RLogError(@"[DIY-HLS] Failed to start encoder");
+        RLogError(@"[DIY-HLS] Failed to start video encoder");
         return NO;
     }
     
@@ -988,10 +1029,15 @@
                            duration:duration];
 }
 
+
 #pragma mark - VideoToolbox Encoder Delegate
 
 - (void)encoder:(RptrVideoToolboxEncoder *)encoder didEncodeParameterSets:(NSData *)sps pps:(NSData *)pps {
     dispatch_async(self.segmentQueue, ^{
+        // Save parameter sets
+        self.sps = sps;
+        self.pps = pps;
+        
         // Update muxer with parameter sets
         RptrFMP4TrackConfig *videoTrack = [[RptrFMP4TrackConfig alloc] init];
         videoTrack.trackID = 1;
@@ -1058,7 +1104,7 @@
 }
 
 - (void)encoder:(RptrVideoToolboxEncoder *)encoder didEncounterError:(NSError *)error {
-    RLogError(@"[DIY-HLS] Encoder error: %@", error);
+    RLogError(@"[DIY-HLS] Video encoder error: %@", error);
     
     if ([self.delegate respondsToSelector:@selector(diyServer:didEncounterError:)]) {
         [self.delegate diyServer:self didEncounterError:error];
@@ -1081,6 +1127,7 @@
     // Convert frames to samples for muxer
     NSMutableArray<RptrFMP4Sample *> *samples = [NSMutableArray array];
     
+    // Convert video frames to samples
     for (RptrEncodedFrame *frame in self.currentSegmentFrames) {
         RptrFMP4Sample *sample = [[RptrFMP4Sample alloc] init];
         sample.data = frame.data;
@@ -1088,7 +1135,7 @@
         sample.decodeTime = frame.decodeTime;
         sample.duration = frame.duration;
         sample.isSync = frame.isKeyframe;
-        sample.trackID = 1; // Set track ID for video track
+        sample.trackID = 1; // Video track ID
         
         [samples addObject:sample];
     }

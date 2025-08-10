@@ -1,18 +1,43 @@
 // Get elements
 var video = document.getElementById('video');
-var status = document.getElementById('status');
-var stats = document.getElementById('stats');
 var connectionStatus = document.getElementById('connectionStatus');
-var recordingInfo = document.getElementById('recordingInfo');
-var recordBtn = document.getElementById('recordBtn');
-var downloadBtn = document.getElementById('downloadBtn');
 
 // Get configuration from injected values
 var videoSrc = window.location.origin + window.APP_CONFIG.streamUrl;
 
+// Browser detection - check in specific order
+function detectBrowser() {
+  var ua = navigator.userAgent;
+  // Check Chrome first (includes "Safari" in UA)
+  if (ua.indexOf('Chrome') > -1) {
+    return 'Chrome';
+  }
+  // Check Firefox
+  else if (ua.indexOf('Firefox') > -1) {
+    return 'Firefox';
+  }
+  // Check Safari - must not contain Chrome or CriOS (Chrome on iOS)
+  else if (ua.indexOf('Safari') > -1 && ua.indexOf('Chrome') === -1 && ua.indexOf('CriOS') === -1) {
+    return 'Safari';
+  }
+  // Edge
+  else if (ua.indexOf('Edg') > -1) {
+    return 'Edge';
+  }
+  else {
+    return 'Unknown';
+  }
+}
+
+var browserName = detectBrowser();
+
+// Debug browser detection
+console.log('User Agent:', navigator.userAgent);
+console.log('Detected Browser:', browserName);
+
 // Logging via /forward-log endpoint (goes through centralized logging)
 function udpLog(level, component, message) {
-  var logMessage = 'JS|[' + level + '] [' + component + '] ' + message;
+  var logMessage = 'JS|[' + browserName + '] [' + level + '] [' + component + '] ' + message;
   
   // Send to iOS app's /forward-log endpoint which forwards through RptrLogger
   fetch(window.location.origin + '/forward-log', {
@@ -29,14 +54,12 @@ function udpLog(level, component, message) {
 }
 
 // Debug logging to track URL usage
+udpLog('INFO', 'INIT', 'Browser detected: ' + browserName + ', UA: ' + navigator.userAgent);
 udpLog('INFO', 'INIT', 'APP_CONFIG.streamUrl = ' + window.APP_CONFIG.streamUrl);
 udpLog('INFO', 'INIT', 'Computed videoSrc = ' + videoSrc);
 
 // State variables
 var hls = null;
-var mediaRecorder = null;
-var recordedChunks = [];
-var isRecording = false;
 var reconnectTimer = null;
 var statsInterval = null;
 var lastSegmentTime = 0;
@@ -45,7 +68,6 @@ var hasConnectedOnce = false;
 
 function setConnectionStatus(state) {
   connectionStatus.className = 'connection-indicator ' + state;
-  status.className = 'status ' + state;
 }
 
 function initHLS() {
@@ -53,13 +75,172 @@ function initHLS() {
     hls.destroy();
   }
   
-  if (!Hls.isSupported()) {
+  // Use native HLS for Safari (even if MSE is available)
+  if (!Hls.isSupported() || browserName === 'Safari') {
     if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = videoSrc;
-      status.innerHTML = 'Using native HLS support';
+      udpLog('INFO', 'HLS', 'Using native HLS support for ' + browserName);
+      // Use master playlist for Safari to ensure codec declaration
+      var masterUrl = videoSrc.replace('/playlist.m3u8', '/master.m3u8');
+      udpLog('INFO', 'HLS', 'Safari using master playlist: ' + masterUrl);
+      video.src = masterUrl;
       setConnectionStatus('');
+      
+      // Set up comprehensive native video event handlers for Safari debugging
+      video.addEventListener('loadstart', function() {
+        udpLog('INFO', 'NATIVE', 'loadstart event fired');
+      });
+      
+      video.addEventListener('loadedmetadata', function() {
+        udpLog('INFO', 'NATIVE', 'Video metadata loaded - duration: ' + video.duration + ', videoWidth: ' + video.videoWidth + ', videoHeight: ' + video.videoHeight);
+        // Check decode stats if available
+        if (video.webkitDecodedFrameCount !== undefined) {
+          udpLog('INFO', 'DECODE', 'Webkit decoded frames: ' + video.webkitDecodedFrameCount + ', dropped: ' + video.webkitDroppedFrameCount);
+        }
+      });
+      
+      video.addEventListener('loadeddata', function() {
+        udpLog('INFO', 'NATIVE', 'loadeddata - readyState: ' + video.readyState + ', networkState: ' + video.networkState);
+      });
+      
+      video.addEventListener('canplay', function() {
+        udpLog('INFO', 'NATIVE', 'canplay event - buffered ranges: ' + video.buffered.length);
+        for (var i = 0; i < video.buffered.length; i++) {
+          udpLog('INFO', 'BUFFER', 'Range ' + i + ': ' + video.buffered.start(i) + ' - ' + video.buffered.end(i));
+        }
+      });
+      
+      video.addEventListener('canplaythrough', function() {
+        udpLog('INFO', 'NATIVE', 'canplaythrough event fired');
+      });
+      
+      video.addEventListener('playing', function() {
+        udpLog('INFO', 'NATIVE', 'Video playing via native HLS');
+        setConnectionStatus('');
+      });
+      
+      video.addEventListener('waiting', function() {
+        udpLog('WARN', 'NATIVE', 'waiting event - video is buffering');
+      });
+      
+      video.addEventListener('stalled', function() {
+        udpLog('WARN', 'NATIVE', 'stalled event - network stalled');
+      });
+      
+      video.addEventListener('suspend', function() {
+        udpLog('INFO', 'NATIVE', 'suspend event - browser stopped fetching');
+      });
+      
+      video.addEventListener('progress', function() {
+        udpLog('DEBUG', 'NATIVE', 'progress event - buffered: ' + (video.buffered.length > 0 ? video.buffered.end(0) : 0));
+      });
+      
+      video.addEventListener('timeupdate', function() {
+        // Only log occasionally to avoid spam
+        if (Math.floor(video.currentTime) % 5 === 0 && video.currentTime % 1 < 0.1) {
+          udpLog('INFO', 'PLAYBACK', 'currentTime: ' + video.currentTime + ', paused: ' + video.paused);
+        }
+      });
+      
+      video.addEventListener('error', function(e) {
+        var errorDetails = {
+          code: video.error ? video.error.code : 'N/A',
+          message: video.error ? video.error.message : 'unknown',
+          MEDIA_ERR_ABORTED: video.error && video.error.code === 1,
+          MEDIA_ERR_NETWORK: video.error && video.error.code === 2,
+          MEDIA_ERR_DECODE: video.error && video.error.code === 3,
+          MEDIA_ERR_SRC_NOT_SUPPORTED: video.error && video.error.code === 4
+        };
+        udpLog('ERROR', 'NATIVE', 'Video error details: ' + JSON.stringify(errorDetails));
+        
+        // Check Safari-specific error info
+        if (video.error && video.error.code === 3) {
+          udpLog('ERROR', 'DECODE_ERROR', 'Media decode error - Safari cannot decode the video stream');
+        }
+      });
+      
+      // Check video playback quality if available
+      if (video.getVideoPlaybackQuality) {
+        setInterval(function() {
+          var quality = video.getVideoPlaybackQuality();
+          udpLog('INFO', 'QUALITY', 'Total frames: ' + quality.totalVideoFrames + 
+                ', dropped: ' + quality.droppedVideoFrames + 
+                ', corrupted: ' + quality.corruptedVideoFrames);
+        }, 5000);
+      }
+      
+      // Safari-specific: Check if we can get more info about the tracks
+      video.addEventListener('loadedmetadata', function() {
+        if (video.videoTracks && video.videoTracks.length > 0) {
+          udpLog('INFO', 'TRACKS', 'Video tracks: ' + video.videoTracks.length);
+          for (var i = 0; i < video.videoTracks.length; i++) {
+            var track = video.videoTracks[i];
+            udpLog('INFO', 'TRACK', 'Track ' + i + ': kind=' + track.kind + ', label=' + track.label + ', enabled=' + track.enabled);
+          }
+        }
+        
+        // Check text tracks (might have metadata)
+        if (video.textTracks && video.textTracks.length > 0) {
+          udpLog('INFO', 'TEXT_TRACKS', 'Text tracks: ' + video.textTracks.length);
+        }
+      });
+      
+      // Try to play with detailed error catching
+      video.play().then(function() {
+        udpLog('INFO', 'NATIVE', 'Play promise resolved successfully');
+      }).catch(function(e) {
+        udpLog('ERROR', 'PLAY_ERROR', 'Play failed: ' + e.name + ' - ' + e.message);
+        if (e.name === 'NotAllowedError') {
+          udpLog('INFO', 'AUTOPLAY', 'Autoplay blocked - waiting for user interaction');
+          document.addEventListener('click', function() {
+            video.muted = false;
+            video.play().then(function() {
+              udpLog('INFO', 'NATIVE', 'Play succeeded after user interaction');
+            }).catch(function(e2) {
+              udpLog('ERROR', 'PLAY_ERROR', 'Play still failed after interaction: ' + e2.message);
+            });
+          }, { once: true });
+        }
+      });
+      
+      // Safari-specific decode monitoring
+      var decodeCheckCount = 0;
+      var decodeCheckInterval = setInterval(function() {
+        decodeCheckCount++;
+        
+        // Check various video states
+        var stateInfo = {
+          readyState: video.readyState,
+          networkState: video.networkState,
+          paused: video.paused,
+          seeking: video.seeking,
+          currentTime: video.currentTime,
+          bufferedRanges: video.buffered.length,
+          duration: video.duration,
+          videoWidth: video.videoWidth,
+          videoHeight: video.videoHeight
+        };
+        
+        // Check webkit-specific properties
+        if (video.webkitDecodedFrameCount !== undefined) {
+          stateInfo.webkitDecodedFrames = video.webkitDecodedFrameCount;
+          stateInfo.webkitDroppedFrames = video.webkitDroppedFrameCount;
+        }
+        
+        // Check if we have presentation stats
+        if (video.webkitVideoDecodedByteCount !== undefined) {
+          stateInfo.decodedBytes = video.webkitVideoDecodedByteCount;
+        }
+        
+        udpLog('DEBUG', 'DECODE_STATE', 'Check #' + decodeCheckCount + ': ' + JSON.stringify(stateInfo));
+        
+        // Stop after 20 checks (20 seconds)
+        if (decodeCheckCount >= 20) {
+          clearInterval(decodeCheckInterval);
+          udpLog('INFO', 'DECODE_STATE', 'Stopped monitoring after 20 checks');
+        }
+      }, 1000);
     } else {
-      status.innerHTML = 'HLS not supported in this browser';
+      udpLog('ERROR', 'HLS', 'HLS not supported in this browser');
       setConnectionStatus('error');
     }
     return;
@@ -98,7 +279,6 @@ function initHLS() {
   });
   
   setConnectionStatus('connecting');
-  status.innerHTML = 'Connecting to stream...';
   
   udpLog('INFO', 'HLS', 'Loading HLS source: ' + videoSrc);
   hls.loadSource(videoSrc);
@@ -106,7 +286,6 @@ function initHLS() {
   
   hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
     hasConnectedOnce = true;
-    status.innerHTML = 'Stream connected - Starting playback';
     setConnectionStatus('');
     udpLog('INFO', 'HLS', 'Manifest parsed - levels: ' + (data ? data.levels.length : 0));
     
@@ -133,7 +312,6 @@ function initHLS() {
   });
   
   video.addEventListener('playing', function() {
-    status.innerHTML = 'Live Broadcast';
     setConnectionStatus('');
     udpLog('INFO', 'VIDEO', 'Video playing - duration: ' + video.duration);
     
@@ -295,7 +473,6 @@ function initHLS() {
     // Check for 410 Gone error which indicates URL was regenerated
     if (data.type === Hls.ErrorTypes.NETWORK_ERROR && data.response && data.response.code === 410) {
       udpLog('WARN', 'HLS', 'URL regenerated (410 Gone) - reloading page');
-      status.innerHTML = 'Stream URL changed - Reloading...';
       setConnectionStatus('error');
       // Reload the page after a short delay
       setTimeout(function() {
@@ -306,7 +483,6 @@ function initHLS() {
     
     if (data.fatal) {
       udpLog('ERROR', 'HLS', 'Fatal error - attempting reconnect');
-      status.innerHTML = 'Connection lost - Reconnecting...';
       setConnectionStatus('error');
       scheduleReconnect();
     } else {
@@ -353,7 +529,6 @@ function scheduleReconnect() {
     reconnectTimer = setTimeout(function() {
       console.log('Attempting to reconnect...');
       setConnectionStatus('connecting');
-      status.innerHTML = 'Reconnecting...';
       initHLS();
       reconnectTimer = null;
     }, 1000);
@@ -387,8 +562,6 @@ function updateStats() {
   // Estimate latency based on segment timing
   var estimatedLatency = lastSegmentTime > 0 ? ((Date.now() - lastSegmentTime) / 1000).toFixed(3) + 's' : '--';
   
-  stats.innerHTML = 'Latency: ~' + estimatedLatency + ' | Buffer: ' + bufferLen + 's | Bitrate: ' + bitrate + ' | Time: ' + currentTime + 's';
-  
   // Log stats every 5 seconds
   if (Date.now() - lastStatsLog > 5000) {
     lastStatsLog = Date.now();
@@ -396,78 +569,7 @@ function updateStats() {
   }
 }
 
-function toggleRecording() {
-  if (!isRecording) {
-    startRecording();
-  } else {
-    stopRecording();
-  }
-}
 
-function startRecording() {
-  if (!video.captureStream) {
-    recordingInfo.innerHTML = 'Recording not supported in this browser';
-    return;
-  }
-  
-  recordedChunks = [];
-  var stream = video.captureStream(30);
-  
-  try {
-    mediaRecorder = new MediaRecorder(stream, {
-      mimeType: 'video/webm; codecs=vp9'
-    });
-  } catch (e) {
-    try {
-      mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'video/webm'
-      });
-    } catch (e2) {
-      recordingInfo.innerHTML = 'Recording failed: ' + e2.message;
-      return;
-    }
-  }
-  
-  mediaRecorder.ondataavailable = function(event) {
-    if (event.data && event.data.size > 0) {
-      recordedChunks.push(event.data);
-    }
-  };
-  
-  mediaRecorder.onstop = function() {
-    var blob = new Blob(recordedChunks, { type: 'video/webm' });
-    var url = URL.createObjectURL(blob);
-    downloadBtn.href = url;
-    downloadBtn.download = 'stream_' + Date.now() + '.webm';
-    downloadBtn.style.display = 'inline-block';
-    recordingInfo.innerHTML = 'Recording saved (' + (blob.size / 1048576).toFixed(2) + ' MB)';
-  };
-  
-  mediaRecorder.start(1000);
-  isRecording = true;
-  recordBtn.textContent = 'Stop Recording';
-  recordBtn.classList.add('recording');
-  recordingInfo.innerHTML = 'Recording in progress...';
-}
-
-function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
-    isRecording = false;
-    recordBtn.textContent = 'Start Recording';
-    recordBtn.classList.remove('recording');
-  }
-}
-
-function toggleDebug() {
-  debugMode = document.getElementById('debugToggle').checked;
-  var stats = document.getElementById('stats');
-  if (debugMode) {
-    stats.style.display = 'block';
-  } else {
-    stats.style.display = 'none';
-  }
-}
 
 // Mobile detection
 var isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
@@ -511,8 +613,11 @@ document.addEventListener('touchend', function(e) {
 });
 
 // Initialize on load
-udpLog('INFO', 'PAGE', 'Page loaded, initializing HLS player');
+udpLog('INFO', 'PAGE', 'Page loaded');
 udpLog('INFO', 'PAGE', 'User Agent: ' + navigator.userAgent);
+
+// Always initialize HLS for all browsers (Safari blocking removed)
+udpLog('INFO', 'PAGE', 'Initializing HLS player for ' + browserName);
 initHLS();
 startConnectionMonitor();
 statsInterval = setInterval(updateStats, 200);
@@ -524,4 +629,5 @@ window.addEventListener('beforeunload', function() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   if (statsInterval) clearInterval(statsInterval);
   if (connectionCheckInterval) clearInterval(connectionCheckInterval);
+  udpLog('INFO', 'PAGE', 'Page unloading - cleaned up resources');
 });

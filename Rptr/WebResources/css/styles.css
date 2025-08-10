@@ -5,6 +5,80 @@ body {
     padding-top: 60px; /* Space for fixed header */
 }
 
+/* Safari not supported message */
+.safari-not-supported {
+    display: none;
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    padding: 40px;
+    margin: 40px auto;
+    max-width: 500px;
+    text-align: center;
+}
+
+.safari-not-supported h2 {
+    color: #1e3a8a;
+    font-size: 28px;
+    margin: 0 0 20px 0;
+}
+
+.safari-not-supported p {
+    color: #555;
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0 0 30px 0;
+}
+
+.browser-suggestions {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+
+.browser-option {
+    background: #f8f9fa;
+    border: 2px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 20px;
+    text-decoration: none;
+    color: #333;
+    transition: all 0.2s;
+    min-width: 140px;
+}
+
+.browser-option:hover {
+    border-color: #1e3a8a;
+    background: #f0f4ff;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}
+
+.browser-option .browser-name {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 5px;
+}
+
+.browser-option .browser-status {
+    font-size: 14px;
+    color: #22c55e;
+}
+
+/* Safari blocking disabled for testing
+body.safari-browser .main-container,
+body.safari-browser .controls,
+body.safari-browser .recording,
+body.safari-browser .stats {
+    display: none !important;
+}
+
+body.safari-browser .safari-not-supported {
+    display: block;
+}
+*/
+
 .feedback-container {
     display: flex;
     gap: 10px;
@@ -163,7 +237,7 @@ video {
     background: #1a1a1a; 
     color: #fff;
     border-radius: 25px;
-    display: inline-block;
+    display: none; /* Hidden by default, shown only in debug mode */
     position: relative;
     font-weight: 500;
     text-align: center;
@@ -216,17 +290,20 @@ video {
     background: #d4edda; 
     font-family: monospace; 
     font-size: 12px; 
+    display: none; /* Hidden by default, shown only in debug mode */
 }
 
 .recording { 
     margin: 10px 0; 
     padding: 10px; 
     background: #cce7ff; 
+    display: none; /* Removed - recording feature no longer exists */
 }
 
 .controls { 
     margin: 10px 0; 
     text-align: center; 
+    display: none; /* Removed - recording controls no longer exist */
 }
 
 button { 
@@ -277,5 +354,9 @@ button {
 }
 
 .debug-active .status { 
-    display: block; 
+    display: inline-block; 
+}
+
+.debug-active .stats {
+    display: block;
 }

@@ -8,6 +8,7 @@
 #import "RptrVideoToolboxEncoder.h"
 #import "RptrLogger.h"
 #import "RptrH264Decoder.h"
+#import "RptrSPSModifier.h"
 
 @implementation RptrEncodedFrame
 @end
@@ -161,10 +162,11 @@ static void compressionOutputCallback(void * _Nullable outputCallbackRefCon,
     VTSessionSetProperty(self.compressionSession,
         kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     
-    // Profile level - Baseline for maximum compatibility
+    // Profile level - Main Profile like Apple's sample streams
+    // Apple's bipbop sample uses Main Profile (0x64) with Level 3.2 for 960x540
     VTSessionSetProperty(self.compressionSession,
         kVTCompressionPropertyKey_ProfileLevel,
-        kVTProfileLevel_H264_Baseline_AutoLevel);
+        kVTProfileLevel_H264_Main_3_2);
     
     // Bitrate
     int bitrate = (int)self.bitrate;
@@ -191,7 +193,7 @@ static void compressionOutputCallback(void * _Nullable outputCallbackRefCon,
     VTSessionSetProperty(self.compressionSession,
         kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
     
-    RLogDIY(@"[VT-ENCODER] Configured: H.264 Baseline, %d bps, keyframe every %d frames",
+    RLogDIY(@"[VT-ENCODER] Configured: H.264 Main Profile Level 3.2, %d bps, keyframe every %d frames",
              bitrate, keyframeInterval);
 }
 
@@ -341,13 +343,16 @@ static void compressionOutputCallback(void * _Nullable outputCallbackRefCon,
         if (status == noErr && ppsData && ppsSize > 0) {
             NSData *newPPS = [NSData dataWithBytes:ppsData length:ppsSize];
             
+            // Add VUI parameters to SPS for Safari compatibility
+            NSData *modifiedSPS = [RptrSPSModifier addVUIParametersToSPS:newSPS frameRate:self.frameRate];
+            
             // Only notify if parameter sets changed
-            if (![newSPS isEqualToData:self.sps] || ![newPPS isEqualToData:self.pps]) {
-                self.sps = newSPS;
+            if (![modifiedSPS isEqualToData:self.sps] || ![newPPS isEqualToData:self.pps]) {
+                self.sps = modifiedSPS;
                 self.pps = newPPS;
                 
-                RLogDIY(@"[VT-ENCODER] Extracted parameter sets - SPS: %lu bytes, PPS: %lu bytes",
-                        (unsigned long)spsSize, (unsigned long)ppsSize);
+                RLogDIY(@"[VT-ENCODER] Extracted parameter sets - SPS: %lu bytes (modified from %lu), PPS: %lu bytes",
+                        (unsigned long)modifiedSPS.length, (unsigned long)spsSize, (unsigned long)ppsSize);
                 
                 // Log hex dump of raw SPS/PPS for analysis
                 const uint8_t *spsBytes = self.sps.bytes;
@@ -363,6 +368,10 @@ static void compressionOutputCallback(void * _Nullable outputCallbackRefCon,
                     [ppsHex appendFormat:@"%02X ", ppsBytes[i]];
                 }
                 RLogDIY(@"[VT-ENCODER] PPS hex: %@", ppsHex);
+                
+                // Analyze original vs modified SPS for debugging
+                [RptrSPSModifier analyzeSPS:newSPS label:@"Original VideoToolbox SPS"];
+                [RptrSPSModifier analyzeSPS:modifiedSPS label:@"Modified SPS with VUI"];
                 
                 // Validate and log parameter sets using decoder
                 NSString *analysisReport = [RptrH264Decoder generateDetailedReport:self.sps pps:self.pps];
