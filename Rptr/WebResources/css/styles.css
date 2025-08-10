@@ -5,6 +5,48 @@ body {
     padding-top: 60px; /* Space for fixed header */
 }
 
+.feedback-container {
+    display: flex;
+    gap: 10px;
+    max-width: 500px;
+    margin: 20px auto;
+    padding: 0 20px;
+}
+
+.feedback-container input {
+    flex: 1;
+    padding: 10px 15px;
+    border: 1px solid #ddd;
+    border-radius: 5px;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.feedback-container input:focus {
+    border-color: #1e3a8a;
+}
+
+.feedback-container button {
+    padding: 10px 20px;
+    background: #1e3a8a;
+    color: white;
+    border: none;
+    border-radius: 5px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.feedback-container button:hover {
+    background: #1e4a9a;
+}
+
+.feedback-container button:disabled {
+    background: #ccc;
+    cursor: not-allowed;
+}
+
 .title-bar {
     position: fixed;
     top: 0;

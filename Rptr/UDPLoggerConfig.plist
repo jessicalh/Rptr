@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>ServerIP</key>
+    <string>172.20.10.9</string>
+    <key>ServerPort</key>
+    <integer>9999</integer>
+    <key>BuildTimestamp</key>
+    <string>2025-08-10 12:10:22</string>
+    <key>BuildMachine</key>
+    <string>Jessicas-MacBook-Air.local</string>
+</dict>
+</plist>

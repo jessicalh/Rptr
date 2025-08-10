@@ -2,126 +2,150 @@
 //  RptrConstants.h
 //  Rptr
 //
-//  Centralized constants for the Rptr application
-//  Following Apple's Objective-C naming conventions:
-//  - Use 'k' prefix for constants (e.g., kRptrConstantName)
-//  - Use descriptive names that indicate purpose
-//  - Group related constants together
+//  Application-wide constants and configuration values
 //
 
-#ifndef RptrConstants_h
-#define RptrConstants_h
-
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
-// MARK: - HLS Streaming Constants
+NS_ASSUME_NONNULL_BEGIN
+
+#pragma mark - Network Configuration
+
+// Server Ports
+static const NSUInteger kRptrHLSServerPort = 8080;
+static const NSUInteger kRptrDefaultServerPort = 8080;
+
+// Network Timeouts (seconds)
+static const NSTimeInterval kRptrNetworkTimeout = 30.0;
+static const NSTimeInterval kRptrManifestTimeout = 15.0;
+
+// Buffer Sizes
+static const NSUInteger kRptrSocketBufferSize = 4096;
+static const NSUInteger kRptrMaxBufferSize = 30 * 1024 * 1024; // 30 MB
+
+#pragma mark - HLS Configuration
 
 // Segment Configuration
-// These values are optimized for reliability on poor network conditions
-// Research: Apple recommends 6-10 second segments for live streaming
-// We use 4 seconds to balance latency and reliability
-static const NSTimeInterval kRptrSegmentDuration = 4.0;  // Duration of each HLS segment in seconds
-static const NSInteger kRptrTargetDuration = 5;          // Maximum segment duration for playlist (must be >= actual segment duration)
-static const NSInteger kRptrMaxSegments = 20;            // Maximum segments to keep in memory (20 * 4s = 80s buffer)
-static const NSInteger kRptrPlaylistWindow = 6;          // Number of segments in sliding window playlist (6 * 4s = 24s)
+static const NSTimeInterval kRptrSegmentDuration = 4.0;
+static const NSInteger kRptrSegmentCount = 6;
+static const NSInteger kRptrMaxSegmentCount = 10;
 
-// Network Buffer Sizes
-static const NSInteger kRptrHTTPBufferSize = 16384;      // 16KB buffer for HTTP operations
+// HLS Timing
+static const NSTimeInterval kRptrLiveLatency = 3.0;
+static const NSTimeInterval kRptrMaxLatency = 10.0;
 
-// Video Encoding Constants
-// Optimized for reliability: lower bitrate, resolution, and framerate
-static const NSInteger kRptrVideoBitrate = 600000;       // 600 kbps - works on most 3G/4G networks
-static const NSInteger kRptrVideoWidth = 960;            // qHD width (quarter HD)
-static const NSInteger kRptrVideoHeight = 540;           // qHD height
-static const NSInteger kRptrVideoFrameRate = 15;         // 15 fps - smooth enough for most content
-static const NSInteger kRptrVideoKeyFrameInterval = 30;  // Keyframe every 2 seconds (30 frames at 15fps)
-static const CGFloat kRptrVideoKeyFrameDuration = 2.0;   // Keyframe interval in seconds
-static const CGFloat kRptrVideoQuality = 0.75;           // Video quality (0.0-1.0)
+#pragma mark - Video Configuration
 
-// Audio Encoding Constants
-static const NSInteger kRptrAudioBitrate = 64000;        // 64 kbps for mono audio
-static const NSInteger kRptrAudioSampleRate = 44100;     // Standard CD quality
-static const NSInteger kRptrAudioChannels = 1;           // Mono to save bandwidth
+// Video Dimensions
+static const CGFloat kRptrVideoWidth = 960.0;
+static const CGFloat kRptrVideoHeight = 540.0;
 
-// Server Configuration
-static const NSInteger kRptrDefaultServerPort = 8080;    // Default HTTP server port
-static const NSInteger kRptrRandomPathLength = 10;       // Length of random URL path for basic security
+// Frame Rates
+static const NSInteger kRptrReliableFrameRate = 15;
+static const NSInteger kRptrRealtimeFrameRate = 30;
 
-// Timing Constants
-static const NSTimeInterval kRptrSegmentTimerOffset = 0.5;     // Fire timer 0.5s before segment end
-static const NSTimeInterval kRptrSegmentRotationDelay = 0.5;   // Additional delay before forcing rotation
-static const NSTimeInterval kRptrClientInactivityTimeout = 30.0; // Remove inactive clients after 30s
-static const NSTimeInterval kRptrMemoryWarningDelay = 0.5;     // Delay before handling memory warnings
+// Bitrates (bits per second)
+static const NSInteger kRptrReliableVideoBitrate = 600000;  // 600 kbps
+static const NSInteger kRptrRealtimeVideoBitrate = 1500000; // 1.5 Mbps
+static const NSInteger kRptrAudioBitrate = 64000;           // 64 kbps
 
-// UI Update Intervals
-static const NSTimeInterval kRptrLocationUpdateInterval = 2.0;  // Update location every 2 seconds
-static const NSTimeInterval kRptrAudioLevelUpdateInterval = 0.1; // Update audio meter 10 times per second
+#pragma mark - UI Configuration
 
-// MARK: - Network Interface Names
+// Button Sizes
+static const CGFloat kRptrStreamButtonSize = 60.0;
+static const CGFloat kRptrSmallButtonSize = 40.0;
 
-// Cellular Interface Prefixes
-static NSString * const kRptrCellularInterfacePDP = @"pdp_ip";
-static NSString * const kRptrCellularInterfaceRMNET = @"rmnet";
-static NSString * const kRptrCellularInterfaceEN2 = @"en2";
+// Animation Durations
+static const NSTimeInterval kRptrFadeAnimationDuration = 0.3;
+static const NSTimeInterval kRptrPulseAnimationDuration = 1.5;
 
-// WiFi Interface
-static NSString * const kRptrWiFiInterface = @"en0";
+// Feedback Display
+static const NSTimeInterval kRptrFeedbackDisplayDuration = 10.0;
+static const NSUInteger kRptrMaxFeedbackQueueSize = 100;
 
-// MARK: - HLS Playlist Tags
+// Layout Constants
+static const CGFloat kRptrDefaultPadding = 20.0;
+static const CGFloat kRptrSmallPadding = 10.0;
+static const CGFloat kRptrCornerRadius = 8.0;
 
-// HLS Version and Compatibility
-static NSString * const kRptrHLSVersion = @"6";  // Version 6 supports fMP4 with good compatibility
+#pragma mark - Timer Intervals
 
-// MARK: - File Names and Paths
+static const NSTimeInterval kRptrUTCUpdateInterval = 1.0;
+static const NSTimeInterval kRptrLocationUpdateInterval = 10.0;
+static const NSTimeInterval kRptrStatsUpdateInterval = 0.2;
+static const NSTimeInterval kRptrStatusPollInterval = 10.0;
 
-static NSString * const kRptrPlaylistFileName = @"playlist.m3u8";
-static NSString * const kRptrInitSegmentFileName = @"init.mp4";
-static NSString * const kRptrSegmentFilePrefix = @"segment";
-static NSString * const kRptrSegmentFileExtension = @"m4s";
-static NSString * const kRptrBaseDirectoryName = @"HLSStream";
+#pragma mark - Limits
+
+// Connection Limits
+static const NSUInteger kRptrMaxConnections = 100;
+
+// String Length Limits
+static const NSUInteger kRptrMaxTitleLength = 100;
+static const NSUInteger kRptrMaxFeedbackLength = 100;
+static const NSUInteger kRptrRandomPathLength = 8;
+
+#pragma mark - Queue Names
+
+static NSString * const kRptrServerQueueName = @"com.rptr.server.queue";
+static NSString * const kRptrWriterQueueName = @"com.rptr.writer.queue";
+static NSString * const kRptrPropertyQueueName = @"com.rptr.property.queue";
+static NSString * const kRptrClientsQueueName = @"com.rptr.clients.queue";
+static NSString * const kRptrSegmentDataQueueName = @"com.rptr.segmentData.queue";
+static NSString * const kRptrSegmentsQueueName = @"com.rptr.segments.queue";
+
+#pragma mark - File System Names
+
+static NSString * const kRptrBaseDirectoryName = @"HLSAssets";
 static NSString * const kRptrSegmentDirectoryName = @"segments";
 
-// MARK: - HTTP Response Headers
+#pragma mark - Camera Configuration
 
-static NSString * const kRptrHTTPHeaderContentType = @"Content-Type";
-static NSString * const kRptrHTTPHeaderContentLength = @"Content-Length";
-static NSString * const kRptrHTTPHeaderConnection = @"Connection";
-static NSString * const kRptrHTTPHeaderCacheControl = @"Cache-Control";
-static NSString * const kRptrHTTPHeaderAccessControl = @"Access-Control-Allow-Origin";
+// Brightness Detection
+static const CGFloat kRptrMinBrightness = 0.1;
+static const CGFloat kRptrMaxBrightness = 0.9;
+static const NSUInteger kRptrBrightnessHistorySize = 30;
 
-// MARK: - Content Types
+// Activity Detection
+static const NSTimeInterval kRptrCameraEvaluationInterval = 5.0;
+static const NSInteger kRptrNoActivityThreshold = 5;
+static const NSInteger kRptrBurstCountThreshold = 3;
 
-static NSString * const kRptrContentTypeM3U8 = @"application/vnd.apple.mpegurl";
-static NSString * const kRptrContentTypeMP4 = @"video/mp4";
-static NSString * const kRptrContentTypeHTML = @"text/html";
-static NSString * const kRptrContentTypeCSS = @"text/css";
-static NSString * const kRptrContentTypeJS = @"application/javascript";
-static NSString * const kRptrContentTypePNG = @"image/png";
-static NSString * const kRptrContentTypeJSON = @"application/json";
+#pragma mark - File System
 
-// MARK: - Queue Names
+// Cache Durations (seconds)
+static const NSTimeInterval kRptrWebResourceCacheDuration = 0; // No cache for development
+static const NSTimeInterval kRptrSegmentCacheDuration = 30.0;
 
-static NSString * const kRptrServerQueueName = @"com.rptr.hls.server";
-static NSString * const kRptrWriterQueueName = @"com.rptr.hls.writer";
-static NSString * const kRptrPropertyQueueName = @"com.rptr.hls.properties";
-static NSString * const kRptrClientsQueueName = @"com.rptr.hls.clients";
-static NSString * const kRptrSegmentDataQueueName = @"com.rptr.hls.segmentdata";
-static NSString * const kRptrSegmentsQueueName = @"com.rptr.hls.segments";
-static NSString * const kRptrVideoQueueName = @"com.rptr.videoQueue";
-static NSString * const kRptrAudioQueueName = @"com.rptr.audioQueue";
-static NSString * const kRptrOverlayQueueName = @"com.rptr.overlay.queue";
-static NSString * const kRptrLocationQueueName = @"com.rptr.permission.location";
+#pragma mark - Error Codes
 
-// MARK: - Error Domains
+static NSString * const kRptrErrorDomainHLSServer = @"com.rptr.hls.error";
 
-static NSString * const kRptrErrorDomainHLSServer = @"HLSServer";
-static NSString * const kRptrErrorDomainPermission = @"PermissionManager";
+typedef NS_ENUM(NSInteger, RptrErrorCode) {
+    RptrErrorCodeUnknown = -1,
+    RptrErrorCodeNetworkUnavailable = 1000,
+    RptrErrorCodeServerStartFailed = 1001,
+    RptrErrorCodeStreamingFailed = 1002,
+    RptrErrorCodePermissionDenied = 1003,
+    RptrErrorCodeCameraUnavailable = 1004,
+    RptrErrorCodeAssetWriterFailed = 1005,
+    RptrErrorCodeInvalidConfiguration = 1006
+};
 
-// MARK: - Notification Names
+#pragma mark - Notification Names
 
-static NSString * const kRptrNotificationStreamingStarted = @"RptrStreamingStarted";
-static NSString * const kRptrNotificationStreamingStopped = @"RptrStreamingStopped";
-static NSString * const kRptrNotificationClientConnected = @"RptrClientConnected";
-static NSString * const kRptrNotificationClientDisconnected = @"RptrClientDisconnected";
+extern NSString * const RptrStreamDidStartNotification;
+extern NSString * const RptrStreamDidStopNotification;
+extern NSString * const RptrClientDidConnectNotification;
+extern NSString * const RptrClientDidDisconnectNotification;
+extern NSString * const RptrErrorOccurredNotification;
 
-#endif /* RptrConstants_h */
+#pragma mark - User Defaults Keys
+
+extern NSString * const RptrUserDefaultsStreamTitle;
+extern NSString * const RptrUserDefaultsQualityMode;
+extern NSString * const RptrUserDefaultsLocationEnabled;
+extern NSString * const RptrUserDefaultsAudioEnabled;
+
+NS_ASSUME_NONNULL_END

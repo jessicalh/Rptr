@@ -7,6 +7,7 @@
 
 #import <UIKit/UIKit.h>
 #import "AppDelegate.h"
+#import "RptrApplication.h"
 
 int main(int argc, char * argv[]) {
     NSString * appDelegateClassName;
@@ -14,5 +15,6 @@ int main(int argc, char * argv[]) {
         // Setup code that might create autoreleased objects goes here.
         appDelegateClassName = NSStringFromClass([AppDelegate class]);
     }
-    return UIApplicationMain(argc, argv, nil, appDelegateClassName);
+    // Use our custom UIApplication class to prevent menu/storyboard crashes
+    return UIApplicationMain(argc, argv, NSStringFromClass([RptrApplication class]), appDelegateClassName);
 }

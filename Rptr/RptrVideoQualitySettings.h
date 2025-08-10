@@ -23,12 +23,14 @@ typedef NS_ENUM(NSInteger, RptrVideoQualityMode) {
 @property (nonatomic, readonly) NSString *modeDescription;
 
 // HLS Segment Settings
-@property (nonatomic, readonly) NSTimeInterval segmentDuration;
-@property (nonatomic, readonly) NSInteger targetDuration;
-@property (nonatomic, readonly) NSInteger maxSegments;
-@property (nonatomic, readonly) NSInteger playlistWindow;
-@property (nonatomic, readonly) NSTimeInterval segmentTimerOffset;
-@property (nonatomic, readonly) NSTimeInterval segmentRotationDelay;
+@property (nonatomic, readonly) NSTimeInterval segmentDuration;      // Target segment duration
+@property (nonatomic, readonly) NSTimeInterval segmentMinDuration;    // Minimum allowed duration
+@property (nonatomic, readonly) NSTimeInterval segmentMaxDuration;    // Maximum before force rotation
+@property (nonatomic, readonly) NSInteger targetDuration;             // Playlist target duration
+@property (nonatomic, readonly) NSInteger maxSegments;                // Max segments in playlist
+@property (nonatomic, readonly) NSInteger playlistWindow;             // Sliding window size
+@property (nonatomic, readonly) NSTimeInterval segmentTimerOffset;    // When to start checking
+@property (nonatomic, readonly) NSTimeInterval segmentRotationDelay;  // Max wait for keyframe
 
 // Video Settings
 @property (nonatomic, readonly) NSInteger videoBitrate;

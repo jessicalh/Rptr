@@ -9,12 +9,28 @@ var downloadBtn = document.getElementById('downloadBtn');
 
 // Get configuration from injected values
 var videoSrc = window.location.origin + window.APP_CONFIG.streamUrl;
-var locationEndpoint = window.location.origin + window.APP_CONFIG.locationEndpoint;
+
+// Logging via /forward-log endpoint (goes through centralized logging)
+function udpLog(level, component, message) {
+  var logMessage = 'JS|[' + level + '] [' + component + '] ' + message;
+  
+  // Send to iOS app's /forward-log endpoint which forwards through RptrLogger
+  fetch(window.location.origin + '/forward-log', {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: logMessage,
+    keepalive: true
+  }).catch(function(err) {
+    console.error('Failed to send log:', err);
+  });
+  
+  // Also log to console for debugging
+  console.log(logMessage);
+}
 
 // Debug logging to track URL usage
-console.log('DEBUG: APP_CONFIG.streamUrl =', window.APP_CONFIG.streamUrl);
-console.log('DEBUG: Computed videoSrc =', videoSrc);
-console.log('DEBUG: locationEndpoint =', locationEndpoint);
+udpLog('INFO', 'INIT', 'APP_CONFIG.streamUrl = ' + window.APP_CONFIG.streamUrl);
+udpLog('INFO', 'INIT', 'Computed videoSrc = ' + videoSrc);
 
 // State variables
 var hls = null;
@@ -26,34 +42,6 @@ var statsInterval = null;
 var lastSegmentTime = 0;
 var connectionCheckInterval = null;
 var hasConnectedOnce = false;
-var map = null;
-var deviceMarker = null;
-var statusWorker = null;
-
-function initializeMap() {
-  if (map) return;
-  
-  fetch(locationEndpoint)
-    .then(response => response.json())
-    .then(data => {
-      if (data.latitude && data.longitude) {
-        map = L.map('mapContainer').setView([data.latitude, data.longitude], 15);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution: '© OpenStreetMap contributors'
-        }).addTo(map);
-        
-        deviceMarker = L.marker([data.latitude, data.longitude])
-          .addTo(map)
-          .bindPopup('Device Location<br>Accuracy: ' + data.accuracy + 'm');
-      } else {
-        document.getElementById('mapContainer').innerHTML = '<div style="text-align: center; padding: 50px; color: #666;">Location not available</div>';
-      }
-    })
-    .catch(error => {
-      console.error('Error fetching location:', error);
-      document.getElementById('mapContainer').innerHTML = '<div style="text-align: center; padding: 50px; color: #666;">Could not load location</div>';
-    });
-}
 
 function setConnectionStatus(state) {
   connectionStatus.className = 'connection-indicator ' + state;
@@ -112,20 +100,22 @@ function initHLS() {
   setConnectionStatus('connecting');
   status.innerHTML = 'Connecting to stream...';
   
-  console.log('DEBUG: About to load HLS source:', videoSrc);
+  udpLog('INFO', 'HLS', 'Loading HLS source: ' + videoSrc);
   hls.loadSource(videoSrc);
   hls.attachMedia(video);
   
-  hls.on(Hls.Events.MANIFEST_PARSED, function() {
+  hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
     hasConnectedOnce = true;
     status.innerHTML = 'Stream connected - Starting playback';
     setConnectionStatus('');
+    udpLog('INFO', 'HLS', 'Manifest parsed - levels: ' + (data ? data.levels.length : 0));
     
     // Check if this is a live stream
     if (hls.levels && hls.levels.length > 0) {
       var level = hls.levels[0];
+      udpLog('INFO', 'CODEC', 'Video: ' + (level.videoCodec || 'unknown') + ', Audio: ' + (level.audioCodec || 'none'));
       if (level.details && level.details.live) {
-        console.log('Live stream detected');
+        udpLog('INFO', 'HLS', 'Live stream detected');
         // For live streams, set to live edge
         hls.config.liveSyncDuration = 3;
         hls.config.liveMaxLatencyDuration = 10;
@@ -145,6 +135,7 @@ function initHLS() {
   video.addEventListener('playing', function() {
     status.innerHTML = 'Live Broadcast';
     setConnectionStatus('');
+    udpLog('INFO', 'VIDEO', 'Video playing - duration: ' + video.duration);
     
     // Hide duration display for live streams
     if (video.duration === Infinity || isNaN(video.duration)) {
@@ -166,8 +157,117 @@ function initHLS() {
     }
   });
   
+  // Track init segment parsing
+  hls.on(Hls.Events.FRAG_PARSING_INIT_SEGMENT, function(event, data) {
+    udpLog('INFO', 'INIT_PARSE', 'Parsing init segment');
+    if (data.tracks) {
+      if (data.tracks.video) {
+        var v = data.tracks.video;
+        udpLog('INFO', 'VIDEO_TRACK', 'codec=' + v.codec + ', size=' + v.width + 'x' + v.height + ', timescale=' + v.timescale);
+        if (v.timescale) {
+          udpLog('INFO', 'VIDEO_TIMESCALE', 'Video track timescale: ' + v.timescale);
+        }
+      }
+    }
+  });
+  
+  // Track fragment parsing
+  hls.on(Hls.Events.FRAG_PARSING_DATA, function(event, data) {
+    udpLog('DEBUG', 'PARSE_DATA', 'Type=' + data.type + ', samples=' + data.nb + ', pts=' + data.startPTS + '-' + data.endPTS);
+  });
+  
+  // Track buffer operations with more detail
+  hls.on(Hls.Events.BUFFER_APPENDING, function(event, data) {
+    udpLog('DEBUG', 'BUFFER_APPEND', 'Type=' + data.type + ', size=' + data.data.byteLength);
+    
+    // Check what type of data we have
+    var dataType = Object.prototype.toString.call(data.data);
+    udpLog('DEBUG', 'BUFFER_TYPE', 'Data type: ' + dataType);
+    
+    // Get the actual ArrayBuffer
+    var buffer = null;
+    if (data.data instanceof ArrayBuffer) {
+      buffer = data.data;
+    } else if (data.data.buffer instanceof ArrayBuffer) {
+      // It might be a TypedArray view
+      buffer = data.data.buffer;
+    }
+    
+    // Check first bytes to detect format
+    if (buffer && buffer.byteLength > 8) {
+      var showBytes = Math.min(buffer.byteLength, 200);
+      var arr = new Uint8Array(buffer, 0, showBytes);
+      var hex = Array.from(arr, function(b) { return ('0' + b.toString(16)).slice(-2); }).join(' ');
+      udpLog('DEBUG', 'BUFFER_HEX', 'First ' + showBytes + ' bytes: ' + hex);
+      
+      // Check for box types
+      try {
+        var view = new DataView(buffer);
+        var pos = 0;
+        var boxes = [];
+        var boxDetails = [];
+        
+        while (pos < Math.min(buffer.byteLength, 1000)) {
+          if (pos + 8 > buffer.byteLength) break;
+          var size = view.getUint32(pos);
+          var type = String.fromCharCode(
+            view.getUint8(pos + 4),
+            view.getUint8(pos + 5),
+            view.getUint8(pos + 6),
+            view.getUint8(pos + 7)
+          );
+          boxes.push(type + '(' + size + ')');
+          
+          // Log details for specific boxes
+          if (type === 'tfdt') {
+            if (pos + 16 <= buffer.byteLength) {
+              var version = view.getUint8(pos + 8);
+              var decodeTime = 0;
+              if (version === 0) {
+                decodeTime = view.getUint32(pos + 12);
+              } else {
+                // 64-bit decode time - read high and low parts
+                var high = view.getUint32(pos + 12);
+                var low = view.getUint32(pos + 16);
+                decodeTime = high * 0x100000000 + low;
+              }
+              boxDetails.push('tfdt decode_time=' + decodeTime);
+            }
+          } else if (type === 'trun') {
+            if (pos + 16 <= buffer.byteLength) {
+              var trunFlags = view.getUint32(pos + 8);
+              var sampleCount = view.getUint32(pos + 12);
+              boxDetails.push('trun samples=' + sampleCount + ' flags=0x' + trunFlags.toString(16));
+            }
+          } else if (type === 'mvhd') {
+            if (pos + 20 <= buffer.byteLength) {
+              var mvhdVersion = view.getUint8(pos + 8);
+              var timescale = view.getUint32(pos + (mvhdVersion === 0 ? 20 : 28));
+              boxDetails.push('mvhd timescale=' + timescale);
+            }
+          }
+          
+          pos += size;
+          if (size === 0 || size === 1) break;
+        }
+        
+        if (boxes.length > 0) {
+          udpLog('DEBUG', 'BOXES', 'Found boxes: ' + boxes.join(', '));
+          if (boxDetails.length > 0) {
+            udpLog('DEBUG', 'BOX_DETAILS', boxDetails.join(', '));
+          }
+        }
+      } catch (e) {
+        udpLog('DEBUG', 'BOXES', 'Error parsing boxes: ' + e.message + ' Stack: ' + e.stack);
+      }
+    } else {
+      udpLog('WARN', 'BUFFER_APPEND', 'Could not extract ArrayBuffer from data');
+    }
+  });
+  
   hls.on(Hls.Events.FRAG_LOADED, function(event, data) {
     lastSegmentTime = Date.now();
+    udpLog('DEBUG', 'FRAG', 'Fragment loaded: ' + data.frag.sn + ', duration: ' + data.frag.duration + 's');
   });
   
   // Check for live stream on level loaded
@@ -190,11 +290,11 @@ function initHLS() {
   });
   
   hls.on(Hls.Events.ERROR, function (event, data) {
-    console.log('HLS error:', data.type, data.details, 'Fatal:', data.fatal);
+    udpLog('ERROR', 'HLS', 'Error: ' + data.type + ' - ' + data.details + ' (Fatal: ' + data.fatal + ')');
     
     // Check for 410 Gone error which indicates URL was regenerated
     if (data.type === Hls.ErrorTypes.NETWORK_ERROR && data.response && data.response.code === 410) {
-      console.log('URL has been regenerated (410 Gone) - reloading page...');
+      udpLog('WARN', 'HLS', 'URL regenerated (410 Gone) - reloading page');
       status.innerHTML = 'Stream URL changed - Reloading...';
       setConnectionStatus('error');
       // Reload the page after a short delay
@@ -205,14 +305,43 @@ function initHLS() {
     }
     
     if (data.fatal) {
+      udpLog('ERROR', 'HLS', 'Fatal error - attempting reconnect');
       status.innerHTML = 'Connection lost - Reconnecting...';
       setConnectionStatus('error');
       scheduleReconnect();
     } else {
       // Non-fatal errors, try to recover
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        udpLog('WARN', 'HLS', 'Network error - restarting load');
         hls.startLoad();
       } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        udpLog('WARN', 'HLS', 'Media error - attempting recovery');
+        // Log more details about the media error
+        if (data.details === Hls.ErrorDetails.BUFFER_APPENDING_ERROR) {
+          udpLog('ERROR', 'MSE', 'Buffer append failed - checking source buffer state');
+          udpLog('ERROR', 'MSE_DETAILS', 'Error details: ' + JSON.stringify({
+            type: data.type,
+            details: data.details,
+            fatal: data.fatal,
+            reason: data.reason,
+            frag: data.frag ? data.frag.sn : 'N/A'
+          }));
+          if (video.error) {
+            udpLog('ERROR', 'MSE', 'Video error: ' + video.error.code + ' - ' + video.error.message);
+          }
+          // Try to get more info from the error event
+          if (data.err) {
+            udpLog('ERROR', 'MSE', 'Original error: ' + data.err.toString());
+            if (data.err.stack) {
+              udpLog('ERROR', 'MSE_STACK', 'Stack: ' + data.err.stack.substring(0, 500));
+            }
+          }
+        } else if (data.details === Hls.ErrorDetails.FRAG_PARSING_ERROR) {
+          udpLog('ERROR', 'PARSE', 'Fragment parsing error');
+          if (data.reason) {
+            udpLog('ERROR', 'PARSE_REASON', 'Reason: ' + data.reason);
+          }
+        }
         hls.recoverMediaError();
       }
     }
@@ -245,6 +374,7 @@ function startConnectionMonitor() {
   }, 2000);
 }
 
+var lastStatsLog = 0;
 function updateStats() {
   if (!hls || !hls.media) return;
   
@@ -258,6 +388,12 @@ function updateStats() {
   var estimatedLatency = lastSegmentTime > 0 ? ((Date.now() - lastSegmentTime) / 1000).toFixed(3) + 's' : '--';
   
   stats.innerHTML = 'Latency: ~' + estimatedLatency + ' | Buffer: ' + bufferLen + 's | Bitrate: ' + bitrate + ' | Time: ' + currentTime + 's';
+  
+  // Log stats every 5 seconds
+  if (Date.now() - lastStatsLog > 5000) {
+    lastStatsLog = Date.now();
+    udpLog('INFO', 'STATS', 'Buffer: ' + bufferLen + 's, Bitrate: ' + bitrate + ', Time: ' + currentTime + 's, Latency: ' + estimatedLatency);
+  }
 }
 
 function toggleRecording() {
@@ -374,196 +510,13 @@ document.addEventListener('touchend', function(e) {
   }
 });
 
-// AbortController for cancelling in-flight requests
-var statusAbortController = null;
-
-// Status polling function with optimizations
-function updateStatus() {
-  // Cancel any in-flight request
-  if (statusAbortController) {
-    statusAbortController.abort();
-  }
-  
-  // Create new abort controller for this request
-  statusAbortController = new AbortController();
-  
-  var requestUrl = window.location.origin + '/status';
-  console.log('Status poll: Requesting', requestUrl);
-  
-  // Use fetch with optimizations to prevent video interference
-  fetch(requestUrl, {
-    method: 'GET',
-    signal: statusAbortController.signal,
-    // Use keepalive to allow request to continue in background
-    keepalive: true,
-    // Set priority to low to avoid interfering with video
-    priority: 'low',
-    // Cache control to prevent caching status
-    cache: 'no-store',
-    // Add timeout
-    signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : statusAbortController.signal
-  })
-    .then(response => {
-      console.log('Status poll: Response received', response.status, response.statusText);
-      if (!response.ok) {
-        throw new Error('Response not ok: ' + response.status);
-      }
-      return response.json();
-    })
-    .then(data => {
-      console.log('Status poll: Data received', JSON.stringify(data));
-      
-      // Use requestAnimationFrame to update UI without blocking video
-      requestAnimationFrame(function() {
-        // Update title if changed
-        if (data.title) {
-          var titleElement = document.querySelector('.title-bar h3');
-          if (titleElement && titleElement.textContent !== data.title) {
-            titleElement.textContent = data.title;
-            console.log('Status poll: Title updated to "' + data.title + '"');
-          }
-        }
-        
-        // Update map location if changed
-        if (data.location && data.location.latitude && data.location.longitude) {
-          if (map && deviceMarker) {
-            var newLatLng = [data.location.latitude, data.location.longitude];
-            // Only update if location actually changed
-            var currentLatLng = deviceMarker.getLatLng();
-            if (currentLatLng.lat !== data.location.latitude || currentLatLng.lng !== data.location.longitude) {
-              deviceMarker.setLatLng(newLatLng);
-              // Don't auto-pan the map as it can be jarring during video playback
-              // map.setView(newLatLng, 15);
-              deviceMarker.setPopupContent('Device Location<br>Accuracy: ' + data.location.accuracy + 'm');
-              console.log('Status poll: Location updated to', newLatLng);
-            }
-          }
-        }
-      });
-      
-      // Clear abort controller after successful request
-      statusAbortController = null;
-    })
-    .catch(error => {
-      if (error.name !== 'AbortError') {
-        console.error('Status poll: Error fetching status:', error);
-      }
-      statusAbortController = null;
-    });
-}
-
-// Optimized polling with requestIdleCallback
-var statusPollInterval = null;
-
-// Initialize Web Worker for background polling if supported
-function initializeStatusWorker() {
-  if (typeof Worker !== 'undefined') {
-    try {
-      statusWorker = new Worker('/js/status-worker.js');
-      
-      // Handle messages from worker
-      statusWorker.addEventListener('message', function(e) {
-        var message = e.data;
-        
-        if (message.type === 'status') {
-          // Process status update in main thread with minimal impact
-          requestAnimationFrame(function() {
-            processStatusUpdate(message.data);
-          });
-        } else if (message.type === 'error') {
-          console.error('Status worker error:', message.error);
-        }
-      });
-      
-      // Handle worker errors
-      statusWorker.addEventListener('error', function(error) {
-        console.error('Status worker error:', error);
-        // Fallback to main thread polling
-        statusWorker = null;
-        startStatusPolling();
-      });
-      
-      // Start worker polling
-      statusWorker.postMessage({
-        command: 'start',
-        url: window.location.origin,
-        interval: 10000
-      });
-      
-      console.log('Status polling using Web Worker for better performance');
-      return true;
-    } catch (error) {
-      console.error('Failed to create status worker:', error);
-      statusWorker = null;
-    }
-  }
-  return false;
-}
-
-// Process status update with minimal DOM manipulation
-function processStatusUpdate(data) {
-  // Update title if changed
-  if (data.title) {
-    var titleElement = document.querySelector('.title-bar h3');
-    if (titleElement && titleElement.textContent !== data.title) {
-      titleElement.textContent = data.title;
-      console.log('Status poll: Title updated to "' + data.title + '"');
-    }
-  }
-  
-  // Update map location if changed
-  if (data.location && data.location.latitude && data.location.longitude) {
-    if (map && deviceMarker) {
-      var newLatLng = [data.location.latitude, data.location.longitude];
-      var currentLatLng = deviceMarker.getLatLng();
-      if (currentLatLng.lat !== data.location.latitude || currentLatLng.lng !== data.location.longitude) {
-        deviceMarker.setLatLng(newLatLng);
-        deviceMarker.setPopupContent('Device Location<br>Accuracy: ' + data.location.accuracy + 'm');
-        console.log('Status poll: Location updated to', newLatLng);
-      }
-    }
-  }
-}
-
-function startStatusPolling() {
-  // Try to use Web Worker first
-  if (initializeStatusWorker()) {
-    return;
-  }
-  
-  // Fallback to optimized main thread polling
-  console.log('Starting optimized status polling in main thread');
-  
-  // Clear any existing interval
-  if (statusPollInterval) {
-    clearInterval(statusPollInterval);
-  }
-  
-  // Do immediate poll
-  updateStatus();
-  
-  // Set up polling that respects browser idle time
-  statusPollInterval = setInterval(function() {
-    // Use requestIdleCallback if available to poll during idle time
-    if ('requestIdleCallback' in window) {
-      requestIdleCallback(updateStatus, { timeout: 2000 });
-    } else {
-      // Fallback to setTimeout to run in next tick
-      setTimeout(updateStatus, 0);
-    }
-  }, 10000);
-}
-
 // Initialize on load
-// Always initialize both video player and map
-initializeMap();
+udpLog('INFO', 'PAGE', 'Page loaded, initializing HLS player');
+udpLog('INFO', 'PAGE', 'User Agent: ' + navigator.userAgent);
 initHLS();
 startConnectionMonitor();
 statsInterval = setInterval(updateStats, 200);
-
-// Start optimized status polling
-console.log('Starting optimized status polling - will poll every 10 seconds during idle time');
-startStatusPolling();
+udpLog('INFO', 'PAGE', 'Initialization complete');
 
 // Cleanup on page unload
 window.addEventListener('beforeunload', function() {
@@ -571,10 +524,4 @@ window.addEventListener('beforeunload', function() {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   if (statsInterval) clearInterval(statsInterval);
   if (connectionCheckInterval) clearInterval(connectionCheckInterval);
-  if (statusPollInterval) clearInterval(statusPollInterval);
-  if (statusAbortController) statusAbortController.abort();
-  if (statusWorker) {
-    statusWorker.postMessage({ command: 'stop' });
-    statusWorker.terminate();
-  }
 });

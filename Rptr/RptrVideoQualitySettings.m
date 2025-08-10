@@ -47,21 +47,23 @@
     _modeName = @"Reliable";
     _modeDescription = @"Optimized for poor network conditions";
     
-    // HLS Segment Settings - Longer segments for reliability
-    _segmentDuration = 4.0;          // 4 second segments
-    _targetDuration = 5;             // Max segment duration
+    // HLS Segment Settings - 1 second for browser compatibility
+    _segmentDuration = 1.0;          // Target: 1 second segments (optimal for browsers)
+    _segmentMinDuration = 0.5;       // Min: Half of target (prevents micro-segments)
+    _segmentMaxDuration = 1.5;       // Max: 1.5x target (force rotation)
+    _targetDuration = 6;             // Playlist target duration (Apple recommendation)
     _maxSegments = 20;               // 80 seconds of buffer
     _playlistWindow = 6;             // 24 seconds window
-    _segmentTimerOffset = 0.5;       // Fire timer early
-    _segmentRotationDelay = 0.5;     // Additional safety margin
+    _segmentTimerOffset = 0.2;       // Start checking at 0.8s (target - offset)
+    _segmentRotationDelay = 0.5;     // Max 0.5s wait for keyframe after target
     
     // Video Settings - Lower quality for reliability
     _videoBitrate = 600000;          // 600 kbps
     _videoWidth = 960;               // qHD width
     _videoHeight = 540;              // qHD height
     _videoFrameRate = 15;            // 15 fps (keep low for reliability)
-    _videoKeyFrameInterval = 30;     // Every 2 seconds at 15fps
-    _videoKeyFrameDuration = 2.0;    // 2 second keyframe interval
+    _videoKeyFrameInterval = 15;     // Every 1 second at 15fps (aligned with segments)
+    _videoKeyFrameDuration = 1.0;    // 1 second keyframe interval (critical for segments)
     _videoQuality = 0.75;            // 75% quality
     _sessionPreset = AVCaptureSessionPresetHigh;
     
@@ -84,21 +86,23 @@
     _modeName = @"Real-time";
     _modeDescription = @"Low latency for good networks";
     
-    // HLS Segment Settings - Optimized for stability with low latency
-    _segmentDuration = 2.0;          // 2 second segments (better balance)
-    _targetDuration = 3;             // Max segment duration
+    // HLS Segment Settings - 1 second for browser compatibility
+    _segmentDuration = 1.0;          // Target: 1 second segments (optimal for browsers)
+    _segmentMinDuration = 0.5;       // Min: Half of target (prevents micro-segments)
+    _segmentMaxDuration = 1.5;       // Max: 1.5x target (force rotation)
+    _targetDuration = 3;             // Playlist target duration
     _maxSegments = 6;                // 12 seconds of buffer
     _playlistWindow = 3;             // 6 seconds window (3 segments)
-    _segmentTimerOffset = 0.3;       // More buffer time for network jitter
-    _segmentRotationDelay = 0.3;     // More time to wait for keyframe
+    _segmentTimerOffset = 0.2;       // Start checking at 0.8s (target - offset)
+    _segmentRotationDelay = 0.5;     // Max 0.5s wait for keyframe after target
     
     // Video Settings - Balanced for real-time streaming
     _videoBitrate = 1200000;         // 1.2 Mbps (reduced bitrate with 24fps)
     _videoWidth = 1280;              // HD width
     _videoHeight = 720;              // HD height
     _videoFrameRate = 24;            // 24 fps (cinema standard, saves bandwidth)
-    _videoKeyFrameInterval = 48;     // Every 2 seconds at 24fps (optimal)
-    _videoKeyFrameDuration = 2.0;    // 2 second keyframe interval
+    _videoKeyFrameInterval = 24;     // Every 1 second at 24fps (aligned with segments)
+    _videoKeyFrameDuration = 1.0;    // 1 second keyframe interval (critical for segments)
     _videoQuality = 0.85;            // 85% quality (slightly reduced)
     _sessionPreset = AVCaptureSessionPreset1280x720;
     

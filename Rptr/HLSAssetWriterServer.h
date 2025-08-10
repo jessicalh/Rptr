@@ -198,6 +198,12 @@ NS_ASSUME_NONNULL_BEGIN
  */
 - (void)updateQualitySettings:(RptrVideoQualitySettings *)settings;
 
+/**
+ * Clean up old segments to free memory
+ * Called automatically but can be triggered manually under memory pressure
+ */
+- (void)cleanupOldSegments;
+
 @end
 
 NS_ASSUME_NONNULL_END

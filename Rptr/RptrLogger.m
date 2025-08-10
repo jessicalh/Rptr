@@ -6,6 +6,7 @@
 //
 
 #import "RptrLogger.h"
+#import "RptrUDPLogger.h"
 
 @implementation RptrLogger
 
@@ -33,29 +34,12 @@ static RptrLogLevel _currentLogLevel = RPTR_CURRENT_LOG_LEVEL;
 // Helper to get module name from area
 + (NSString *)moduleNameForArea:(RptrLogArea)area {
     // Return first matching area for simplicity
-    if (area & RptrLogAreaHLS) return @"HLS";
-    if (area & RptrLogAreaVideo) return @"VIDEO";
-    if (area & RptrLogAreaAudio) return @"AUDIO";
-    if (area & RptrLogAreaNetwork) return @"NET";
-    if (area & RptrLogAreaUI) return @"UI";
-    if (area & RptrLogAreaPermission) return @"PERM";
-    if (area & RptrLogAreaCamera) return @"CAM";
-    if (area & RptrLogAreaSegment) return @"SEG";
-    if (area & RptrLogAreaBuffer) return @"BUF";
-    if (area & RptrLogAreaPlayback) return @"PLAY";
-    if (area & RptrLogAreaTiming) return @"TIME";
-    if (area & RptrLogAreaMemory) return @"MEM";
-    if (area & RptrLogAreaFile) return @"FILE";
-    if (area & RptrLogAreaHTTP) return @"HTTP";
+    if (area & RptrLogAreaProtocol) return @"HLS";
+    if (area & RptrLogAreaStartup) return @"INIT";
+    if (area & RptrLogAreaANR) return @"ANR";
+    if (area & RptrLogAreaInfo) return @"INFO";
     if (area & RptrLogAreaError) return @"ERROR";
-    if (area & RptrLogAreaDebug) return @"DEBUG";
-    if (area & RptrLogAreaAssetWriter) return @"WRITER";
-    if (area & RptrLogAreaLocation) return @"LOC";
-    if (area & RptrLogAreaSession) return @"SESSION";
-    if (area & RptrLogAreaDelegate) return @"DELEGATE";
-    if (area & RptrLogAreaLifecycle) return @"LIFECYCLE";
-    if (area & RptrLogAreaPerformance) return @"PERF";
-    return @"UNKNOWN";
+    return @"";
 }
 
 + (BOOL)isAreaActive:(RptrLogArea)area {
@@ -123,8 +107,19 @@ static RptrLogLevel _currentLogLevel = RPTR_CURRENT_LOG_LEVEL;
     
     NSString *module = [self moduleNameForArea:area];
     
-    // Use NSLog for output - this could be replaced with a more sophisticated system later
-    NSLog(@"[%@-%@] %@", module, levelString, message);
+    // Add timestamp for better tracing
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"HH:mm:ss.SSS"];
+    NSString *timestamp = [formatter stringFromDate:[NSDate date]];
+    
+    // Format the log message
+    NSString *formattedMessage = [NSString stringWithFormat:@"[%@-%@] %@", module, levelString, message];
+    
+    // Send to UDP logger (non-blocking)
+    [[RptrUDPLogger sharedLogger] logWithSource:@"SERVER" message:formattedMessage];
+    
+    // Also log to console for debugging
+    NSLog(@"[%@] %@", timestamp, formattedMessage);
 #endif
 }
 
@@ -156,50 +151,61 @@ static RptrLogLevel _currentLogLevel = RPTR_CURRENT_LOG_LEVEL;
             break;
     }
     
-    // Use NSLog for output - this could be replaced with a more sophisticated system later
-    NSLog(@"[%@-%@] %@", module, levelString, message);
+    // Add timestamp for better tracing
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"HH:mm:ss.SSS"];
+    NSString *timestamp = [formatter stringFromDate:[NSDate date]];
+    
+    // Format the log message
+    NSString *formattedMessage = [NSString stringWithFormat:@"[%@-%@] %@", module, levelString, message];
+    
+    // Send to UDP logger (non-blocking)
+    [[RptrUDPLogger sharedLogger] logWithSource:@"SERVER" message:formattedMessage];
+    
+    // Also log to console for debugging
+    NSLog(@"[%@] %@", timestamp, formattedMessage);
 #endif
 }
 
 + (void)logHLS:(NSString *)format, ... {
     va_list args;
     va_start(args, format);
-    [self logWithArea:RptrLogAreaHLS level:RptrLogLevelInfo format:format arguments:args];
+    [self logWithArea:RptrLogAreaProtocol level:RptrLogLevelInfo format:format arguments:args];
     va_end(args);
 }
 
 + (void)logVideo:(NSString *)format, ... {
     va_list args;
     va_start(args, format);
-    [self logWithArea:RptrLogAreaVideo level:RptrLogLevelInfo format:format arguments:args];
+    [self logWithArea:RptrLogAreaInfo level:RptrLogLevelInfo format:format arguments:args];
     va_end(args);
 }
 
 + (void)logNetwork:(NSString *)format, ... {
     va_list args;
     va_start(args, format);
-    [self logWithArea:RptrLogAreaNetwork level:RptrLogLevelInfo format:format arguments:args];
+    [self logWithArea:RptrLogAreaInfo level:RptrLogLevelInfo format:format arguments:args];
     va_end(args);
 }
 
 + (void)logUI:(NSString *)format, ... {
     va_list args;
     va_start(args, format);
-    [self logWithArea:RptrLogAreaUI level:RptrLogLevelInfo format:format arguments:args];
+    [self logWithArea:RptrLogAreaInfo level:RptrLogLevelInfo format:format arguments:args];
     va_end(args);
 }
 
 + (void)logPermission:(NSString *)format, ... {
     va_list args;
     va_start(args, format);
-    [self logWithArea:RptrLogAreaPermission level:RptrLogLevelInfo format:format arguments:args];
+    [self logWithArea:RptrLogAreaStartup level:RptrLogLevelInfo format:format arguments:args];
     va_end(args);
 }
 
 + (void)logDebug:(NSString *)format, ... {
     va_list args;
     va_start(args, format);
-    [self logWithArea:RptrLogAreaDebug level:RptrLogLevelDebug format:format arguments:args];
+    [self logWithArea:RptrLogAreaInfo level:RptrLogLevelDebug format:format arguments:args];
     va_end(args);
 }
 
@@ -243,7 +249,7 @@ static RptrLogLevel _currentLogLevel = RPTR_CURRENT_LOG_LEVEL;
     // Performance logging uses timing area
     va_list args;
     va_start(args, format);
-    [self logWithArea:RptrLogAreaTiming level:RptrLogLevelDebug format:format arguments:args];
+    [self logWithArea:RptrLogAreaANR level:RptrLogLevelDebug format:format arguments:args];
     va_end(args);
 }
 

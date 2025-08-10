@@ -10,36 +10,29 @@
 // Master logging switch - set to 0 to disable ALL logging
 #define RPTR_LOGGING_ENABLED 1
 
-// Log Area Bitmasks - can be combined for fine-grained control
+// Simplified log areas for focused debugging
 typedef NS_OPTIONS(NSUInteger, RptrLogArea) {
     RptrLogAreaNone         = 0,
-    RptrLogAreaHLS          = 1 << 0,  // 0x0001 - HLS streaming
-    RptrLogAreaVideo        = 1 << 1,  // 0x0002 - Video capture/processing
-    RptrLogAreaAudio        = 1 << 2,  // 0x0004 - Audio capture/processing
-    RptrLogAreaNetwork      = 1 << 3,  // 0x0008 - Network operations
-    RptrLogAreaUI           = 1 << 4,  // 0x0010 - UI interactions
-    RptrLogAreaPermission   = 1 << 5,  // 0x0020 - Permission handling
-    RptrLogAreaCamera       = 1 << 6,  // 0x0040 - Camera operations
-    RptrLogAreaSegment      = 1 << 7,  // 0x0080 - Segment management
-    RptrLogAreaBuffer       = 1 << 8,  // 0x0100 - Buffer operations
-    RptrLogAreaPlayback     = 1 << 9,  // 0x0200 - Playback issues
-    RptrLogAreaTiming       = 1 << 10, // 0x0400 - Timing/sync issues
-    RptrLogAreaMemory       = 1 << 11, // 0x0800 - Memory management
-    RptrLogAreaFile         = 1 << 12, // 0x1000 - File operations
-    RptrLogAreaHTTP         = 1 << 13, // 0x2000 - HTTP server
-    RptrLogAreaError        = 1 << 14, // 0x4000 - Errors (always enabled)
-    RptrLogAreaDebug        = 1 << 15, // 0x8000 - Debug info
-    RptrLogAreaAssetWriter  = 1 << 16, // 0x10000 - AVAssetWriter operations
-    RptrLogAreaLocation     = 1 << 17, // 0x20000 - Location services
-    RptrLogAreaSession      = 1 << 18, // 0x40000 - AVCaptureSession management
-    RptrLogAreaDelegate     = 1 << 19, // 0x80000 - Delegate callbacks
-    RptrLogAreaLifecycle    = 1 << 20, // 0x100000 - App lifecycle events
-    RptrLogAreaPerformance  = 1 << 21, // 0x200000 - Performance metrics
-    RptrLogAreaAll          = 0x3FFFFF  // All areas
+    RptrLogAreaProtocol     = 1 << 0,  // HLS protocol: segments, playlists, HTTP requests/responses
+    RptrLogAreaStartup      = 1 << 1,  // App startup and initialization  
+    RptrLogAreaANR          = 1 << 2,  // ANR debugging: blocking operations, delays
+    RptrLogAreaInfo         = 1 << 3,  // General info messages
+    RptrLogAreaError        = 1 << 4,  // Errors (always enabled when logging)
+    RptrLogAreaVideoParams  = 1 << 5,  // Verbose video parameter logging (compressionProperties, etc)
+    RptrLogAreaDIY          = 1 << 6,  // DIY HLS implementation logging
+    RptrLogAreaAll          = 0x7F      // All areas (updated to include DIY)
 };
 
-// Active log areas - modify this to control what gets logged
-#define RPTR_ACTIVE_LOG_AREAS (RptrLogAreaError)
+// Preset configurations for common debugging scenarios
+#define RPTR_LOG_PROTOCOL_ONLY (RptrLogAreaProtocol | RptrLogAreaError)
+#define RPTR_LOG_STARTUP_DEBUG (RptrLogAreaStartup | RptrLogAreaANR | RptrLogAreaError)
+#define RPTR_LOG_NORMAL (RptrLogAreaInfo | RptrLogAreaError)
+#define RPTR_LOG_VERBOSE RptrLogAreaAll
+#define RPTR_LOG_PROTOCOL_WITH_VIDEO (RptrLogAreaProtocol | RptrLogAreaError | RptrLogAreaVideoParams)
+#define RPTR_LOG_DIY_DEBUG (RptrLogAreaDIY | RptrLogAreaProtocol | RptrLogAreaError)
+
+// Active log areas - change this to control what gets logged
+#define RPTR_ACTIVE_LOG_AREAS RPTR_LOG_DIY_DEBUG
 
 // Log levels
 typedef NS_ENUM(NSInteger, RptrLogLevel) {
@@ -51,7 +44,7 @@ typedef NS_ENUM(NSInteger, RptrLogLevel) {
 };
 
 // Current log level - only messages at this level or lower will be logged
-#define RPTR_CURRENT_LOG_LEVEL RptrLogLevelError
+#define RPTR_CURRENT_LOG_LEVEL RptrLogLevelInfo
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -98,14 +91,15 @@ NS_ASSUME_NONNULL_BEGIN
     #define RLogLevel(area, level, ...) ((void)0)
 #endif
 
-// Legacy convenience macros (now use bitmask internally)
+// Legacy convenience macros - now map to new areas
 #if RPTR_LOGGING_ENABLED
-    #define RLogHLS(...) [RptrLogger log:RptrLogAreaHLS format:__VA_ARGS__]
-    #define RLogVideo(...) [RptrLogger log:RptrLogAreaVideo format:__VA_ARGS__]
-    #define RLogNetwork(...) [RptrLogger log:RptrLogAreaNetwork format:__VA_ARGS__]
-    #define RLogUI(...) [RptrLogger log:RptrLogAreaUI format:__VA_ARGS__]
-    #define RLogPermission(...) [RptrLogger log:RptrLogAreaPermission format:__VA_ARGS__]
-    #define RLogDebug(...) [RptrLogger log:RptrLogAreaDebug format:__VA_ARGS__]
+    #define RLogHLS(...) [RptrLogger log:RptrLogAreaProtocol format:__VA_ARGS__]
+    #define RLogVideo(...) [RptrLogger log:RptrLogAreaInfo format:__VA_ARGS__]
+    #define RLogNetwork(...) [RptrLogger log:RptrLogAreaInfo format:__VA_ARGS__]
+    #define RLogUI(...) [RptrLogger log:RptrLogAreaInfo format:__VA_ARGS__]
+    #define RLogPermission(...) [RptrLogger log:RptrLogAreaStartup format:__VA_ARGS__]
+    #define RLogDebug(...) [RptrLogger log:RptrLogAreaInfo format:__VA_ARGS__]
+    #define RLogDIY(...) [RptrLogger log:RptrLogAreaDIY format:__VA_ARGS__]
 #else
     #define RLogHLS(...) ((void)0)
     #define RLogVideo(...) ((void)0)

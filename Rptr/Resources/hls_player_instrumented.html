@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Rptr Live Stream - Instrumented</title>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<style>
+body { 
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; 
+    margin: 0; 
+    background: #000; 
+    display: flex; 
+    flex-direction: column; 
+    height: 100vh; 
+}
+.header { 
+    background: #1e3a8a; 
+    color: white; 
+    padding: 10px 20px; 
+}
+.header h2 { 
+    margin: 0; 
+    font-size: 20px; 
+}
+.video-container { 
+    flex: 1; 
+    display: flex; 
+    align-items: center; 
+    justify-content: center; 
+    position: relative;
+}
+video { 
+    width: 100%; 
+    max-width: 100%; 
+    height: auto; 
+    background: #000; 
+}
+.status { 
+    position: absolute; 
+    top: 10px; 
+    left: 10px; 
+    color: white; 
+    background: rgba(0,0,0,0.7); 
+    padding: 5px 10px; 
+    border-radius: 4px; 
+    font-size: 14px; 
+    z-index: 10;
+}
+.error { background: rgba(220, 53, 69, 0.9); }
+.success { background: rgba(76, 175, 80, 0.9); }
+.warning { background: rgba(255, 193, 7, 0.9); }
+.debug-panel {
+    position: absolute;
+    bottom: 10px;
+    left: 10px;
+    right: 10px;
+    background: rgba(0,0,0,0.8);
+    color: #0f0;
+    font-family: monospace;
+    font-size: 11px;
+    padding: 10px;
+    max-height: 200px;
+    overflow-y: auto;
+    z-index: 10;
+    border: 1px solid #333;
+    border-radius: 4px;
+}
+.debug-line {
+    margin: 2px 0;
+    white-space: pre-wrap;
+}
+.debug-error { color: #f44; }
+.debug-warn { color: #fa0; }
+.debug-info { color: #0af; }
+.debug-success { color: #0f0; }
+</style>
+</head>
+<body>
+<div class='header'>
+<h2>Rptr Live Stream - Instrumented Debug</h2>
+</div>
+<div class='video-container'>
+<video id='video' controls autoplay playsinline></video>
+<div class='status' id='status'>Initializing...</div>
+<div class='debug-panel' id='debugPanel'></div>
+</div>
+
+<script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>
+<script>
+// UDP Logger Implementation
+class UDPLogger {
+    constructor() {
+        // Get the UDP server IP from the iOS app's IP (same network)
+        // The UDP server runs on the build machine
+        this.serverIP = window.location.hostname; // iOS device IP
+        this.serverPort = 9999;
+        this.enabled = true;
+        this.ws = null;
+        
+        this.initWebSocket();
+    }
+    
+    initWebSocket() {
+        // Since browsers can't send UDP directly, we need to use WebSockets
+        // The iOS app should have a WebSocket server that forwards to UDP
+        // OR we can use XMLHttpRequest to send to the iOS app which forwards to UDP
+        
+        // For now, we'll try to send to the build machine's IP directly
+        // The UDP server IP should be the same network as the iOS device
+        
+        // Common build machine IPs (you may need to adjust based on your network)
+        const buildMachineIPs = [
+            window.location.hostname.replace(/\.\d+$/, '.1'), // Router/build machine often .1
+            window.location.hostname.replace(/\.\d+$/, '.2'), // Sometimes .2
+            '172.20.10.2', // Common Mac hotspot build machine
+            '192.168.1.100', // Common home network
+        ];
+        
+        // We'll use a simple HTTP endpoint on the iOS app to forward to UDP
+        this.log('INFO', 'UDP', `Logger initialized - will forward through iOS app at ${this.serverIP}`);
+    }
+    
+    log(level, module, message) {
+        // Format for UDP server: SOURCE|MESSAGE
+        const formattedMessage = `JS|[${level}] [${module}] ${message}`;
+        
+        // Also log to console
+        console.log(`[${level}] [${module}] ${message}`);
+        
+        // Add to debug panel
+        this.addToDebugPanel(level, module, message);
+        
+        if (this.enabled) {
+            this.sendToUDP(formattedMessage);
+        }
+    }
+    
+    sendToUDP(message) {
+        // We need the iOS app to forward our logs to the UDP server
+        // The iOS app should expose an endpoint for this
+        
+        // Using XMLHttpRequest for better compatibility
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `http://${this.serverIP}:8080/forward-log`, true);
+        xhr.setRequestHeader('Content-Type', 'text/plain');
+        xhr.send(message);
+        
+        // We don't wait for response to avoid blocking
+    }
+    
+    addToDebugPanel(level, module, message) {
+        const panel = document.getElementById('debugPanel');
+        if (!panel) return;
+        
+        const line = document.createElement('div');
+        line.className = 'debug-line';
+        
+        const timestamp = new Date().toLocaleTimeString();
+        const colorClass = {
+            'ERROR': 'debug-error',
+            'WARN': 'debug-warn',
+            'INFO': 'debug-info',
+            'DEBUG': 'debug-success'
+        }[level] || '';
+        
+        line.innerHTML = `<span class="${colorClass}">[${timestamp}] [${module}] ${message}</span>`;
+        panel.appendChild(line);
+        
+        // Keep only last 100 lines
+        while (panel.children.length > 100) {
+            panel.removeChild(panel.firstChild);
+        }
+        
+        // Auto-scroll to bottom
+        panel.scrollTop = panel.scrollHeight;
+    }
+}
+
+// Initialize logger
+const logger = new UDPLogger();
+
+// Get video element and status
+var video = document.getElementById('video');
+var status = document.getElementById('status');
+var videoSrc = window.location.pathname.replace('/view/', '/stream/') + '/playlist.m3u8';
+
+logger.log('INFO', 'PLAYER', 'Starting instrumented HLS.js player');
+logger.log('INFO', 'PLAYER', `Stream URL: ${videoSrc}`);
+logger.log('INFO', 'PLAYER', `HLS.js version: ${Hls.version}`);
+
+// Update status helper
+function updateStatus(text, className = 'status') {
+    status.textContent = text;
+    status.className = className;
+    logger.log('INFO', 'STATUS', text);
+}
+
+if (Hls.isSupported()) {
+    logger.log('INFO', 'PLAYER', 'HLS.js is supported');
+    
+    var hls = new Hls({
+        debug: true,
+        enableWorker: true,
+        lowLatencyMode: false,
+        backBufferLength: 90,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 600,
+        maxBufferSize: 60 * 1000 * 1000,
+        maxBufferHole: 0.5,
+        startLevel: -1,
+        autoStartLoad: true,
+        startPosition: -1,
+        defaultAudioCodec: undefined,
+        fragLoadingTimeOut: 20000,
+        fragLoadingMaxRetry: 6,
+        fragLoadingRetryDelay: 1000,
+        fragLoadingMaxRetryTimeout: 64000,
+        startFragPrefetch: false,
+        testBandwidth: true,
+        progressive: false,
+        lowLatencyMode: false
+    });
+    
+    // Detailed event logging
+    hls.on(Hls.Events.MEDIA_ATTACHING, function(event, data) {
+        logger.log('DEBUG', 'HLS', 'Media attaching');
+    });
+    
+    hls.on(Hls.Events.MEDIA_ATTACHED, function(event, data) {
+        logger.log('DEBUG', 'HLS', 'Media attached');
+    });
+    
+    hls.on(Hls.Events.MANIFEST_LOADING, function(event, data) {
+        logger.log('INFO', 'HLS', `Loading manifest: ${data.url}`);
+        updateStatus('Loading manifest...', 'status warning');
+    });
+    
+    hls.on(Hls.Events.MANIFEST_LOADED, function(event, data) {
+        logger.log('INFO', 'HLS', `Manifest loaded: ${data.levels.length} levels, ${data.audioTracks.length} audio tracks`);
+        logger.log('DEBUG', 'HLS', `Live: ${data.live}, Duration: ${data.totalduration}`);
+        updateStatus('Manifest loaded', 'status warning');
+    });
+    
+    hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
+        logger.log('INFO', 'HLS', `Manifest parsed: ${data.levels.length} quality levels`);
+        data.levels.forEach((level, index) => {
+            logger.log('DEBUG', 'HLS', `Level ${index}: ${level.width}x${level.height} @ ${level.bitrate}bps`);
+            logger.log('DEBUG', 'HLS', `Level ${index} details: videoCodec=${level.videoCodec}, audioCodec=${level.audioCodec}`);
+        });
+        
+        // Check if MediaSource is actually supported
+        if (window.MediaSource) {
+            logger.log('INFO', 'MSE', `MediaSource supported, isTypeSupported('video/mp4')=${MediaSource.isTypeSupported('video/mp4')}`);
+            logger.log('INFO', 'MSE', `isTypeSupported('video/mp4; codecs="avc1.42E01E"')=${MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"')}`);
+        } else {
+            logger.log('ERROR', 'MSE', 'MediaSource not supported!');
+        }
+        
+        updateStatus('Connected', 'status success');
+        
+        video.play().catch(function(e) {
+            logger.log('WARN', 'PLAYER', `Autoplay prevented: ${e.message}`);
+            updateStatus('Click to play', 'status warning');
+        });
+    });
+    
+    hls.on(Hls.Events.LEVEL_LOADING, function(event, data) {
+        logger.log('DEBUG', 'HLS', `Loading level ${data.level}: ${data.url}`);
+    });
+    
+    hls.on(Hls.Events.LEVEL_LOADED, function(event, data) {
+        logger.log('DEBUG', 'HLS', `Level ${data.level} loaded: ${data.details.fragments.length} fragments`);
+    });
+    
+    hls.on(Hls.Events.LEVEL_SWITCHING, function(event, data) {
+        logger.log('INFO', 'HLS', `Switching to level ${data.level}`);
+    });
+    
+    hls.on(Hls.Events.FRAG_LOADING, function(event, data) {
+        logger.log('DEBUG', 'FRAG', `Loading fragment ${data.frag.sn}: ${data.frag.url}`);
+    });
+    
+    hls.on(Hls.Events.FRAG_LOAD_PROGRESS, function(event, data) {
+        const percent = Math.round((data.frag.loaded / data.frag.total) * 100);
+        logger.log('DEBUG', 'FRAG', `Fragment ${data.frag.sn} progress: ${percent}%`);
+    });
+    
+    hls.on(Hls.Events.FRAG_LOADED, function(event, data) {
+        logger.log('INFO', 'FRAG', `Fragment ${data.frag.sn} loaded: ${data.frag.loaded} bytes, ${data.networkDetails.requestTime}ms`);
+    });
+    
+    hls.on(Hls.Events.FRAG_PARSING_INIT_SEGMENT, function(event, data) {
+        logger.log('INFO', 'PARSE', 'Parsing init segment');
+        if (data.tracks) {
+            if (data.tracks.video) {
+                const v = data.tracks.video;
+                logger.log('INFO', 'PARSE', `Video track: ${v.codec}, ${v.width}x${v.height}`);
+                logger.log('DEBUG', 'PARSE', `Video details: container=${v.container}, codec=${v.codec}, initData length=${v.initData ? v.initData.length : 0}`);
+            }
+            if (data.tracks.audio) {
+                const a = data.tracks.audio;
+                logger.log('INFO', 'PARSE', `Audio track: ${a.codec}, ${a.samplerate}Hz`);
+            }
+        }
+    });
+    
+    hls.on(Hls.Events.FRAG_PARSING_DATA, function(event, data) {
+        logger.log('DEBUG', 'PARSE', `Parsing ${data.type} data: ${data.nb} samples, pts: ${data.startPTS}-${data.endPTS}`);
+    });
+    
+    hls.on(Hls.Events.FRAG_PARSED, function(event, data) {
+        logger.log('DEBUG', 'PARSE', `Fragment ${data.frag.sn} parsed`);
+    });
+    
+    hls.on(Hls.Events.FRAG_BUFFERED, function(event, data) {
+        logger.log('DEBUG', 'BUFFER', `Fragment ${data.frag.sn} buffered`);
+    });
+    
+    hls.on(Hls.Events.BUFFER_APPENDING, function(event, data) {
+        logger.log('DEBUG', 'BUFFER', `Appending ${data.type} buffer: ${data.data.byteLength} bytes`);
+        // Check first few bytes to detect format
+        if (data.data && data.data.byteLength > 16) {
+            const uint8Array = new Uint8Array(data.data, 0, 16);
+            const hex = Array.from(uint8Array, b => b.toString(16).padStart(2, '0')).join(' ');
+            logger.log('DEBUG', 'BUFFER', `First 16 bytes: ${hex}`);
+        }
+    });
+    
+    hls.on(Hls.Events.BUFFER_APPENDED, function(event, data) {
+        logger.log('DEBUG', 'BUFFER', `Buffer appended: ${data.timeRanges.start(0)}-${data.timeRanges.end(0)}`);
+    });
+    
+    hls.on(Hls.Events.BUFFER_CODECS, function(event, data) {
+        logger.log('INFO', 'CODEC', `Buffer codecs - video: ${data.video}, audio: ${data.audio}`);
+    });
+    
+    hls.on(Hls.Events.BUFFER_EOS, function(event, data) {
+        logger.log('INFO', 'BUFFER', 'End of stream reached');
+    });
+    
+    hls.on(Hls.Events.BUFFER_FLUSHING, function(event, data) {
+        logger.log('WARN', 'BUFFER', `Flushing buffer: ${data.startOffset}-${data.endOffset}`);
+    });
+    
+    hls.on(Hls.Events.ERROR, function(event, data) {
+        logger.log('ERROR', 'HLS', `Error: Type=${data.type}, Details=${data.details}, Fatal=${data.fatal}`);
+        
+        if (data.response) {
+            logger.log('ERROR', 'HLS', `Response: ${data.response.code} ${data.response.text}`);
+        }
+        
+        if (data.frag) {
+            logger.log('ERROR', 'HLS', `Fragment: ${data.frag.sn} ${data.frag.url}`);
+        }
+        
+        if (data.fatal) {
+            switch(data.type) {
+                case Hls.ErrorTypes.NETWORK_ERROR:
+                    logger.log('ERROR', 'HLS', 'Fatal network error, attempting recovery');
+                    updateStatus('Network error', 'status error');
+                    hls.startLoad();
+                    break;
+                case Hls.ErrorTypes.MEDIA_ERROR:
+                    logger.log('ERROR', 'HLS', 'Fatal media error, attempting recovery');
+                    updateStatus('Media error', 'status error');
+                    hls.recoverMediaError();
+                    break;
+                default:
+                    logger.log('ERROR', 'HLS', 'Fatal error, cannot recover');
+                    updateStatus('Fatal error', 'status error');
+                    hls.destroy();
+                    break;
+            }
+        }
+    });
+    
+    // Video element events
+    video.addEventListener('loadstart', function() {
+        logger.log('DEBUG', 'VIDEO', 'Load start');
+    });
+    
+    video.addEventListener('loadedmetadata', function() {
+        logger.log('INFO', 'VIDEO', `Metadata loaded: ${video.videoWidth}x${video.videoHeight}, duration: ${video.duration}`);
+    });
+    
+    video.addEventListener('loadeddata', function() {
+        logger.log('DEBUG', 'VIDEO', 'Data loaded');
+    });
+    
+    video.addEventListener('canplay', function() {
+        logger.log('INFO', 'VIDEO', 'Can play');
+    });
+    
+    video.addEventListener('canplaythrough', function() {
+        logger.log('INFO', 'VIDEO', 'Can play through');
+    });
+    
+    video.addEventListener('playing', function() {
+        logger.log('INFO', 'VIDEO', 'Playing');
+        updateStatus('Playing', 'status success');
+    });
+    
+    video.addEventListener('waiting', function() {
+        logger.log('WARN', 'VIDEO', 'Waiting for data');
+        updateStatus('Buffering...', 'status warning');
+    });
+    
+    video.addEventListener('seeking', function() {
+        logger.log('DEBUG', 'VIDEO', `Seeking to ${video.currentTime}`);
+    });
+    
+    video.addEventListener('seeked', function() {
+        logger.log('DEBUG', 'VIDEO', `Seeked to ${video.currentTime}`);
+    });
+    
+    video.addEventListener('ended', function() {
+        logger.log('INFO', 'VIDEO', 'Playback ended');
+        updateStatus('Stream ended', 'status');
+    });
+    
+    video.addEventListener('error', function(e) {
+        const error = video.error;
+        logger.log('ERROR', 'VIDEO', `Video error: ${error.code} ${error.message}`);
+        updateStatus(`Video error: ${error.code}`, 'status error');
+    });
+    
+    video.addEventListener('stalled', function() {
+        logger.log('WARN', 'VIDEO', 'Playback stalled');
+        updateStatus('Stalled', 'status warning');
+    });
+    
+    video.addEventListener('suspend', function() {
+        logger.log('DEBUG', 'VIDEO', 'Data loading suspended');
+    });
+    
+    video.addEventListener('abort', function() {
+        logger.log('WARN', 'VIDEO', 'Playback aborted');
+    });
+    
+    video.addEventListener('emptied', function() {
+        logger.log('WARN', 'VIDEO', 'Media element emptied');
+    });
+    
+    // Monitor buffer status
+    setInterval(function() {
+        if (video.buffered.length > 0) {
+            const buffered = video.buffered.end(video.buffered.length - 1) - video.currentTime;
+            logger.log('DEBUG', 'BUFFER', `Buffered ahead: ${buffered.toFixed(2)}s, Current time: ${video.currentTime.toFixed(2)}s`);
+        }
+        
+        // Check HLS internals
+        if (hls.media) {
+            const stats = hls.levelController?.stats;
+            if (stats) {
+                logger.log('DEBUG', 'STATS', `Bandwidth: ${Math.round(stats.bwEstimate/1000)}kbps`);
+            }
+        }
+    }, 5000);
+    
+    // Load and attach
+    logger.log('INFO', 'HLS', 'Loading source and attaching media');
+    hls.loadSource(videoSrc);
+    hls.attachMedia(video);
+    
+} else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    logger.log('INFO', 'PLAYER', 'Using native HLS support');
+    video.src = videoSrc;
+    video.addEventListener('loadedmetadata', function() {
+        logger.log('INFO', 'NATIVE', 'Metadata loaded, starting playback');
+        updateStatus('Connected (native)', 'status success');
+        video.play().catch(function(e) {
+            logger.log('WARN', 'NATIVE', `Autoplay prevented: ${e.message}`);
+        });
+    });
+} else {
+    logger.log('ERROR', 'PLAYER', 'HLS not supported in this browser');
+    updateStatus('HLS not supported', 'status error');
+}
+
+// Log page visibility changes
+document.addEventListener('visibilitychange', function() {
+    logger.log('INFO', 'PAGE', `Visibility changed: ${document.hidden ? 'hidden' : 'visible'}`);
+});
+
+// Log network status
+window.addEventListener('online', function() {
+    logger.log('INFO', 'NETWORK', 'Connection restored');
+});
+
+window.addEventListener('offline', function() {
+    logger.log('ERROR', 'NETWORK', 'Connection lost');
+});
+
+</script>
+</body>
+</html>

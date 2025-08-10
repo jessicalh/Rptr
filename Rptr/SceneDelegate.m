@@ -16,13 +16,12 @@
 
 @implementation SceneDelegate
 
-
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
     // Use this method to optionally configure and attach the UIWindow `window` to the provided UIWindowScene `scene`.
     // If using a storyboard, the `window` property will automatically be initialized and attached to the scene.
     // This delegate does not imply the connecting scene or session are new (see `application:configurationForConnectingSceneSession` instead).
     
-    RLog(RptrLogAreaUI, @"SceneDelegate: Scene will connect to session");
+    RLog(RptrLogAreaInfo, @"SceneDelegate: Scene will connect to session");
     
     // Create window manually to ensure full screen
     if ([scene isKindOfClass:[UIWindowScene class]]) {
@@ -47,13 +46,13 @@
         self.window.rootViewController = rootViewController;
         
         // Log window hierarchy
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Window frame after creation: %@", NSStringFromCGRect(self.window.frame));
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Window bounds: %@", NSStringFromCGRect(self.window.bounds));
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"WindowScene bounds: %@", NSStringFromCGRect(windowScene.coordinateSpace.bounds));
+        RLog(RptrLogAreaInfo, @"Window frame after creation: %@", NSStringFromCGRect(self.window.frame));
+        RLog(RptrLogAreaInfo, @"Window bounds: %@", NSStringFromCGRect(self.window.bounds));
+        RLog(RptrLogAreaInfo, @"WindowScene bounds: %@", NSStringFromCGRect(windowScene.coordinateSpace.bounds));
         
         [self.window makeKeyAndVisible];
         
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Created window with frame: %@", NSStringFromCGRect(self.window.frame));
+        RLog(RptrLogAreaInfo, @"Created window with frame: %@", NSStringFromCGRect(self.window.frame));
         
         // Force window to be full screen
         self.window.windowLevel = UIWindowLevelNormal;
@@ -100,7 +99,7 @@
         if (self.window) {
             if ([scene isKindOfClass:[UIWindowScene class]]) {
                 UIWindowScene *windowScene = (UIWindowScene *)scene;
-                RLog(RptrLogAreaUI | RptrLogAreaDebug, @"SceneDelegate: Window scene bounds: %@", NSStringFromCGRect(windowScene.coordinateSpace.bounds));
+                RLog(RptrLogAreaInfo, @"SceneDelegate: Window scene bounds: %@", NSStringFromCGRect(windowScene.coordinateSpace.bounds));
                 
                 // Force window to fill screen
                 self.window.frame = windowScene.coordinateSpace.bounds;
@@ -109,15 +108,15 @@
                 }
                 
                 // Log interface orientation
-                RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Interface orientation: %ld", (long)windowScene.interfaceOrientation);
+                RLog(RptrLogAreaInfo, @"Interface orientation: %ld", (long)windowScene.interfaceOrientation);
             }
             
-            RLog(RptrLogAreaUI | RptrLogAreaDebug, @"SceneDelegate: Window exists - Frame: %@", NSStringFromCGRect(self.window.frame));
-            RLog(RptrLogAreaUI | RptrLogAreaDebug, @"SceneDelegate: Root view controller: %@", self.window.rootViewController);
-            RLog(RptrLogAreaUI | RptrLogAreaDebug, @"SceneDelegate: Window is key: %@", self.window.isKeyWindow ? @"YES" : @"NO");
-            RLog(RptrLogAreaUI | RptrLogAreaDebug, @"SceneDelegate: Window is visible: %@", self.window.isHidden ? @"NO" : @"YES");
+            RLog(RptrLogAreaInfo, @"SceneDelegate: Window exists - Frame: %@", NSStringFromCGRect(self.window.frame));
+            RLog(RptrLogAreaInfo, @"SceneDelegate: Root view controller: %@", self.window.rootViewController);
+            RLog(RptrLogAreaInfo, @"SceneDelegate: Window is key: %@", self.window.isKeyWindow ? @"YES" : @"NO");
+            RLog(RptrLogAreaInfo, @"SceneDelegate: Window is visible: %@", self.window.isHidden ? @"NO" : @"YES");
         } else {
-            RLog(RptrLogAreaUI | RptrLogAreaError, @"SceneDelegate: ERROR - Window is nil!");
+            RLog(RptrLogAreaError, @"SceneDelegate: ERROR - Window is nil!");
         }
     });
 }

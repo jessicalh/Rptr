@@ -29,7 +29,10 @@
 
 #import "HLSAssetWriterServer.h"
 #import "RptrLogger.h"
+#import "RptrUDPLogger.h"
 #import "RptrConstants.h"
+#import "RptrDiagnostics.h"
+#import "HLSSegmentObserver.h"
 #import <UIKit/UIKit.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -38,7 +41,16 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <errno.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#include <stdatomic.h>
+
+#pragma mark - Configuration
+
+// URL Generation - Always uses randomized paths for security
+// URLs:
+//   View: http://localhost:8080/view/{randomPath}
+//   Stream: http://localhost:8080/stream/{randomPath}/playlist.m3u8
 
 #pragma mark - Helper Classes
 
@@ -67,6 +79,7 @@
 @property (nonatomic, assign) NSInteger sequenceNumber; // Sequence number for playlist
 @property (nonatomic, strong) NSDate *createdAt;        // Creation timestamp for cleanup
 @property (nonatomic, assign) NSUInteger fileSize;      // Size in bytes for memory management
+@property (nonatomic, strong) NSString *segmentID;      // Unique ID for tracing segment lifecycle
 @end
 
 @implementation HLSSegmentInfo
@@ -97,7 +110,6 @@
 @property (nonatomic, strong) AVAssetWriterInput *audioInput;   // Audio input for AAC encoding
 @property (nonatomic, assign) BOOL isWriting;                   // Writer active state
 @property (nonatomic, assign) BOOL sessionStarted;              // Encoding session state
-@property (nonatomic, assign) BOOL isFinishingWriter;           // Prevents concurrent finalization
 
 #pragma mark - Segment Management Properties
 // HLS segment lifecycle management
@@ -115,20 +127,35 @@
 @property (nonatomic, strong) NSLock *segmentDataLock;          // Lock for segment data access
 @property (nonatomic, strong) dispatch_queue_t segmentDataQueue; // Concurrent queue for segment data
 @property (nonatomic, strong) dispatch_queue_t segmentsQueue;   // Concurrent queue for segment metadata
+@property (nonatomic, assign) BOOL hasGeneratedInitSegment;     // Track if init segment has been generated
+@property (nonatomic, strong) NSData *savedInitSegmentData;     // Preserved init segment for reuse
+@property (nonatomic, strong) NSDictionary *savedVideoSettings; // Preserved video settings for consistency
+@property (nonatomic, strong) NSDictionary *savedAudioSettings; // Preserved audio settings for consistency
 
 #pragma mark - Timing and Synchronization
 // Precise timing for segment boundaries
 @property (nonatomic, assign) CMTime nextSegmentBoundary;       // Next segment start time
 @property (nonatomic, assign) CMTime sessionStartTime;          // Encoding session start
 @property (nonatomic, strong) NSTimer *segmentTimer;            // Timer for segment rotation
+@property (nonatomic, strong) NSTimer *flushTimer;              // Timer for manual flush (Test 4)
 @property (nonatomic, assign) BOOL waitingForKeyFrame;          // Waiting for IDR frame
 @property (nonatomic, strong) NSDate *currentSegmentStartTime;  // Wall clock time for segment
-@property (nonatomic, assign) BOOL forceSegmentRotation;        // Force new segment flag
+@property (nonatomic, assign) BOOL isFinishing;                 // Currently finishing writer
+@property (nonatomic, assign) CMTime lastProcessedTime;         // Last processed frame timestamp
+@property (nonatomic, assign) CMTime originalSessionStartTime;  // Original session start for continuity
+
+#pragma mark - Frame Queue System
+// Queue frames during writer transitions to prevent drops
+@property (nonatomic, strong) NSMutableArray *pendingVideoFrames; // Queued video frames during transition
+@property (nonatomic, strong) NSMutableArray *pendingAudioFrames; // Queued audio frames during transition
+@property (nonatomic, assign) BOOL isTransitioning;             // Currently transitioning between writers
+@property (nonatomic, assign) BOOL hasRecentKeyframe;           // Detected keyframe recently
 
 #pragma mark - Performance Monitoring
 // Statistics and performance tracking
 @property (nonatomic, assign) NSInteger framesProcessed;        // Total frames encoded
 @property (nonatomic, assign) NSInteger framesDropped;          // Frames dropped due to timing
+@property (nonatomic, assign) NSInteger lastKeyframeNumber;     // Frame number of last keyframe for QoE tracking
 
 #pragma mark - Client Activity Tracking
 // Monitor active clients for cleanup
@@ -157,10 +184,8 @@
     if (self) {
         // Configure debug logging based on build configuration
         #ifdef DEBUG
-        [RptrLogger setActiveAreas:RptrLogAreaError | RptrLogAreaHLS | RptrLogAreaVideo | 
-                                  RptrLogAreaAudio | RptrLogAreaNetwork | RptrLogAreaSegment |
-                                  RptrLogAreaHTTP | RptrLogAreaAssetWriter | RptrLogAreaTiming];
-        [RptrLogger setLogLevel:RptrLogLevelDebug];
+        [RptrLogger setActiveAreas:RPTR_LOG_PROTOCOL_ONLY];
+        [RptrLogger setLogLevel:RptrLogLevelInfo];
         #endif
         
         // Initialize server configuration
@@ -187,7 +212,7 @@
         // Generate random path for basic URL obscurity
         // Not cryptographically secure - just prevents casual discovery
         _randomPath = [self generateRandomString:kRptrRandomPathLength];
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Generated randomized URL path: %@", _randomPath);
+        RLog(RptrLogAreaProtocol, @"Generated randomized URL path: %@", _randomPath);
         
         // Initialize default values
         _streamTitle = @"Share Stream";  // Default stream title
@@ -197,7 +222,15 @@
         _sessionStartTime = kCMTimeInvalid;
         _nextSegmentBoundary = kCMTimeZero;
         _sessionStarted = NO;
-        _isFinishingWriter = NO;
+        _isFinishing = NO;
+        
+        // Initialize frame queue system
+        _pendingVideoFrames = [NSMutableArray array];
+        _pendingAudioFrames = [NSMutableArray array];
+        _isTransitioning = NO;
+        _hasRecentKeyframe = NO;
+        _lastProcessedTime = kCMTimeInvalid;
+        _originalSessionStartTime = kCMTimeInvalid;
         
         // Initialize with default quality settings
         _qualitySettings = [RptrVideoQualitySettings reliableSettings];
@@ -239,7 +272,7 @@
                         error:&error];
     
     if (error) {
-        RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaError, @"Failed to create directories: %@", error);
+        RLog(RptrLogAreaError, @"Failed to create directories: %@", error);
     }
 }
 
@@ -261,66 +294,92 @@
  * @warning Server must be stopped before app termination
  */
 - (BOOL)startServer:(NSError * __autoreleasing *)error {
-    __block BOOL success = YES;
-    __block NSError *blockError = nil;
+    // Start new UDP logging session
+    [[RptrUDPLogger sharedLogger] startNewSession];
     
-    // Ignore SIGPIPE globally
+    // Capture timing for ANR diagnosis (lightweight, no logging)
+    CFAbsoluteTime startTime = CFAbsoluteTimeGetCurrent();
+    
+    // Ignore SIGPIPE globally (this can be done on main thread)
     signal(SIGPIPE, SIG_IGN);
-    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"SIGPIPE handler installed");
+    RLog(RptrLogAreaProtocol, @"SIGPIPE handler installed");
     
-    dispatch_sync(self.serverQueue, ^{
-        if (self.running) {
-            return;
+    // Quick check if already running
+    if (self.running) {
+        return YES;
+    }
+    
+    // Add memory barrier to ensure proper ordering (fixes race condition)
+    atomic_thread_fence(memory_order_seq_cst);
+    
+    // Create socket synchronously to check for errors immediately
+    self.serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (self.serverSocket < 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:kRptrErrorDomainHLSServer code:1 userInfo:@{NSLocalizedDescriptionKey: @"Failed to create socket"}];
         }
-        
-        // Create socket
-        self.serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-        if (self.serverSocket < 0) {
-            blockError = [NSError errorWithDomain:@"HLSServer" code:1 userInfo:@{NSLocalizedDescriptionKey: @"Failed to create socket"}];
-            success = NO;
-            return;
+        return NO;
+    }
+    
+    // Allow socket reuse
+    int yes = 1;
+    setsockopt(self.serverSocket, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    
+    // Set non-blocking mode to avoid ANR
+    int flags = fcntl(self.serverSocket, F_GETFL, 0);
+    fcntl(self.serverSocket, F_SETFL, flags | O_NONBLOCK);
+    
+    // Bind to port
+    struct sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons((uint16_t)self.port);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    
+    if (bind(self.serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0) {
+        close(self.serverSocket);
+        if (error) {
+            *error = [NSError errorWithDomain:kRptrErrorDomainHLSServer code:2 userInfo:@{NSLocalizedDescriptionKey: @"Failed to bind socket"}];
         }
-        
-        // Allow socket reuse
-        int yes = 1;
-        setsockopt(self.serverSocket, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-        
-        // Bind to port
-        struct sockaddr_in serverAddr;
-        memset(&serverAddr, 0, sizeof(serverAddr));
-        serverAddr.sin_family = AF_INET;
-        serverAddr.sin_port = htons((uint16_t)self.port);
-        serverAddr.sin_addr.s_addr = INADDR_ANY;
-        
-        if (bind(self.serverSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0) {
-            close(self.serverSocket);
-            blockError = [NSError errorWithDomain:@"HLSServer" code:2 userInfo:@{NSLocalizedDescriptionKey: @"Failed to bind socket"}];
-            success = NO;
-            return;
+        return NO;
+    }
+    
+    // Start listening
+    if (listen(self.serverSocket, 10) < 0) {
+        close(self.serverSocket);
+        if (error) {
+            *error = [NSError errorWithDomain:kRptrErrorDomainHLSServer code:3 userInfo:@{NSLocalizedDescriptionKey: @"Failed to listen"}];
         }
+        return NO;
+    }
+    
+    self.running = YES;
+    
+    // Execute server setup directly on the server queue to ensure proper sequencing
+    dispatch_async(self.serverQueue, ^{
+        // Diagnostic: Track if we're blocking main thread
+        CFAbsoluteTime acceptStartTime = CFAbsoluteTimeGetCurrent();
         
-        // Start listening
-        if (listen(self.serverSocket, 10) < 0) {
-            close(self.serverSocket);
-            blockError = [NSError errorWithDomain:@"HLSServer" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Failed to listen"}];
-            success = NO;
-            return;
-        }
-        
-        self.running = YES;
-        
-        // Start accept loop
-        dispatch_async(self.serverQueue, ^{
-            [self acceptLoop];
+        // Setup asset writer synchronously to ensure it's ready before accepting connections
+        RLog(RptrLogAreaProtocol, @"About to setup asset writer...");
+        dispatch_sync(self.writerQueue, ^{
+            [self setupAssetWriterSync];
         });
-        
-        // Setup asset writer
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"About to call setupAssetWriter...");
-        [self setupAssetWriter];
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"setupAssetWriter called");
+        RLog(RptrLogAreaProtocol, @"Asset writer setup complete");
         
         // Create initial empty playlist
         [self createInitialPlaylist];
+        
+        // Start accept loop on a different queue to avoid blocking
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            [self acceptLoop];
+        });
+        
+        // Diagnostic: Log if this took too long
+        CFAbsoluteTime setupDuration = CFAbsoluteTimeGetCurrent() - acceptStartTime;
+        if (setupDuration > 0.1) {
+            RLog(RptrLogAreaANR, @"Server setup took %.3f seconds", setupDuration);
+        }
         
         // Start client cleanup timer on main thread
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -331,36 +390,47 @@
                                                                        repeats:YES];
         });
         
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Server started on port %lu", (unsigned long)self.port);
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Randomized view URL: http://localhost:%lu/view/%@", (unsigned long)self.port, self.randomPath);
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Randomized stream URL: http://localhost:%lu/stream/%@/playlist.m3u8", (unsigned long)self.port, self.randomPath);
+        RLog(RptrLogAreaProtocol, @"Server started port:%lu path:%@", (unsigned long)self.port, self.randomPath);
         
-        if ([self.delegate respondsToSelector:@selector(hlsServerDidStart:)]) {
-            NSString *url = [NSString stringWithFormat:@"http://localhost:%lu", (unsigned long)self.port];
-            [self.delegate hlsServerDidStart:url];
-        }
+        // Call delegate on main queue to avoid nested dispatches
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if ([self.delegate respondsToSelector:@selector(hlsServerDidStart:)]) {
+                NSString *url = [NSString stringWithFormat:@"http://localhost:%lu", (unsigned long)self.port];
+                [self.delegate hlsServerDidStart:url];
+            }
+        });
     });
     
-    if (!success && error) {
-        *error = blockError;
+    // Diagnostic: Log total startup time
+    CFAbsoluteTime totalStartupTime = CFAbsoluteTimeGetCurrent() - startTime;
+    if (totalStartupTime > 0.5) {
+        RLog(RptrLogAreaError, @"WARNING: Server startup took %.3f seconds (potential ANR)", totalStartupTime);
     }
     
-    return success;
+    return YES;
 }
 
 - (void)stopStreaming {
     dispatch_async(self.writerQueue, ^{
         if (self.isWriting) {
-            RLog(RptrLogAreaHLS, @"Stopping streaming (keeping server running)");
+            RLog(RptrLogAreaProtocol, @"Stopping streaming (keeping server running)");
+            
+            // Stop the manual flush timer for Test 4
+            [self invalidateFlushTimer];
+            
             [self stopAssetWriter];
         }
     });
 }
 
 - (void)prepareForStreaming {
+    // Create initial playlist immediately so browsers don't get 404
+    // Empty playlist is better than 404 - segments will come when streaming starts
+    [self createInitialPlaylist];
+    
     dispatch_async(self.writerQueue, ^{
         if (!self.isWriting && !self.assetWriter) {
-            RLog(RptrLogAreaHLS, @"Preparing asset writer for streaming");
+            RLog(RptrLogAreaProtocol, @"Preparing asset writer for streaming");
             [self setupAssetWriter];
         }
     });
@@ -378,6 +448,9 @@
         
         // Stop writer
         [self stopAssetWriter];
+        
+        // End UDP logging session
+        [[RptrUDPLogger sharedLogger] endSession];
         
         // Stop segment timer
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -400,7 +473,7 @@
         // Clean up segments
         [self cleanupAllSegments];
         
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Server stopped");
+        RLog(RptrLogAreaProtocol, @"Server stopped");
         
         if ([self.delegate respondsToSelector:@selector(hlsServerDidStop)]) {
             [self.delegate hlsServerDidStop];
@@ -418,56 +491,55 @@
     return item;
 }
 
-- (void)setupAssetWriter {
-    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"setupAssetWriter: Starting...");
-    dispatch_async(self.writerQueue, ^{
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"setupAssetWriter: Inside async block");
+- (void)setupAssetWriterSync {
+    // Synchronous version for initial setup
+    RLog(RptrLogAreaProtocol, @"setupAssetWriterSync: Starting...");
         NSError *error;
         
-        // Create a new segment file
-        NSString *segmentName;
-        if (@available(iOS 14.0, *)) {
-            // For delegate-based writing, use .m4s extension
-            segmentName = [NSString stringWithFormat:@"segment_%03ld.m4s", (long)self.currentSegmentIndex];
-        } else {
-            // For file-based writing, use .mp4 extension
-            segmentName = [NSString stringWithFormat:@"segment_%03ld.mp4", (long)self.currentSegmentIndex];
+        // Check if we're recreating writer after forcing segment output
+        BOOL isRecreation = self.hasGeneratedInitSegment;
+        if (isRecreation) {
+            RLog(RptrLogAreaProtocol, @"[WRITER-RECREATION] Recreating writer while preserving init segment");
         }
-        NSString *segmentPath = [self.segmentDirectory stringByAppendingPathComponent:segmentName];
-        NSURL *segmentURL = [NSURL fileURLWithPath:segmentPath];
         
-        // Remove existing file
-        [[NSFileManager defaultManager] removeItemAtURL:segmentURL error:nil];
+        // AVAssetWriter handles segmentation automatically via preferredOutputSegmentInterval
+        // Delegate callbacks fire automatically when segments are ready
+        
+        // For delegate-based writing, no file needed but keep name for logging
+        NSString *segmentName = [NSString stringWithFormat:@"segment_%03ld.m4s", (long)self.mediaSequenceNumber];
+        RLog(RptrLogAreaProtocol, @"Starting delegate-based writing, initial segment: %@", segmentName);
         
         // Create asset writer with delegate-based fMP4 for HLS
-        RLog(RptrLogAreaHLS | RptrLogAreaAssetWriter, @"Creating delegate-based asset writer for HLS fMP4");
+        RLog(RptrLogAreaProtocol, @"Creating asset writer for HLS fMP4");
         
-        // Use contentType for delegate-based delivery (iOS 14+)
-        if (@available(iOS 14.0, *)) {
-            self.assetWriter = [[AVAssetWriter alloc] initWithContentType:UTTypeMPEG4Movie];
-            if (self.assetWriter) {
-                // Set Apple HLS profile for proper fMP4 output
-                self.assetWriter.outputFileTypeProfile = AVFileTypeProfileMPEG4AppleHLS;
-                self.assetWriter.delegate = self;
-                // Set required initialSegmentStartTime for delegate-based output
-                self.assetWriter.initialSegmentStartTime = kCMTimeZero;
-                RLog(RptrLogAreaHLS | RptrLogAreaAssetWriter, @"Using delegate-based fMP4 approach with Apple HLS profile");
-                RLog(RptrLogAreaHLS | RptrLogAreaAssetWriter | RptrLogAreaDebug, @"Delegate set: %@", self.assetWriter.delegate ? @"YES" : @"NO");
-            } else {
-                RLog(RptrLogAreaHLS | RptrLogAreaAssetWriter | RptrLogAreaError, @"Failed to create AVAssetWriter with contentType");
-            }
+        // Use contentType for delegate-based delivery
+        self.assetWriter = [[AVAssetWriter alloc] initWithContentType:UTTypeMPEG4Movie];
+        if (self.assetWriter) {
+            // Set Apple HLS profile for proper fMP4 output
+            self.assetWriter.outputFileTypeProfile = AVFileTypeProfileMPEG4AppleHLS;
+            self.assetWriter.delegate = self;
+            // Set required initialSegmentStartTime for delegate-based output
+            self.assetWriter.initialSegmentStartTime = kCMTimeZero;
+            RLog(RptrLogAreaProtocol, @"Using delegate-based fMP4 with automatic segmentation");
+            RLog(RptrLogAreaProtocol, @"Delegate set: %@", self.assetWriter.delegate ? @"YES" : @"NO");
         } else {
-            // Fallback for older iOS versions
-            self.assetWriter = [[AVAssetWriter alloc] initWithURL:segmentURL fileType:AVFileTypeMPEG4 error:&error];
-        }
-        if (error) {
-            RLog(RptrLogAreaHLS | RptrLogAreaError, @"Failed to create asset writer: %@", error);
+            RLog(RptrLogAreaError, @"Failed to create AVAssetWriter with contentType");
             return;
         }
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Asset writer created successfully, status: %ld", (long)self.assetWriter.status);
+        if (error) {
+            RLog(RptrLogAreaError, @"Failed to create asset writer: %@", error);
+            return;
+        }
+        RLog(RptrLogAreaProtocol, @"Asset writer created successfully, status: %ld", (long)self.assetWriter.status);
         
         // Configure for HLS with fragmented MP4
         self.assetWriter.shouldOptimizeForNetworkUse = YES;
+        
+        // CRITICAL: Set movieFragmentInterval to make segments independent
+        // This ensures each segment can be decoded without depending on previous segments
+        // For HLS.js compatibility, segments must be self-contained with their own moof/mdat boxes
+        // Research shows this should match preferredOutputSegmentInterval
+        self.assetWriter.movieFragmentInterval = CMTimeMakeWithSeconds(self.qualitySettings.segmentDuration, 600); // Use 600 timescale for precision
         
         // Set metadata for better streaming
         NSArray *metadata = @[
@@ -476,20 +548,30 @@
         ];
         self.assetWriter.metadata = metadata;
         
-        // Configure for delegate-based fMP4 HLS output
-        if (@available(iOS 14.0, *)) {
-            // Set segment duration for HLS with proper precision
-            self.assetWriter.preferredOutputSegmentInterval = CMTimeMakeWithSeconds(self.qualitySettings.segmentDuration, 1000);
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Set preferredOutputSegmentInterval to %f seconds", self.qualitySettings.segmentDuration);
-        } else {
-            // Fallback: use movieFragmentInterval for older iOS
-            self.assetWriter.movieFragmentInterval = CMTimeMakeWithSeconds(0.2, 1000);
-        }
+        // TEST 4: PASSTHROUGH MODE - Manual segment control
+        // Set to indefinite so we can manually control with flushSegment
+        self.assetWriter.preferredOutputSegmentInterval = kCMTimeIndefinite;
+        RLog(RptrLogAreaProtocol, @"[TEST4] Set preferredOutputSegmentInterval to INDEFINITE");
+        RLog(RptrLogAreaProtocol, @"[TEST4] Will use manual flushSegment() for segment control");
         
-        // Configure video encoding settings
-        // Research: H.264 Baseline profile provides best compatibility across devices
-        // CAVLC entropy coding is more error-resilient than CABAC for streaming
-        NSDictionary *videoSettings = @{
+        // Schedule the manual flush timer for Test 4
+        [self scheduleManualFlushTimer];
+        
+        // TEST 4: PASSTHROUGH MODE - No encoding
+        // Configure video for passthrough (no compression)
+        NSDictionary *videoSettings = nil; // nil = passthrough mode
+        
+        RLog(RptrLogAreaProtocol, @"[TEST4] PASSTHROUGH MODE - No video encoding");
+        RLog(RptrLogAreaProtocol, @"[TEST4] Files will be larger but segmentation should work");
+        RLog(RptrLogAreaProtocol, @"[TEST4] Can use flushSegment() for manual control");
+        
+        /* ORIGINAL ENCODING SETTINGS DISABLED FOR TEST 4
+        // Reuse saved settings if this is a recreation to maintain codec consistency
+        if (isRecreation && self.savedVideoSettings) {
+            videoSettings = self.savedVideoSettings;
+            RLog(RptrLogAreaProtocol, @"[WRITER-RECREATION] Reusing saved video settings for consistency");
+        } else {
+            videoSettings = @{
             AVVideoCodecKey: AVVideoCodecTypeH264,
             AVVideoWidthKey: @(self.qualitySettings.videoWidth),
             AVVideoHeightKey: @(self.qualitySettings.videoHeight),
@@ -518,62 +600,94 @@
                 }
             }
         };
+            // Save settings for future recreations
+            self.savedVideoSettings = videoSettings;
+            RLog(RptrLogAreaProtocol, @"[INIT-CONFIG] Saved video settings for future writer recreations");
+        }
+        */
         
         self.videoInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:videoSettings];
         if (!self.videoInput) {
-            RLog(RptrLogAreaVideo | RptrLogAreaError, @"Failed to create video input!");
+            RLog(RptrLogAreaError, @"Failed to create video input!");
             return;
         }
         
         // Use identity transform - rotation is handled at capture level
         self.videoInput.transform = CGAffineTransformIdentity;
-        RLog(RptrLogAreaHLS | RptrLogAreaVideo, @"Using identity transform for segment %ld - rotation handled at capture", 
+        RLog(RptrLogAreaProtocol, @"Using identity transform for segment %ld - rotation handled at capture", 
              (long)self.currentSegmentIndex);
         self.videoInput.expectsMediaDataInRealTime = YES;
-        RLog(RptrLogAreaVideo | RptrLogAreaDebug, @"Created video input: %@", self.videoInput);
+        
+        // CRITICAL for fMP4: Request sync samples at segment boundaries
+        // This ensures each segment starts with a keyframe (IDR frame)
+        self.videoInput.performsMultiPassEncodingIfSupported = YES;
+        
+        RLog(RptrLogAreaVideoParams, @"Created video input: %@", self.videoInput);
         
         if ([self.assetWriter canAddInput:self.videoInput]) {
             [self.assetWriter addInput:self.videoInput];
-            RLog(RptrLogAreaVideo | RptrLogAreaAssetWriter | RptrLogAreaDebug, @"Added video input to asset writer");
+            RLog(RptrLogAreaVideoParams, @"Added video input to asset writer");
         } else {
-            RLog(RptrLogAreaVideo | RptrLogAreaAssetWriter | RptrLogAreaError, @"Cannot add video input to asset writer!");
+            RLog(RptrLogAreaError, @"Cannot add video input to asset writer!");
             return;
         }
         
-        // Configure audio encoding settings
-        // Research: AAC-LC provides best quality/size ratio for streaming
-        // Mono audio saves 50% bandwidth with minimal quality impact for voice
-        NSDictionary *audioSettings = @{
+        // TEST 4: PASSTHROUGH MODE - No audio encoding
+        NSDictionary *audioSettings = nil; // nil = passthrough mode
+        
+        RLog(RptrLogAreaProtocol, @"[TEST4] PASSTHROUGH MODE - No audio encoding");
+        
+        /* ORIGINAL AUDIO ENCODING DISABLED FOR TEST 4
+        // Reuse saved settings if this is a recreation to maintain codec consistency
+        if (isRecreation && self.savedAudioSettings) {
+            audioSettings = self.savedAudioSettings;
+            RLog(RptrLogAreaProtocol, @"[WRITER-RECREATION] Reusing saved audio settings for consistency");
+        } else {
+            audioSettings = @{
             AVFormatIDKey: @(kAudioFormatMPEG4AAC),              // AAC-LC codec
             AVNumberOfChannelsKey: @(self.qualitySettings.audioChannels),
             AVSampleRateKey: @(self.qualitySettings.audioSampleRate),
             AVEncoderBitRateKey: @(self.qualitySettings.audioBitrate),
             AVEncoderAudioQualityKey: @(AVAudioQualityMedium)    // Balanced quality
         };
+            // Save settings for future recreations
+            self.savedAudioSettings = audioSettings;
+            RLog(RptrLogAreaProtocol, @"[INIT-CONFIG] Saved audio settings for future writer recreations");
+        }
+        */
         
         self.audioInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:audioSettings];
         self.audioInput.expectsMediaDataInRealTime = YES;
-        RLog(RptrLogAreaAudio | RptrLogAreaDebug, @"Created audio input: %@", self.audioInput);
+        RLog(RptrLogAreaProtocol, @"[AUDIO CONFIG] Created audio input");
+        RLog(RptrLogAreaVideoParams, @"[AUDIO CONFIG] Format: AAC");
+        RLog(RptrLogAreaVideoParams, @"[AUDIO CONFIG] Sample Rate: 44100 Hz");
+        RLog(RptrLogAreaVideoParams, @"[AUDIO CONFIG] Channels: 2");
+        RLog(RptrLogAreaVideoParams, @"[AUDIO CONFIG] Bitrate: 64000 bps");
         
         // Add audio input to asset writer
         if ([self.assetWriter canAddInput:self.audioInput]) {
             [self.assetWriter addInput:self.audioInput];
-            RLog(RptrLogAreaAudio | RptrLogAreaAssetWriter | RptrLogAreaDebug, @"Added audio input to asset writer");
+            RLog(RptrLogAreaInfo, @"Added audio input to asset writer");
         } else {
-            RLog(RptrLogAreaAudio | RptrLogAreaAssetWriter | RptrLogAreaError, @"Cannot add audio input to asset writer!");
+            RLog(RptrLogAreaError, @"Cannot add audio input to asset writer!");
             return;  // Fail if we can't add audio input
         }
         
         // Start writing
         if ([self.assetWriter startWriting]) {
             self.waitingForKeyFrame = YES;
-            self.sessionStarted = NO;  // Reset session flag for new writer
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Asset writer started for segment %ld", (long)self.currentSegmentIndex);
-            RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Writer status after startWriting: %ld", (long)self.assetWriter.status);
-            // Don't set isWriting yet - wait for first frame to start session
+            self.sessionStarted = NO;  // Will start session when first frame arrives
+            self.isFinishing = NO;     // Reset finishing flag for new writer
+            
+            RLog(RptrLogAreaProtocol, @"Asset writer started for segment %ld", (long)self.currentSegmentIndex);
+            RLog(RptrLogAreaProtocol, @"Writer status after startWriting: %ld", (long)self.assetWriter.status);
+            RLog(RptrLogAreaProtocol, @"Waiting for first frame to start session");
         } else {
-            RLog(RptrLogAreaHLS | RptrLogAreaError, @"Failed to start writing: %@", self.assetWriter.error);
-            RLog(RptrLogAreaHLS | RptrLogAreaDebug | RptrLogAreaError, @"Writer status: %ld", (long)self.assetWriter.status);
+            RLog(RptrLogAreaError, @"Failed to start writing: %@", self.assetWriter.error);
+            RLog(RptrLogAreaError, @"Writer status: %ld", (long)self.assetWriter.status);
+            RLog(RptrLogAreaError, @"Error domain: %@", self.assetWriter.error.domain);
+            RLog(RptrLogAreaError, @"Error code: %ld", (long)self.assetWriter.error.code);
+            RLog(RptrLogAreaError, @"Error userInfo: %@", self.assetWriter.error.userInfo);
             
             // Notify delegate of error
             if ([self.delegate respondsToSelector:@selector(hlsServer:didEncounterError:)]) {
@@ -583,14 +697,21 @@
                 [self.delegate hlsServer:self didEncounterError:error];
             }
         }
+}
+
+- (void)setupAssetWriter {
+    // Async wrapper for segment rotation
+    RLog(RptrLogAreaProtocol, @"setupAssetWriter: Starting async...");
+    dispatch_async(self.writerQueue, ^{
+        [self setupAssetWriterSync];
     });
 }
 
 - (void)stopAssetWriter {
     dispatch_async(self.writerQueue, ^{
-        if (!self.isWriting || self.isFinishingWriter) {
-            RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"stopAssetWriter: Already stopped or finishing (isWriting=%d, isFinishingWriter=%d)", 
-                 self.isWriting, self.isFinishingWriter);
+        if (!self.isWriting || self.isFinishing) {
+            RLog(RptrLogAreaProtocol, @"stopAssetWriter: Already stopped or finishing (isWriting=%d, isFinishing=%d)", 
+                 self.isWriting, self.isFinishing);
             return;
         }
         
@@ -599,7 +720,7 @@
         
         // Only mark as finished if writer is in correct state
         if (self.assetWriter && self.assetWriter.status == AVAssetWriterStatusWriting) {
-            self.isFinishingWriter = YES;
+            self.isFinishing = YES;
             
             if (self.videoInput && self.videoInput.readyForMoreMediaData) {
                 [self.videoInput markAsFinished];
@@ -612,13 +733,15 @@
             [self.assetWriter finishWritingWithCompletionHandler:^{
                 __strong typeof(weakSelf) strongSelf = weakSelf;
                 if (strongSelf) {
-                    RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Finished writing segment");
-                    [strongSelf finalizeCurrentSegment];
-                    strongSelf.isFinishingWriter = NO;
+                    RLog(RptrLogAreaProtocol, @"[WRITER] Finished writing - segments handled via delegate");
+                    RLog(RptrLogAreaProtocol, @"[QoE] Writer session ended successfully");
+                    // Segments are automatically handled via delegate callbacks
+                    // No need to finalize manually
+                    strongSelf.isFinishing = NO;
                 }
             }];
         } else {
-            RLog(RptrLogAreaHLS | RptrLogAreaError, @"Writer not in correct state to stop. Status: %ld", 
+            RLog(RptrLogAreaError, @"Writer not in correct state to stop. Status: %ld", 
                   self.assetWriter ? (long)self.assetWriter.status : -1);
         }
     });
@@ -652,13 +775,22 @@
         
         // Quick state check
         if (!self.running) {
-            RLog(RptrLogAreaHLS | RptrLogAreaBuffer, @"Server not running, ignoring sample buffer");
+            RLog(RptrLogAreaProtocol, @"Server not running, ignoring sample buffer");
             return;
         }
         
         // Validate sample buffer before processing
         if (!CMSampleBufferIsValid(sampleBuffer)) {
-            RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"WARNING: Invalid sample buffer received");
+            RLog(RptrLogAreaError, @"WARNING: Invalid sample buffer received");
+            return;
+        }
+        
+        // Queue frames during transition instead of dropping
+        if (self.isTransitioning) {
+            CFRetain(sampleBuffer);
+            [self.pendingVideoFrames addObject:(__bridge id)sampleBuffer];
+            RLogDebug(@"[FRAME-QUEUE] Queued video frame during transition (total: %lu)", 
+                     (unsigned long)self.pendingVideoFrames.count);
             return;
         }
         
@@ -666,7 +798,7 @@
         // The capture system needs these buffers back quickly for its pool
         
         // Quick check if we should process this frame
-        if (!self.assetWriter || !self.videoInput || self.isFinishingWriter) {
+        if (!self.assetWriter || !self.videoInput || self.isFinishing) {
             return;
         }
         
@@ -693,6 +825,12 @@
         isKeyFrame = (notSync == NULL) || !CFBooleanGetValue(notSync);
     }
     
+    // Track keyframe for clean segment boundaries
+    if (isKeyFrame) {
+        self.hasRecentKeyframe = YES;
+        RLogDebug(@"[KEYFRAME] Detected keyframe at time %.2f", CMTimeGetSeconds(presentationTime));
+    }
+    
     // Retain the buffer only for the duration of the append operation
     CFRetain(sampleBuffer);
     
@@ -700,19 +838,19 @@
         @try {
         // Validate sample buffer is still valid
         if (!sampleBuffer || !CMSampleBufferIsValid(sampleBuffer)) {
-            RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"ERROR: Sample buffer became invalid or nil");
+            RLog(RptrLogAreaError, @"ERROR: Sample buffer became invalid or nil");
             return;
         }
         
         // Check if we have a writer
         if (!self.assetWriter) {
-            RLog(RptrLogAreaHLS | RptrLogAreaError, @"ERROR: No asset writer available!");
+            RLog(RptrLogAreaError, @"ERROR: No asset writer available!");
             return;
         }
         
         // Check if video input exists
         if (!self.videoInput) {
-            RLog(RptrLogAreaHLS | RptrLogAreaError, @"ERROR: No video input available!");
+            RLog(RptrLogAreaError, @"ERROR: No video input available!");
             return;
         }
         
@@ -725,65 +863,81 @@
         if (isFirstFrame) {
             // Double-check that session hasn't been started by another thread
             if (self.sessionStarted) {
-                RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Session already started by another thread");
+                RLog(RptrLogAreaProtocol, @"Session already started by another thread");
                 return;
             } else {
                 // Log buffer dimensions for first frame
                 if (dimensions.width > 0 && dimensions.height > 0) {
-                    RLog(RptrLogAreaHLS | RptrLogAreaVideo, @"First frame buffer dimensions: %d x %d", dimensions.width, dimensions.height);
+                    RLog(RptrLogAreaProtocol, @"Stream started: %dx%d", dimensions.width, dimensions.height);
                     // Video should already be in landscape orientation from AVCaptureConnection
                 }
                 
                 // Check writer status
                 if (self.assetWriter.status == AVAssetWriterStatusUnknown) {
-                    RLog(RptrLogAreaHLS | RptrLogAreaError, @"ERROR: Writer not started yet! Call startWriting first.");
+                    RLog(RptrLogAreaError, @"ERROR: Writer not started yet! Call startWriting first.");
                     return;
                 } else if (self.assetWriter.status == AVAssetWriterStatusWriting) {
-                    // Double-check session hasn't been started
+                    // Check if session is already started (could happen due to threading)
                     if (self.sessionStarted) {
-                        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Session started by another thread during checks");
+                        RLog(RptrLogAreaProtocol, @"Session already started");
                         return;
                     }
                     
-                    // Writer is ready, start the session
-                    RLog(RptrLogAreaHLS | RptrLogAreaTiming, @"First frame - starting session");
-                    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Asset writer status: %ld", (long)self.assetWriter.status);
-                    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Video input: %@", self.videoInput);
-                    
-                    // Initialize timing
-                    self.sessionStartTime = presentationTime;
-                    self.nextSegmentBoundary = presentationTime;
+                    // Start the session with the actual frame timestamp
+                    RLog(RptrLogAreaProtocol, @"First frame - starting session");
                     
                     // Ensure valid time
                     if (CMTIME_IS_INVALID(presentationTime)) {
-                        RLog(RptrLogAreaHLS | RptrLogAreaTiming | RptrLogAreaError, @"ERROR: Invalid presentation time!");
+                        RLog(RptrLogAreaError, @"ERROR: Invalid presentation time!");
                         return;
                     }
                     
-                    // Set sessionStarted BEFORE calling startSessionAtSourceTime to prevent race condition
-                    self.sessionStarted = YES;
+                    // For delegate-based fMP4, align timing to ensure segments are independent
+                    // Use the actual frame time to maintain sync
+                    CMTime alignedTime = presentationTime;
                     
-                    // Start the session
-                    RLog(RptrLogAreaHLS | RptrLogAreaTiming, @"Starting session at source time: %.2f", CMTimeGetSeconds(presentationTime));
+                    // Initialize timing - preserve original for tracking but use current frame for session
+                    if (CMTIME_IS_INVALID(self.originalSessionStartTime)) {
+                        // First time starting - save original time for tracking
+                        self.originalSessionStartTime = alignedTime;
+                        self.sessionStartTime = alignedTime;
+                        self.nextSegmentBoundary = alignedTime;
+                        RLog(RptrLogAreaProtocol, @"[SESSION-INIT] First session start time: %.2f", 
+                             CMTimeGetSeconds(alignedTime));
+                    } else {
+                        // Continuing from previous session after recreation
+                        // Use current frame time for new session to maintain continuity
+                        self.sessionStartTime = presentationTime;
+                        RLog(RptrLogAreaProtocol, @"[SESSION-CONTINUITY] Using frame time %.2f for new session (original: %.2f)", 
+                             CMTimeGetSeconds(presentationTime), CMTimeGetSeconds(self.originalSessionStartTime));
+                    }
+                    
+                    // Start the session with current frame time for proper alignment
+                    CMTime sessionTime = presentationTime;
+                    RLog(RptrLogAreaProtocol, @"Starting session at source time: %.2f", CMTimeGetSeconds(sessionTime));
+                    RLog(RptrLogAreaProtocol, @"[TEST4] PASSTHROUGH MODE - Manual segment control");
                     @try {
-                        [self.assetWriter startSessionAtSourceTime:presentationTime];
+                        [self.assetWriter startSessionAtSourceTime:sessionTime];
+                        self.sessionStarted = YES;
                         self.isWriting = YES;
                         self.currentSegmentStartTime = [NSDate date];
-                        RLog(RptrLogAreaHLS | RptrLogAreaTiming, @"Session started successfully");
+                        RLog(RptrLogAreaProtocol, @"Session started successfully with frame timestamp");
+                        RLog(RptrLogAreaProtocol, @"[TEST4] Will manually flush segments every 1 second");
                         
-                        // Start segment timer as backup
+                        // Start segment timer (disabled for Test 2)
                         [self startSegmentTimer];
                     } @catch (NSException *exception) {
-                        RLog(RptrLogAreaHLS | RptrLogAreaError, @"EXCEPTION starting session: %@", exception);
-                        RLog(RptrLogAreaHLS | RptrLogAreaError, @"Writer status was: %ld", (long)self.assetWriter.status);
-                        // Reset sessionStarted since we failed to start
+                        RLog(RptrLogAreaError, @"EXCEPTION starting session: %@", exception);
+                        RLog(RptrLogAreaError, @"Writer status was: %ld", (long)self.assetWriter.status);
                         self.sessionStarted = NO;
                         return;
                     }
                 } else {
-                    RLog(RptrLogAreaHLS | RptrLogAreaError, @"ERROR: Writer in unexpected state: %ld", (long)self.assetWriter.status);
-                    if (self.assetWriter.error) {
-                        RLog(RptrLogAreaHLS | RptrLogAreaError, @"Writer error: %@", self.assetWriter.error);
+                    // Writer may be in Completed state if we just recreated it after rotation
+                    // Skip this frame and let the next one start the session properly
+                    RLog(RptrLogAreaProtocol, @"[WRITER-STATE] Writer in state %ld, skipping frame", (long)self.assetWriter.status);
+                    if (self.assetWriter.status == AVAssetWriterStatusFailed || self.assetWriter.error) {
+                        RLog(RptrLogAreaError, @"Writer error: %@", self.assetWriter.error);
                     }
                     return;
                 }
@@ -792,126 +946,99 @@
         
         // Check writer status
         if (self.assetWriter.status == AVAssetWriterStatusFailed) {
-            RLog(RptrLogAreaHLS | RptrLogAreaError, @"Writer failed with error: %@", self.assetWriter.error);
+            RLog(RptrLogAreaError, @"Writer failed with error: %@", self.assetWriter.error);
             self.isWriting = NO;
             return;
         }
         
         if (self.assetWriter.status != AVAssetWriterStatusWriting) {
-            RLog(RptrLogAreaHLS | RptrLogAreaError, @"Writer not ready, status: %ld", (long)self.assetWriter.status);
+            RLog(RptrLogAreaError, @"Writer not ready, status: %ld", (long)self.assetWriter.status);
             return;
         }
         
-        // Check if we need to start a new segment
-        CMTime timeSinceSegmentStart = CMTimeSubtract(presentationTime, self.nextSegmentBoundary);
-        double secondsSinceSegmentStart = CMTimeGetSeconds(timeSinceSegmentStart);
-        
-        if (secondsSinceSegmentStart >= self.qualitySettings.segmentDuration || self.forceSegmentRotation) {
-            if (self.forceSegmentRotation) {
-                RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Forced segment rotation requested");
-            } else {
-                RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Time for new segment: %.2f seconds since start", secondsSinceSegmentStart);
-            }
-            
-            // Use the pre-extracted key frame information
-            if (!isKeyFrame && self.framesProcessed % 30 == 0) {
-                RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaDebug, @"Frame %ld is NOT a key frame", (long)self.framesProcessed);
-            }
-            
-            if (isKeyFrame) {
-                RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"[KEY FRAME] Detected at %.3f seconds (segment %ld age: %.3f)", 
-                       CMTimeGetSeconds(presentationTime), 
-                       (long)self.currentSegmentIndex, 
-                       secondsSinceSegmentStart);
-                self.forceSegmentRotation = NO;
-                [self rotateSegment];
-                return; // Skip this frame, it will be written to the new segment
-            } else if (self.forceSegmentRotation && secondsSinceSegmentStart >= self.qualitySettings.segmentDuration + self.qualitySettings.segmentRotationDelay) {
-                // Force rotation if we've waited a bit for key frame
-                RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"[FORCE ROTATION] No key frame for %.3f seconds, forcing rotation of segment %ld", 
-                       secondsSinceSegmentStart, (long)self.currentSegmentIndex);
-                self.forceSegmentRotation = NO;
-                [self rotateSegment];
-                return;
-            } else if (self.forceSegmentRotation) {
-                RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming | RptrLogAreaDebug, @"[WAITING] Segment %ld: %.3f seconds elapsed, waiting for key frame (force flag set)", 
-                       (long)self.currentSegmentIndex, secondsSinceSegmentStart);
-            }
+        // TEST 4: Monitor passthrough mode with manual flush
+        if (self.framesProcessed % 30 == 0) {
+            NSTimeInterval timeSinceSegmentStart = self.currentSegmentStartTime ? 
+                [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime] : 0;
+            RLog(RptrLogAreaProtocol, @"[TEST4-MONITOR] Frame %ld, Time in segment: %.2fs (manual flush every 1.0s)", 
+                 (long)self.framesProcessed, timeSinceSegmentStart);
         }
+        
         
         // Comprehensive null checks before appending
         if (!self.videoInput) {
-            RLog(RptrLogAreaHLS | RptrLogAreaError, @"ERROR: videoInput is nil!");
+            RLog(RptrLogAreaError, @"ERROR: videoInput is nil!");
             return;
         }
         
         if (!sampleBuffer) {
-            RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"ERROR: sampleBuffer is nil!");
+            RLog(RptrLogAreaError, @"ERROR: sampleBuffer is nil!");
             return;
         }
         
         // Verify sample buffer is valid
         if (!CMSampleBufferIsValid(sampleBuffer)) {
-            RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"ERROR: sampleBuffer is invalid!");
+            RLog(RptrLogAreaError, @"ERROR: sampleBuffer is invalid!");
             return;
         }
         
         // Check if we're in the middle of finishing the writer
-        if (self.isFinishingWriter) {
-            RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaDebug, @"Skipping frame - writer is finishing");
+        if (self.isFinishing) {
+            RLog(RptrLogAreaProtocol, @"Skipping frame - writer is finishing");
             return;
         }
         
         // Check if input is ready
         if (self.videoInput.isReadyForMoreMediaData) {
-            RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaDebug, @"About to append sample buffer - videoInput: %@, sampleBuffer: %p", 
+            RLog(RptrLogAreaVideoParams, @"About to append sample buffer - videoInput: %@, sampleBuffer: %p", 
                   self.videoInput, sampleBuffer);
             
             @try {
                 // Final validation before append
                 if (!CMSampleBufferIsValid(sampleBuffer)) {
-                    RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"ERROR: Sample buffer invalid before append");
+                    RLog(RptrLogAreaError, @"ERROR: Sample buffer invalid before append");
                     return;
                 }
                 
                 BOOL success = [self.videoInput appendSampleBuffer:sampleBuffer];
                 if (success) {
                     self.framesProcessed++;
+                    // Track the last successfully processed time
+                    self.lastProcessedTime = presentationTime;
+                    
                     if (self.framesProcessed == 1) {
-                        RLog(RptrLogAreaHLS | RptrLogAreaBuffer, @"Successfully appended first frame!");
+                        RLog(RptrLogAreaProtocol, @"Successfully appended first frame!");
                     } else if (self.framesProcessed % 30 == 0) {
-                        RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaDebug, @"Processed %ld frames", (long)self.framesProcessed);
+                        RLog(RptrLogAreaVideoParams, @"Processed %ld frames", (long)self.framesProcessed);
                     }
                 } else {
-                    RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"Failed to append sample buffer");
-                    RLog(RptrLogAreaHLS | RptrLogAreaDebug | RptrLogAreaError, @"Writer status: %ld", (long)self.assetWriter.status);
-                    RLog(RptrLogAreaHLS | RptrLogAreaError, @"Writer error: %@", self.assetWriter.error);
-                    RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaDebug | RptrLogAreaError, @"Video input readyForMoreMediaData: %@", self.videoInput.readyForMoreMediaData ? @"YES" : @"NO");
+                    RLog(RptrLogAreaError, @"Failed to append sample buffer");
+                    RLog(RptrLogAreaError, @"Writer status: %ld", (long)self.assetWriter.status);
+                    RLog(RptrLogAreaError, @"Writer error: %@", self.assetWriter.error);
+                    RLog(RptrLogAreaVideoParams, @"Video input readyForMoreMediaData: %@", self.videoInput.readyForMoreMediaData ? @"YES" : @"NO");
                     self.framesDropped++;
                     
                     // Check if writer failed
                     if (self.assetWriter.status == AVAssetWriterStatusFailed) {
-                        RLog(RptrLogAreaHLS | RptrLogAreaError, @"Writer failed with error: %@", self.assetWriter.error);
-                        RLog(RptrLogAreaHLS | RptrLogAreaError, @"Error code: %ld", (long)self.assetWriter.error.code);
-                        RLog(RptrLogAreaHLS | RptrLogAreaError, @"Error domain: %@", self.assetWriter.error.domain);
+                        RLog(RptrLogAreaError, @"Writer failed with error: %@", self.assetWriter.error);
+                        RLog(RptrLogAreaError, @"Error code: %ld", (long)self.assetWriter.error.code);
+                        RLog(RptrLogAreaError, @"Error domain: %@", self.assetWriter.error.domain);
                         self.isWriting = NO;
                         
-                        // Try to restart writer
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), self.writerQueue, ^{
-                            RLog(RptrLogAreaHLS | RptrLogAreaError, @"Attempting to restart writer...");
-                            self.currentSegmentIndex++;
-                            [self setupAssetWriter];
-                        });
+                        // Try to restart writer immediately on error
+                        RLog(RptrLogAreaError, @"Attempting to restart writer...");
+                        // Delegate-based: counter incremented in assetWriter:didOutputSegmentData:
+                        [self setupAssetWriter];
                     }
                 }
             } @catch (NSException *exception) {
-                RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"EXCEPTION appending sample buffer: %@", exception);
-                RLog(RptrLogAreaHLS | RptrLogAreaError, @"Exception reason: %@", exception.reason);
-                RLog(RptrLogAreaHLS | RptrLogAreaError | RptrLogAreaDebug, @"Stack trace: %@", exception.callStackSymbols);
+                RLog(RptrLogAreaError, @"EXCEPTION appending sample buffer: %@", exception);
+                RLog(RptrLogAreaError, @"Exception reason: %@", exception.reason);
+                RLog(RptrLogAreaError, @"Stack trace: %@", exception.callStackSymbols);
                 self.framesDropped++;
             }
         } else {
-            RLog(RptrLogAreaHLS | RptrLogAreaBuffer, @"Video input not ready for more data");
+            RLog(RptrLogAreaVideoParams, @"Video input not ready for more data");
             self.framesDropped++;
         }
         } @finally {
@@ -937,12 +1064,21 @@
     
     // Validate sample buffer before processing
     if (!CMSampleBufferIsValid(sampleBuffer)) {
-        RLog(RptrLogAreaHLS | RptrLogAreaBuffer | RptrLogAreaError, @"WARNING: Invalid audio sample buffer received");
+        RLog(RptrLogAreaError, @"WARNING: Invalid audio sample buffer received");
+        return;
+    }
+    
+    // Queue frames during transition instead of dropping
+    if (self.isTransitioning) {
+        CFRetain(sampleBuffer);
+        [self.pendingAudioFrames addObject:(__bridge id)sampleBuffer];
+        RLogDebug(@"[FRAME-QUEUE] Queued audio frame during transition (total: %lu)", 
+                 (unsigned long)self.pendingAudioFrames.count);
         return;
     }
     
     // Quick check if we should process this frame
-    if (!self.running || !self.sessionStarted || !self.audioInput || self.isFinishingWriter) {
+    if (!self.running || !self.sessionStarted || !self.audioInput || self.isFinishing) {
         return;
     }
     
@@ -952,7 +1088,7 @@
     dispatch_async(self.writerQueue, ^{
         @try {
             // Quick validation before append
-            if (!self.audioInput || self.isFinishingWriter || !self.sessionStarted) {
+            if (!self.audioInput || self.isFinishing || !self.sessionStarted) {
                 return;
             }
             
@@ -960,9 +1096,9 @@
             if (self.audioInput.isReadyForMoreMediaData) {
                 BOOL success = [self.audioInput appendSampleBuffer:sampleBuffer];
                 if (!success) {
-                    RLog(RptrLogAreaHLS | RptrLogAreaAudio | RptrLogAreaDebug, @"Failed to append audio sample buffer");
+                    RLog(RptrLogAreaProtocol, @"Failed to append audio sample buffer");
                     if (self.assetWriter.status == AVAssetWriterStatusFailed) {
-                        RLog(RptrLogAreaHLS | RptrLogAreaAudio | RptrLogAreaError, @"Audio append failed - writer error: %@", self.assetWriter.error);
+                        RLog(RptrLogAreaError, @"Audio append failed - writer error: %@", self.assetWriter.error);
                     }
                 }
             }
@@ -976,57 +1112,73 @@
     } // End of @autoreleasepool
 }
 
-/**
- * Rotates to a new segment by finalizing the current segment and preparing the next
- * 
- * Segment rotation process:
- * 1. Marks current inputs as finished to trigger segment completion
- * 2. Waits for AVAssetWriter to finalize and output segment data
- * 3. Creates new AVAssetWriter for the next segment
- * 4. Updates segment index and metadata
- * 
- * This method is called when:
- * - Segment duration is reached
- * - A keyframe is needed for the new segment
- * - Force rotation is triggered by the timer
- * 
- * @note Executes asynchronously on the writer queue
- * @warning Do not call directly - use segment timer or boundary detection
- */
-- (void)rotateSegment {
-    dispatch_async(self.writerQueue, ^{
-        // Check if we're already finishing the writer or not writing
-        if (!self.isWriting || self.isFinishingWriter) {
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, 
-                 @"rotateSegment: Skipping rotation (isWriting=%d, isFinishingWriter=%d)", 
-                 self.isWriting, self.isFinishingWriter);
+
+
+#pragma mark - Frame Queue Management
+
+- (void)processQueuedFrames {
+    RLog(RptrLogAreaProtocol, @"[FRAME-QUEUE] Processing queued frames - Video: %lu, Audio: %lu", 
+         (unsigned long)self.pendingVideoFrames.count, (unsigned long)self.pendingAudioFrames.count);
+    
+    // Process video frames
+    for (id frameObj in self.pendingVideoFrames) {
+        CMSampleBufferRef frame = (__bridge CMSampleBufferRef)frameObj;
+        if (CMSampleBufferIsValid(frame) && self.videoInput.readyForMoreMediaData) {
+            [self.videoInput appendSampleBuffer:frame];
+            self.framesProcessed++;
+            CMTime pts = CMSampleBufferGetPresentationTimeStamp(frame);
+            self.lastProcessedTime = pts;
+            RLogDebug(@"[FRAME-QUEUE] Processed queued video frame at time %.2f", CMTimeGetSeconds(pts));
+        }
+        CFRelease(frame);
+    }
+    [self.pendingVideoFrames removeAllObjects];
+    
+    // Process audio frames
+    for (id frameObj in self.pendingAudioFrames) {
+        CMSampleBufferRef frame = (__bridge CMSampleBufferRef)frameObj;
+        if (CMSampleBufferIsValid(frame) && self.audioInput.readyForMoreMediaData) {
+            [self.audioInput appendSampleBuffer:frame];
+        }
+        CFRelease(frame);
+    }
+    [self.pendingAudioFrames removeAllObjects];
+    
+    RLog(RptrLogAreaProtocol, @"[FRAME-QUEUE] Finished processing queued frames");
+}
+
+- (void)rotateSegmentWithKeyframeCheck {
+    NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime];
+    
+    // Only rotate at proper boundaries
+    if (elapsed >= self.qualitySettings.segmentDuration) {
+        
+        // Only wait for keyframe if we're very close to the target duration
+        if (!self.hasRecentKeyframe && elapsed < self.qualitySettings.segmentDuration + 0.2) {
+            RLogDebug(@"[SEGMENT-ROTATION] Waiting for keyframe (elapsed: %.2f)", elapsed);
+            return; // Wait up to 0.2s for keyframe
+        }
+        
+        // Don't rotate if we're already transitioning
+        if (self.isTransitioning) {
+            RLogDebug(@"[SEGMENT-ROTATION] Already transitioning, skipping");
             return;
         }
         
-        NSTimeInterval segmentAge = [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime];
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Rotating segment %ld after %.3f seconds", (long)self.currentSegmentIndex, segmentAge);
+        RLog(RptrLogAreaProtocol, @"[SEGMENT-ROTATION] Starting rotation after %.2fs", elapsed);
+        self.isTransitioning = YES;
         
-        // Check if we can safely finish the current writer
-        if (!self.assetWriter) {
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaError, @"ERROR: No writer to rotate");
-            return;
-        }
-        
-        if (self.assetWriter.status != AVAssetWriterStatusWriting) {
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaError, @"ERROR: Writer not in writing state, cannot rotate. Status: %ld", (long)self.assetWriter.status);
-            return;
-        }
-        
-        // Mark that we're finishing the writer to prevent concurrent finishes
-        self.isFinishingWriter = YES;
-        
-        // Stop current writer
-        if (self.videoInput && self.videoInput.readyForMoreMediaData) {
+        // Mark inputs as finished
+        if (self.videoInput) {
             [self.videoInput markAsFinished];
         }
-        if (self.audioInput && self.audioInput.readyForMoreMediaData) {
+        if (self.audioInput) {
             [self.audioInput markAsFinished];
         }
+        
+        // Save current state
+        CMTime savedLastTime = self.lastProcessedTime;
+        CMTime savedSessionTime = self.sessionStartTime;
         
         __weak typeof(self) weakSelf = self;
         [self.assetWriter finishWritingWithCompletionHandler:^{
@@ -1034,179 +1186,235 @@
             if (!strongSelf) return;
             
             dispatch_async(strongSelf.writerQueue, ^{
-                // Finalize the completed segment
-                [strongSelf finalizeCurrentSegment];
+                RLog(RptrLogAreaProtocol, @"[SEGMENT-ROTATION] Writer finished, creating new writer");
                 
-                // Update segment boundary
-                strongSelf.nextSegmentBoundary = CMTimeAdd(strongSelf.nextSegmentBoundary, CMTimeMakeWithSeconds(self.qualitySettings.segmentDuration, 1));
+                // Create new writer
+                [strongSelf setupAssetWriterSync];
                 
-                // Clear the finishing flag
-                strongSelf.isFinishingWriter = NO;
+                RLog(RptrLogAreaProtocol, @"[SEGMENT-ROTATION] Writer status after setup: %ld", 
+                     (long)strongSelf.assetWriter.status);
                 
-                // Start new segment only if we're still supposed to be writing
-                if (strongSelf.isWriting) {
-                    strongSelf.currentSegmentIndex++;
-                    strongSelf.currentSegmentStartTime = [NSDate date];
-                    [strongSelf setupAssetWriter];
+                // Calculate next frame time for session start
+                CMTime nextTime = CMTIME_IS_VALID(savedLastTime) ? 
+                    CMTimeAdd(savedLastTime, CMTimeMake(1, 30)) : // For 30fps
+                    savedSessionTime;
+                
+                // Start session at next expected frame time
+                // After startWriting, status should be Writing (1)
+                if (strongSelf.assetWriter && strongSelf.assetWriter.status == AVAssetWriterStatusWriting) {
+                    @try {
+                        [strongSelf.assetWriter startSessionAtSourceTime:nextTime];
+                        strongSelf.sessionStarted = YES;
+                        strongSelf.currentSegmentStartTime = [NSDate date];
+                        strongSelf.hasRecentKeyframe = NO;
+                        
+                        RLog(RptrLogAreaProtocol, @"[SEGMENT-ROTATION] Started new session at time %.2f", 
+                             CMTimeGetSeconds(nextTime));
+                        
+                        // Process queued frames immediately
+                        strongSelf.isTransitioning = NO;
+                        [strongSelf processQueuedFrames];
+                        
+                    } @catch (NSException *exception) {
+                        RLog(RptrLogAreaError, @"[SEGMENT-ROTATION] Failed to start session: %@", exception);
+                        strongSelf.isTransitioning = NO;
+                    }
                 } else {
-                    RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Not starting new segment - writing has been stopped");
+                    // Writer not ready yet, let first frame start the session
+                    RLog(RptrLogAreaProtocol, @"[SEGMENT-ROTATION] Writer not ready (status: %ld), will start session on first frame", 
+                         (long)strongSelf.assetWriter.status);
+                    strongSelf.isTransitioning = NO;
+                    // Don't start session here, let the first frame do it
                 }
             });
         }];
-    });
-}
-
-- (void)finalizeCurrentSegment {
-    NSTimeInterval segmentAge = [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime];
-    RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Finalizing segment %ld after %.3f seconds (expected: %.1f)", 
-           (long)self.currentSegmentIndex, segmentAge, self.qualitySettings.segmentDuration);
-    
-    if (!self.assetWriter) {
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaError, @"ERROR: No asset writer to finalize");
-        return;
     }
-    
-    if (self.assetWriter.status != AVAssetWriterStatusCompleted) {
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaError, @"ERROR: Writer not completed, status: %ld", (long)self.assetWriter.status);
-        return;
-    }
-    
-    // Check if we're using delegate-based writing (iOS 14+)
-    BOOL isDelegateBased = NO;
-    if (@available(iOS 14.0, *)) {
-        isDelegateBased = (self.assetWriter.outputURL == nil);
-    }
-    
-    if (isDelegateBased) {
-        // For delegate-based writing, segments are handled via delegate callbacks
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Using delegate-based segment delivery - segments handled via delegate");
-        
-        // The actual segment data has already been delivered via the delegate method
-        // Just clean up the writer reference
-        self.assetWriter = nil;
-        return;
-    }
-    
-    // File-based writing path (for older iOS versions)
-    NSURL *segmentURL = self.assetWriter.outputURL;
-    NSString *segmentPath = segmentURL.path;
-    RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaFile, @"Segment path: %@", segmentPath);
-    
-    // Get file size
-    NSError *fileError;
-    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:segmentPath error:&fileError];
-    NSUInteger fileSize = [attrs fileSize];
-    
-    if (fileError) {
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaFile | RptrLogAreaError, @"ERROR: Cannot get segment file attributes: %@", fileError);
-    }
-    
-    // Verify file exists
-    BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:segmentPath];
-    RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaFile | RptrLogAreaDebug, @"Segment file exists: %@, size: %lu bytes", fileExists ? @"YES" : @"NO", (unsigned long)fileSize);
-    
-    if (fileSize > 0) {
-        // Calculate actual duration based on writer session
-        CMTime duration = CMTimeMakeWithSeconds(self.qualitySettings.segmentDuration, 1000); // More precise timing
-        
-        // Create segment info
-        HLSSegmentInfo *segmentInfo = [[HLSSegmentInfo alloc] init];
-        segmentInfo.filename = segmentURL.lastPathComponent;
-        segmentInfo.path = segmentPath;
-        segmentInfo.duration = duration;
-        segmentInfo.sequenceNumber = self.mediaSequenceNumber++;
-        segmentInfo.createdAt = [NSDate date];
-        segmentInfo.fileSize = fileSize;
-        
-        // Add to segments array
-        [self.segments addObject:segmentInfo];
-        
-        // Debug: Log current segments
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Current segments in array:");
-        for (HLSSegmentInfo *seg in self.segments) {
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"  - %@ (path: %@)", seg.filename, seg.path);
-        }
-        
-        // Remove old segments
-        [self cleanupOldSegments];
-        
-        // Update playlist
-        [self updatePlaylist];
-        
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Finalized segment %@ (#%ld, %.2fs, %lu bytes) - Total segments: %lu", 
-              segmentInfo.filename, 
-              (long)segmentInfo.sequenceNumber,
-              CMTimeGetSeconds(segmentInfo.duration),
-              (unsigned long)fileSize,
-              (unsigned long)self.segments.count);
-        
-        // Verify the file is actually accessible
-        if ([[NSFileManager defaultManager] fileExistsAtPath:segmentPath]) {
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaFile | RptrLogAreaDebug, @"Verified segment file exists at: %@", segmentPath);
-        } else {
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaFile | RptrLogAreaError, @"ERROR: Segment file missing at: %@", segmentPath);
-        }
-    } else {
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaError, @"Failed to finalize segment: empty file");
-    }
-    
-    // Clear the writer reference
-    self.assetWriter = nil;
 }
 
 #pragma mark - Segment Timer
 
 - (void)startSegmentTimer {
+    // TEST 4: ENABLED - Manual flushSegment control
+    RLog(RptrLogAreaProtocol, @"[TEST4] Segment timer ENABLED for manual flushSegment");
+    RLog(RptrLogAreaProtocol, @"[TEST4] Will call flushSegment every 1 second");
+    
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self stopSegmentTimer];
-        // Fire timer well before segment duration to ensure timely rotation
-        self.segmentTimer = [NSTimer scheduledTimerWithTimeInterval:self.qualitySettings.segmentDuration - self.qualitySettings.segmentTimerOffset
+        [self.segmentTimer invalidate];
+        self.segmentTimer = [NSTimer scheduledTimerWithTimeInterval:1.0  // Flush every 1 second
                                                               target:self
-                                                            selector:@selector(segmentTimerFired:)
+                                                            selector:@selector(manualFlushSegment)
                                                             userInfo:nil
                                                              repeats:YES];
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Started segment rotation timer (interval: %.1f)", self.qualitySettings.segmentDuration - self.qualitySettings.segmentTimerOffset);
+        RLog(RptrLogAreaProtocol, @"[TEST4] Started manual flush timer");
     });
 }
 
 - (void)stopSegmentTimer {
-    if (self.segmentTimer) {
+    dispatch_async(dispatch_get_main_queue(), ^{
         [self.segmentTimer invalidate];
         self.segmentTimer = nil;
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"Stopped segment rotation timer");
-    }
+        RLog(RptrLogAreaProtocol, @"[SEGMENT-TIMER] Stopped segment rotation timer");
+    });
 }
 
-- (void)segmentTimerFired:(NSTimer *)timer {
-    dispatch_async(self.writerQueue, ^{
-        if (!self.isWriting || !self.sessionStarted) {
-            return;
-        }
-        
-        // Check writer state
-        if (!self.assetWriter || self.assetWriter.status != AVAssetWriterStatusWriting) {
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming | RptrLogAreaError, @"[TIMER] Writer not ready for rotation, status: %ld", 
-                  self.assetWriter ? (long)self.assetWriter.status : -1);
-            return;
-        }
-        
-        NSTimeInterval elapsed = [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime];
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming | RptrLogAreaDebug, @"[TIMER] Segment timer fired for segment %ld, elapsed: %.3f seconds (target: %.1f)", 
-               (long)self.currentSegmentIndex, elapsed, self.qualitySettings.segmentDuration);
-        
-        if (elapsed >= self.qualitySettings.segmentDuration - self.qualitySettings.segmentTimerOffset) {
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaTiming, @"[TIMER] Setting force rotation flag for segment %ld (elapsed: %.3f)", 
-                   (long)self.currentSegmentIndex, elapsed);
-            self.forceSegmentRotation = YES;
-        }
-    });
+- (void)checkSegmentRotation {
+    if (!self.isTransitioning && self.sessionStarted) {
+        dispatch_async(self.writerQueue, ^{
+            [self rotateSegmentWithKeyframeCheck];
+        });
+    }
 }
 
 #pragma mark - Playlist Management
 
-- (void)createInitialPlaylist {
-    RLog(RptrLogAreaHLS | RptrLogAreaFile, @"Creating initial playlist...");
+- (void)createPlaceholderSegment {
+    RLog(RptrLogAreaProtocol, @"Creating placeholder segment...");
     
+    // Check if placeholder already exists
+    [self.segmentDataLock lock];
+    if ([self.segmentData objectForKey:@"placeholder.m4s"]) {
+        [self.segmentDataLock unlock];
+        RLog(RptrLogAreaProtocol, @"Placeholder segment already exists");
+        return;
+    }
+    [self.segmentDataLock unlock];
+    
+    @autoreleasepool {
+        // Create a simple video with a "Starting Stream..." message
+        // We'll create a single frame video segment
+        CGSize videoSize = CGSizeMake(1920, 1080);
+        
+        // Create a bitmap context
+        UIGraphicsBeginImageContextWithOptions(videoSize, YES, 1.0);
+        CGContextRef context = UIGraphicsGetCurrentContext();
+        
+        // Fill with dark background
+        [[UIColor colorWithRed:0.1 green:0.1 blue:0.1 alpha:1.0] setFill];
+        CGContextFillRect(context, CGRectMake(0, 0, videoSize.width, videoSize.height));
+        
+        // Draw app icon if available
+        UIImage *appIcon = [UIImage imageNamed:@"AppIcon"];
+        if (appIcon) {
+            CGFloat iconSize = 200;
+            CGRect iconRect = CGRectMake((videoSize.width - iconSize) / 2, 
+                                         (videoSize.height - iconSize) / 2 - 100,
+                                         iconSize, iconSize);
+            [appIcon drawInRect:iconRect];
+        }
+        
+        // Draw text
+        NSString *text = @"Starting Stream...";
+        UIFont *font = [UIFont boldSystemFontOfSize:60];
+        NSDictionary *attributes = @{
+            NSFontAttributeName: font,
+            NSForegroundColorAttributeName: [UIColor whiteColor]
+        };
+        CGSize textSize = [text sizeWithAttributes:attributes];
+        CGRect textRect = CGRectMake((videoSize.width - textSize.width) / 2,
+                                     (videoSize.height - textSize.height) / 2 + 150,
+                                     textSize.width, textSize.height);
+        [text drawInRect:textRect withAttributes:attributes];
+        
+        // Get the image
+        UIImage *placeholderImage = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        
+        // Convert to pixel buffer
+        CVPixelBufferRef pixelBuffer = NULL;
+        NSDictionary *options = @{
+            (NSString *)kCVPixelBufferCGImageCompatibilityKey: @YES,
+            (NSString *)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES
+        };
+        CVPixelBufferCreate(kCFAllocatorDefault, 
+                            videoSize.width, videoSize.height,
+                            kCVPixelFormatType_32ARGB, 
+                            (__bridge CFDictionaryRef)options,
+                            &pixelBuffer);
+        
+        CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+        void *pxdata = CVPixelBufferGetBaseAddress(pixelBuffer);
+        CGColorSpaceRef rgbColorSpace = CGColorSpaceCreateDeviceRGB();
+        CGContextRef bitmapContext = CGBitmapContextCreate(pxdata, videoSize.width, videoSize.height,
+                                                           8, CVPixelBufferGetBytesPerRow(pixelBuffer),
+                                                           rgbColorSpace, kCGImageAlphaNoneSkipFirst);
+        CGContextDrawImage(bitmapContext, CGRectMake(0, 0, videoSize.width, videoSize.height), 
+                          placeholderImage.CGImage);
+        CGColorSpaceRelease(rgbColorSpace);
+        CGContextRelease(bitmapContext);
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+        
+        // Create video using AVAssetWriter
+        NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"placeholder_temp.mp4"];
+        [[NSFileManager defaultManager] removeItemAtPath:tempPath error:nil];
+        NSURL *outputURL = [NSURL fileURLWithPath:tempPath];
+        
+        AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:outputURL 
+                                                           fileType:AVFileTypeMPEG4 
+                                                              error:nil];
+        
+        NSDictionary *videoSettings = @{
+            AVVideoCodecKey: AVVideoCodecTypeH264,
+            AVVideoWidthKey: @(videoSize.width),
+            AVVideoHeightKey: @(videoSize.height),
+            AVVideoCompressionPropertiesKey: @{
+                AVVideoAverageBitRateKey: @(self.qualitySettings.videoBitrate),
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+            }
+        };
+        
+        AVAssetWriterInput *writerInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
+                                                                             outputSettings:videoSettings];
+        AVAssetWriterInputPixelBufferAdaptor *adaptor = [AVAssetWriterInputPixelBufferAdaptor
+                                                         assetWriterInputPixelBufferAdaptorWithAssetWriterInput:writerInput
+                                                         sourcePixelBufferAttributes:nil];
+        
+        [writer addInput:writerInput];
+        [writer startWriting];
+        [writer startSessionAtSourceTime:kCMTimeZero];
+        
+        // Write multiple frames to create a 2-second video
+        for (int i = 0; i < 60; i++) { // 2 seconds at 30fps
+            CMTime presentationTime = CMTimeMake(i, 30);
+            while (!writerInput.readyForMoreMediaData) {
+                [NSThread sleepForTimeInterval:0.01];
+            }
+            [adaptor appendPixelBuffer:pixelBuffer withPresentationTime:presentationTime];
+        }
+        
+        CVPixelBufferRelease(pixelBuffer);
+        
+        [writerInput markAsFinished];
+        
+        // Use dispatch_semaphore to wait for completion
+        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+        [writer finishWritingWithCompletionHandler:^{
+            // Read the generated file
+            NSData *segmentData = [NSData dataWithContentsOfFile:tempPath];
+            if (segmentData) {
+                // Store in memory
+                [self.segmentDataLock lock];
+                [self.segmentData setObject:segmentData forKey:@"placeholder.m4s"];
+                [self.segmentDataLock unlock];
+                
+                RLog(RptrLogAreaProtocol, @"Placeholder segment created: %lu bytes", 
+                     (unsigned long)segmentData.length);
+            }
+            
+            // Clean up temp file
+            [[NSFileManager defaultManager] removeItemAtPath:tempPath error:nil];
+            dispatch_semaphore_signal(semaphore);
+        }];
+        
+        // Wait for completion (with timeout)
+        dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+    }
+}
+
+- (void)createInitialPlaylist {
+    RLog(RptrLogAreaProtocol, @"Creating initial empty playlist...");
+    
+    // Don't include placeholder - just create empty playlist
+    // The placeholder approach causes media sequence mismatches
     NSString *playlist = [NSString stringWithFormat:@"#EXTM3U\n"
                         @"#EXT-X-VERSION:6\n"  // Version 6 for better compatibility
                         @"#EXT-X-TARGETDURATION:%ld\n"
@@ -1216,7 +1424,7 @@
                         @"#EXT-X-START:TIME-OFFSET=-%.1f\n"
                         @"#EXT-X-INDEPENDENT-SEGMENTS\n"
                         @"#EXT-X-ALLOW-CACHE:NO\n"
-                        @"#EXT-X-DISCONTINUITY-SEQUENCE:0\n", 
+                        @"#EXT-X-DISCONTINUITY-SEQUENCE:0\n",
                         (long)self.qualitySettings.targetDuration,
                         self.qualitySettings.segmentDuration * 2,
                         self.qualitySettings.segmentDuration * 2];
@@ -1226,18 +1434,26 @@
     [playlist writeToFile:playlistPath atomically:YES encoding:NSUTF8StringEncoding error:&error];
     
     if (error) {
-        RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaError, @"Failed to create initial playlist: %@", error);
+        RLog(RptrLogAreaError, @"Failed to create initial playlist: %@", error);
     } else {
-        RLog(RptrLogAreaHLS | RptrLogAreaFile, @"Initial playlist created at: %@", playlistPath);
+        RLog(RptrLogAreaProtocol, @"Initial empty playlist created at: %@", playlistPath);
     }
 }
 
 - (void)updatePlaylist {
     dispatch_async(self.writerQueue, ^{
-        RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaDebug, @"Updating playlist...");
+        RLog(RptrLogAreaProtocol, @"Updating playlist...");
+        
+        // Track playlist update event with observer
+        [[HLSSegmentObserver sharedObserver] trackSegmentEvent:HLSSegmentEventPlaylistUpdated
+                                                   segmentName:@"playlist.m3u8"
+                                                sequenceNumber:self.mediaSequenceNumber
+                                                          size:0
+                                                     segmentID:nil];
+        
         dispatch_sync(self.segmentsQueue, ^{
             NSUInteger segmentCount = self.segments.count;
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Total segments available: %lu", (unsigned long)segmentCount);
+        RLog(RptrLogAreaProtocol, @"Total segments available: %lu", (unsigned long)segmentCount);
         
         NSMutableString *playlist = [NSMutableString string];
         
@@ -1246,6 +1462,7 @@
         [playlist appendString:@"#EXT-X-VERSION:6\n"]; // Version 6 for better compatibility (still supports fMP4)
         [playlist appendFormat:@"#EXT-X-TARGETDURATION:%ld\n", (long)self.qualitySettings.targetDuration];
         [playlist appendString:@"#EXT-X-PLAYLIST-TYPE:EVENT\n"]; // Live event that will eventually end
+        [playlist appendString:@"#EXT-X-INDEPENDENT-SEGMENTS\n"]; // CRITICAL for fMP4: segments can be decoded independently
         [playlist appendFormat:@"#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=%.1f\n", self.qualitySettings.segmentDuration * 2]; // Allow skipping old segments
         [playlist appendFormat:@"#EXT-X-START:TIME-OFFSET=-%.1f\n", self.qualitySettings.segmentDuration * 2]; // Start playback 2 segments from live edge
         
@@ -1270,11 +1487,11 @@
         }
         
         // Debug: log current segment index and media sequence
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Playlist generation - currentSegmentIndex: %ld, mediaSequenceNumber: %ld", 
+        RLog(RptrLogAreaProtocol, @"Playlist generation - currentSegmentIndex: %ld, mediaSequenceNumber: %ld", 
              (long)self.currentSegmentIndex, (long)self.mediaSequenceNumber);
         
         // Add segments (sliding window)
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Adding segments from index %ld to %lu", (long)startIndex, (unsigned long)segmentCount);
+        RLog(RptrLogAreaProtocol, @"Adding segments from index %ld to %lu", (long)startIndex, (unsigned long)segmentCount);
         
         // Add program date time for first segment in window
         if (segmentCount > startIndex && self.segments[startIndex].createdAt) {
@@ -1285,34 +1502,52 @@
             [playlist appendFormat:@"#EXT-X-PROGRAM-DATE-TIME:%@\n", dateString];
         }
         
+        // Filter segments - skip zero-duration segments but keep accurate durations
         for (NSInteger i = startIndex; i < segmentCount; i++) {
             HLSSegmentInfo *segment = self.segments[i];
             CGFloat duration = CMTimeGetSeconds(segment.duration);
+            
+            // Skip zero-duration segments entirely (these are empty segments from forced rotation)
+            if (duration < 0.01) {
+                RLog(RptrLogAreaProtocol, @"Skipping zero-duration segment: %@ (%.3fs)", segment.filename, duration);
+                continue;
+            }
             
             // Add discontinuity tag if this is the first segment and not the very first in the stream
             if (i == startIndex && startIndex > 0) {
                 [playlist appendString:@"#EXT-X-DISCONTINUITY\n"];
             }
             
+            // RFC 8216: EXTINF duration MUST match actual segment duration
+            // We can't lie about durations or merge segments in the playlist
+            // Each EXTINF must point to a unique segment with matching duration
             [playlist appendFormat:@"#EXTINF:%.3f,\n", duration];
             [playlist appendFormat:@"/stream/%@/segments/%@\n", self.randomPath, segment.filename];
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Added segment: %@ (%.2fs) -> URL: segments/%@", segment.filename, duration, segment.filename);
+            
+            // Log segment addition
+            if (duration < 0.8) {
+                RLog(RptrLogAreaProtocol, @"Added short segment: %@ (%.2fs) -> URL: segments/%@", 
+                     segment.filename, duration, segment.filename);
+            } else {
+                RLog(RptrLogAreaProtocol, @"Added segment: %@ (%.2fs) -> URL: segments/%@", 
+                     segment.filename, duration, segment.filename);
+            }
         }
         
         // For live streams, don't add EXT-X-ENDLIST
         
         // Write playlist to file
         NSString *playlistPath = [self.baseDirectory stringByAppendingPathComponent:@"playlist.m3u8"];
-        RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaDebug, @"Writing playlist to: %@", playlistPath);
+        RLog(RptrLogAreaProtocol, @"Writing playlist to: %@", playlistPath);
         
         NSError *error;
         [playlist writeToFile:playlistPath atomically:YES encoding:NSUTF8StringEncoding error:&error];
         
         if (error) {
-            RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaError, @"Failed to write playlist: %@", error);
+            RLog(RptrLogAreaError, @"Failed to write playlist: %@", error);
         } else {
-            RLog(RptrLogAreaHLS | RptrLogAreaFile, @"Updated playlist with %ld segments", (long)(segmentCount - startIndex));
-            RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaDebug, @"Playlist content:\n%@", playlist);
+            RLog(RptrLogAreaProtocol, @"Updated playlist with %ld segments", (long)(segmentCount - startIndex));
+            RLog(RptrLogAreaProtocol, @"Playlist content:\n%@", playlist);
         }
         });
     });
@@ -1331,7 +1566,7 @@
             // Remove from array
             [self.segments removeObjectAtIndex:0];
             
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Removed old segment: %@ (#%ld, age: %.1fs) - Segments: %lu -> %lu", 
+            RLog(RptrLogAreaProtocol, @"Removed old segment: %@ (#%ld, age: %.1fs) - Segments: %lu -> %lu", 
                    oldSegment.filename, (long)oldSegment.sequenceNumber, segmentAge,
                    (unsigned long)initialCount, (unsigned long)self.segments.count);
         }
@@ -1345,7 +1580,7 @@
             NSError *error = nil;
             [[NSFileManager defaultManager] removeItemAtPath:segment.path error:&error];
             if (error) {
-                RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaError, @"Failed to remove segment %@: %@", segment.filename, error.localizedDescription);
+                RLog(RptrLogAreaError, @"Failed to remove segment %@: %@", segment.filename, error.localizedDescription);
             }
         }
         [self.segments removeAllObjects];
@@ -1363,7 +1598,7 @@
             NSString *filePath = [self.segmentDirectory stringByAppendingPathComponent:file];
             [[NSFileManager defaultManager] removeItemAtPath:filePath error:nil];
         }
-        RLog(RptrLogAreaHLS | RptrLogAreaFile, @"Cleaned up %lu files from segments directory", (unsigned long)files.count);
+        RLog(RptrLogAreaProtocol, @"Cleaned up %lu files from segments directory", (unsigned long)files.count);
     }
 }
 
@@ -1390,8 +1625,13 @@
         
         int clientSocket = accept(self.serverSocket, (struct sockaddr *)&clientAddr, &clientLen);
         if (clientSocket < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Non-blocking socket has no pending connections
+                usleep(10000); // Sleep 10ms to avoid busy-waiting
+                continue;
+            }
             if (self.running) {
-                RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaError, @"Accept failed");
+                RLog(RptrLogAreaError, @"Accept failed: %s (errno: %d)", strerror(errno), errno);
             }
             continue;
         }
@@ -1399,7 +1639,7 @@
         // Copy client address for async use
         struct sockaddr_in *clientAddrCopy = malloc(sizeof(struct sockaddr_in));
         if (!clientAddrCopy) {
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaError, @"ERROR: Failed to allocate memory for client address");
+            RLog(RptrLogAreaError, @"ERROR: Failed to allocate memory for client address");
             close(clientSocket);
             continue;
         }
@@ -1418,8 +1658,8 @@
             @try {
                 [strongSelf handleClient:clientSocket address:clientAddrCopy];
             } @catch (NSException *exception) {
-                RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaError, @"ERROR: Exception handling client: %@", exception);
-                RLog(RptrLogAreaHLS | RptrLogAreaError | RptrLogAreaDebug, @"Stack trace: %@", exception.callStackSymbols);
+                RLog(RptrLogAreaError, @"ERROR: Exception handling client: %@", exception);
+                RLog(RptrLogAreaError, @"Stack trace: %@", exception.callStackSymbols);
             } @finally {
                 free(clientAddrCopy);
             }
@@ -1452,7 +1692,7 @@
     NSParameterAssert(clientSocket >= 0);
     NSParameterAssert(clientAddr != NULL);
     
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"1. handleClient started for socket: %d", clientSocket);
+    RLog(RptrLogAreaProtocol, @"1. handleClient started for socket: %d", clientSocket);
     
     // Use inet_ntop for thread safety
     char clientIP[INET_ADDRSTRLEN];
@@ -1462,7 +1702,7 @@
         clientAddress = [NSString stringWithUTF8String:clientIP];
         NSAssert(clientAddress != nil, @"Client address conversion should not fail");
     } else {
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaError, @"WARNING: Failed to get client IP address: %s", strerror(errno));
+        RLog(RptrLogAreaError, @"WARNING: Failed to get client IP address: %s", strerror(errno));
     }
     
     // Add client
@@ -1484,52 +1724,66 @@
         }
     });
     
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork, @"Client connected: %@ (active clients: %lu)", clientAddress, (unsigned long)self.activeClients.count);
+    RLog(RptrLogAreaProtocol, @"Client connected: %@ (active clients: %lu)", clientAddress, (unsigned long)self.activeClients.count);
     
     // Read request
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"2. About to read request from socket %d", clientSocket);
+    RLog(RptrLogAreaProtocol, @"2. About to read request from socket %d", clientSocket);
     char buffer[self.qualitySettings.httpBufferSize];
     ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"3. Read %zd bytes from socket %d", bytesRead, clientSocket);
+    RLog(RptrLogAreaProtocol, @"3. Read %zd bytes from socket %d", bytesRead, clientSocket);
     
     if (bytesRead < 0) {
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaError, @"ERROR: Failed to read from client socket: %s", strerror(errno));
+        RLog(RptrLogAreaError, @"ERROR: Failed to read from client socket: %s", strerror(errno));
         // Still need to remove client and close socket
     } else if (bytesRead > 0) {
         buffer[bytesRead] = '\0';
         
         // Validate UTF8 before creating string
         if (![[NSString alloc] initWithBytes:buffer length:bytesRead encoding:NSUTF8StringEncoding]) {
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaError, @"ERROR: Invalid UTF8 in request");
+            RLog(RptrLogAreaError, @"ERROR: Invalid UTF8 in request");
             [self sendErrorResponse:clientSocket code:400 message:@"Bad Request"];
             close(clientSocket);
             return;
         }
         
         NSString *request = [NSString stringWithUTF8String:buffer];
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"4. Request string created, length: %lu", (unsigned long)[request length]);
+        RLog(RptrLogAreaProtocol, @"4. Request string created, length: %lu", (unsigned long)[request length]);
         
         // Parse request
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"5. Parsing request...");
+        RLog(RptrLogAreaProtocol, @"5. Parsing request...");
         NSArray *lines = [request componentsSeparatedByString:@"\r\n"];
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"6. Request has %lu lines", (unsigned long)lines.count);
+        RLog(RptrLogAreaProtocol, @"6. Request has %lu lines", (unsigned long)lines.count);
         if (lines.count > 0) {
             NSArray *parts = [lines[0] componentsSeparatedByString:@" "];
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"7. First line has %lu parts", (unsigned long)parts.count);
+            RLog(RptrLogAreaProtocol, @"7. First line has %lu parts", (unsigned long)parts.count);
             if (parts.count >= 2) {
                 NSString *method = parts[0];
                 NSString *path = parts[1];
                 
                 // Debug: Log path details
-                RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"Raw path: '%@' (length: %lu)", path, (unsigned long)path.length);
-                RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"Path bytes: %@", [path dataUsingEncoding:NSUTF8StringEncoding]);
+                RLog(RptrLogAreaProtocol, @"Raw path: '%@' (length: %lu)", path, (unsigned long)path.length);
+                RLog(RptrLogAreaProtocol, @"Path bytes: %@", [path dataUsingEncoding:NSUTF8StringEncoding]);
                 
-                RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Request: %@ %@ (socket %d)", method, path, clientSocket);
+                RLog(RptrLogAreaProtocol, @"Request: %@ %@ (socket %d)", method, path, clientSocket);
                 
                 if ([method isEqualToString:@"GET"]) {
-                    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"9. Calling handleGETRequest for path: %@", path);
+                    RLog(RptrLogAreaProtocol, @"9. Calling handleGETRequest for path: %@", path);
                     [self handleGETRequest:path socket:clientSocket];
-                    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"10. handleGETRequest completed for path: %@", path);
+                    RLog(RptrLogAreaProtocol, @"10. handleGETRequest completed for path: %@", path);
+                } else if ([method isEqualToString:@"POST"]) {
+                    // Handle POST requests (mainly for client events)
+                    RLog(RptrLogAreaProtocol, @"Handling POST request for path: %@", path);
+                    if ([path isEqualToString:@"/client-event"]) {
+                        [self handleClientEventReport:clientSocket];
+                    } else if ([path isEqualToString:@"/log"]) {
+                        [self handleLogRequest:clientSocket request:request];
+                    } else {
+                        [self sendErrorResponse:clientSocket code:404 message:@"Not Found"];
+                    }
+                } else if ([method isEqualToString:@"OPTIONS"]) {
+                    // Handle CORS preflight requests
+                    RLog(RptrLogAreaProtocol, @"Handling OPTIONS preflight for path: %@", path);
+                    [self sendOptionsResponse:clientSocket];
                 } else {
                     [self sendErrorResponse:clientSocket code:405 message:@"Method Not Allowed"];
                 }
@@ -1556,8 +1810,8 @@
 }
 
 - (void)handleGETRequest:(NSString *)path socket:(int)clientSocket {
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"GET %@ (socket: %d)", path, clientSocket);
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"handleGETRequest entry - path class: %@", [path class]);
+    RLog(RptrLogAreaProtocol, @"GET %@ (socket: %d)", path, clientSocket);
+    RLog(RptrLogAreaProtocol, @"handleGETRequest entry - path class: %@", [path class]);
     
     // Update client activity
     dispatch_barrier_async(self.clientsQueue, ^{
@@ -1580,9 +1834,10 @@
     }
     
     // Debug logging to understand path matching
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"Request path: '%@', Current randomPath: '%@'", path, self.randomPath);
+    RLog(RptrLogAreaProtocol, @"Request path: '%@', Current randomPath: '%@'", path, self.randomPath);
     
     if ([path isEqualToString:@"/"]) {
+        // Root path serves the playlist (legacy support)
         [self sendPlaylistResponse:clientSocket];
     } else if ([path isEqualToString:@"/debug"]) {
         [self sendDebugResponse:clientSocket];
@@ -1595,23 +1850,23 @@
                             @"Content-Length: 0\r\n"
                             @"\r\n", redirectURL];
         send(clientSocket, response.UTF8String, response.length, MSG_NOSIGNAL);
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Redirecting /view to %@", redirectURL);
+        RLog(RptrLogAreaProtocol, @"Redirecting /view to %@", redirectURL);
     } else if ([path isEqualToString:[NSString stringWithFormat:@"/view/%@", self.randomPath]]) {
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Test page requested on socket %d", clientSocket);
-        [self sendTestPageResponse:clientSocket];
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"Test page response completed for socket %d", clientSocket);
+        RLog(RptrLogAreaProtocol, @"Page requested on socket %d", clientSocket);
+        [self sendViewPageResponse:clientSocket];
+        RLog(RptrLogAreaProtocol, @"Page response completed for socket %d", clientSocket);
     } else if ([path isEqualToString:[NSString stringWithFormat:@"/stream/%@/playlist.m3u8", self.randomPath]]) {
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Secure playlist requested on socket %d", clientSocket);
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"DEBUG: Expected path: /stream/%@/playlist.m3u8", self.randomPath);
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"DEBUG: Received path: %@", path);
+        RLog(RptrLogAreaProtocol, @"Secure playlist requested on socket %d", clientSocket);
+        RLog(RptrLogAreaProtocol, @"DEBUG: Expected path: /stream/%@/playlist.m3u8", self.randomPath);
+        RLog(RptrLogAreaProtocol, @"DEBUG: Received path: %@", path);
         [self sendPlaylistResponse:clientSocket];
     } else if ([path isEqualToString:[NSString stringWithFormat:@"/stream/%@/init.mp4", self.randomPath]]) {
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Secure init segment requested on socket %d", clientSocket);
+        RLog(RptrLogAreaProtocol, @"Secure init segment requested on socket %d", clientSocket);
         [self sendInitializationSegmentResponse:clientSocket];
     } else if ([path hasPrefix:[NSString stringWithFormat:@"/stream/%@/segments/", self.randomPath]]) {
         NSString *segmentPrefix = [NSString stringWithFormat:@"/stream/%@/segments/", self.randomPath];
         NSString *segmentName = [path substringFromIndex:segmentPrefix.length];
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Secure segment requested: %@ on socket %d", segmentName, clientSocket);
+        RLog(RptrLogAreaProtocol, @"Secure segment requested: %@ on socket %d", segmentName, clientSocket);
         
         // Debug logging for segment state
         [self.segmentDataLock lock];
@@ -1619,36 +1874,33 @@
         BOOL hasSegment = [self.segmentData objectForKey:segmentName] != nil;
         [self.segmentDataLock unlock];
         
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"Segment lookup: %@ - exists: %@, total segments in memory: %lu", 
+        RLog(RptrLogAreaProtocol, @"Segment lookup: %@ - exists: %@, total segments in memory: %lu", 
              segmentName, hasSegment ? @"YES" : @"NO", (unsigned long)segmentDataCount);
         
-        // Check if we're using delegate-based writing (iOS 14+)
-        if (@available(iOS 14.0, *)) {
-            if (self.assetWriter && self.assetWriter.delegate) {
-                // Use delegate-based segment serving for in-memory segments
-                [self sendDelegateSegmentResponse:clientSocket segmentName:segmentName];
-            } else {
-                // Fallback to file-based serving
-                [self sendSegmentResponse:clientSocket segmentName:segmentName];
-            }
+        // Check if delegate-based writing is active
+        if (self.assetWriter && self.assetWriter.delegate) {
+            // Use delegate-based segment serving for in-memory segments
+            [self sendDelegateSegmentResponse:clientSocket segmentName:segmentName];
         } else {
-            // iOS < 14, always use file-based
+            // Fallback to file-based serving
             [self sendSegmentResponse:clientSocket segmentName:segmentName];
         }
     } else if ([path hasPrefix:@"/css/"] || [path hasPrefix:@"/js/"] || [path hasPrefix:@"/images/"]) {
         // Serve bundled resources
         [self sendBundledResourceResponse:clientSocket path:path];
-    } else if ([path isEqualToString:@"/test-external"]) {
-        [self sendExternalTestPageResponse:clientSocket];
     } else if ([path isEqualToString:@"/location"]) {
         [self sendLocationResponse:clientSocket];
     } else if ([path isEqualToString:@"/status"]) {
         [self sendStatusResponse:clientSocket];
+    } else if ([path isEqualToString:@"/health"]) {
+        [self sendHealthResponse:clientSocket];
+    } else if ([path isEqualToString:@"/client-event"]) {
+        [self handleClientEventReport:clientSocket];
     } else if (self.previousRandomPath && 
                ([path containsString:[NSString stringWithFormat:@"/stream/%@/", self.previousRandomPath]] ||
                 [path containsString:[NSString stringWithFormat:@"/view/%@", self.previousRandomPath]])) {
         // Request is using the old random path after regeneration
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Request using old path: %@ (current: %@)", self.previousRandomPath, self.randomPath);
+        RLog(RptrLogAreaProtocol, @"Request using old path: %@ (current: %@)", self.previousRandomPath, self.randomPath);
         // Send 410 Gone to indicate the resource has been permanently removed
         // This should trigger clients to reload
         [self sendErrorResponse:clientSocket code:410 message:@"Gone - URL has been regenerated"];
@@ -1658,14 +1910,14 @@
         close(clientSocket);
         return;
     } else {
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"DEBUG: Unmatched request path: %@", path);
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"DEBUG: Current randomPath: %@", self.randomPath);
+        RLog(RptrLogAreaProtocol, @"DEBUG: Unmatched request path: %@", path);
+        RLog(RptrLogAreaProtocol, @"DEBUG: Current randomPath: %@", self.randomPath);
         
         // Extra debugging for segment paths
         if ([path containsString:@"/segments/"]) {
             NSString *expectedPrefix = [NSString stringWithFormat:@"/stream/%@/segments/", self.randomPath];
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"DEBUG: Expected segment prefix: %@", expectedPrefix);
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"DEBUG: Path has prefix: %@", [path hasPrefix:expectedPrefix] ? @"YES" : @"NO");
+            RLog(RptrLogAreaProtocol, @"DEBUG: Expected segment prefix: %@", expectedPrefix);
+            RLog(RptrLogAreaProtocol, @"DEBUG: Path has prefix: %@", [path hasPrefix:expectedPrefix] ? @"YES" : @"NO");
         }
         
         [self sendErrorResponse:clientSocket code:404 message:@"Not Found"];
@@ -1673,34 +1925,31 @@
 }
 
 - (void)sendPlaylistResponse:(int)clientSocket {
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"=== Playlist Request Debug ===");
-    BOOL isDelegateAvailable = NO;
-    if (@available(iOS 14.0, *)) {
-        isDelegateAvailable = YES;
-    }
-    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Using delegate-based approach: %@", isDelegateAvailable ? @"YES" : @"NO");
-    RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Initialization segment available: %@", self.initializationSegmentData ? @"YES" : @"NO");
+    RLog(RptrLogAreaProtocol, @"=== Playlist Request Debug ===");
+    BOOL isDelegateAvailable = YES; // Always available with iOS 14+ minimum
+    RLog(RptrLogAreaProtocol, @"Using delegate-based approach: %@", isDelegateAvailable ? @"YES" : @"NO");
+    RLog(RptrLogAreaProtocol, @"Initialization segment available: %@", self.initializationSegmentData ? @"YES" : @"NO");
     [self.segmentDataLock lock];
     NSUInteger segmentCount = self.segmentData.count;
     [self.segmentDataLock unlock];
-    RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Media segments in memory: %lu", (unsigned long)segmentCount);
+    RLog(RptrLogAreaProtocol, @"Media segments in memory: %lu", (unsigned long)segmentCount);
     __block NSUInteger arrayCount;
     dispatch_sync(self.segmentsQueue, ^{
         arrayCount = self.segments.count;
     });
-    RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Segments array count: %lu", (unsigned long)arrayCount);
+    RLog(RptrLogAreaProtocol, @"Segments array count: %lu", (unsigned long)arrayCount);
     
     NSString *playlistPath = [self.baseDirectory stringByAppendingPathComponent:@"playlist.m3u8"];
-    RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaDebug, @"Looking for playlist at: %@", playlistPath);
+    RLog(RptrLogAreaProtocol, @"Looking for playlist at: %@", playlistPath);
     
     // Check if file exists
     BOOL fileExists = [[NSFileManager defaultManager] fileExistsAtPath:playlistPath];
-    RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaDebug, @"Playlist file exists: %@", fileExists ? @"YES" : @"NO");
+    RLog(RptrLogAreaProtocol, @"Playlist file exists: %@", fileExists ? @"YES" : @"NO");
     
     NSData *playlistData = [NSData dataWithContentsOfFile:playlistPath];
     
     if (!playlistData) {
-        RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaError, @"ERROR: Playlist file missing, generating on demand");
+        RLog(RptrLogAreaError, @"ERROR: Playlist file missing, generating on demand");
         // Generate playlist on demand
         [self updatePlaylist];
         
@@ -1710,7 +1959,7 @@
         if (!playlistData) {
             // Still no playlist, check if we have any segments
             if (self.segments.count == 0) {
-                RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"No segments generated yet, sending minimal playlist with sequence %ld", (long)self.mediaSequenceNumber);
+                RLog(RptrLogAreaProtocol, @"No segments generated yet, sending minimal playlist with sequence %ld", (long)self.mediaSequenceNumber);
                 // Send a minimal playlist to keep client waiting
                 NSString *minimalPlaylist = [NSString stringWithFormat:
                     @"#EXTM3U\n"
@@ -1721,13 +1970,13 @@
                     (long)self.mediaSequenceNumber];
                 playlistData = [minimalPlaylist dataUsingEncoding:NSUTF8StringEncoding];
             } else {
-                RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaError, @"Failed to generate playlist despite having %lu segments", (unsigned long)self.segments.count);
+                RLog(RptrLogAreaError, @"Failed to generate playlist despite having %lu segments", (unsigned long)self.segments.count);
                 [self sendErrorResponse:clientSocket code:500 message:@"Playlist generation failed"];
                 return;
             }
         }
     } else {
-        RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaDebug, @"Playlist size: %lu bytes", (unsigned long)playlistData.length);
+        RLog(RptrLogAreaProtocol, @"Playlist size: %lu bytes", (unsigned long)playlistData.length);
     }
     
     // Send headers
@@ -1746,43 +1995,41 @@
 }
 
 - (void)sendSegmentResponse:(int)clientSocket segmentName:(NSString *)segmentName {
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaSegment, @"Segment requested: %@", segmentName);
+    RLog(RptrLogAreaProtocol, @"Segment requested: %@", segmentName);
     
-    // First check if segment exists in memory (for delegate-based writing)
-    if (@available(iOS 14.0, *)) {
-        [self.segmentDataLock lock];
-        NSData *segmentData = [self.segmentData objectForKey:segmentName];
-        [self.segmentDataLock unlock];
-        
-        if (segmentData) {
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Found segment in memory, using delegate response");
-            [self sendDelegateSegmentResponse:clientSocket segmentName:segmentName];
-            return;
-        }
+    // First check if segment exists in memory (delegate-based writing)
+    [self.segmentDataLock lock];
+    NSData *segmentData = [self.segmentData objectForKey:segmentName];
+    [self.segmentDataLock unlock];
+    
+    if (segmentData) {
+        RLog(RptrLogAreaProtocol, @"Found segment in memory, using delegate response");
+        [self sendDelegateSegmentResponse:clientSocket segmentName:segmentName];
+        return;
     }
     
     // Validate segment name
     if (![segmentName hasSuffix:@".mp4"] && ![segmentName hasSuffix:@".m4s"] && ![segmentName hasSuffix:@".ts"]) {
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaError, @"ERROR: Invalid segment extension for: %@", segmentName);
+        RLog(RptrLogAreaError, @"ERROR: Invalid segment extension for: %@", segmentName);
         [self sendErrorResponse:clientSocket code:400 message:@"Invalid segment"];
         return;
     }
     
     NSString *segmentPath = [self.segmentDirectory stringByAppendingPathComponent:segmentName];
-    RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaFile | RptrLogAreaDebug, @"Looking for segment at: %@", segmentPath);
+    RLog(RptrLogAreaProtocol, @"Looking for segment at: %@", segmentPath);
     
     // Debug: List all files in segment directory
     NSError *dirError;
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:self.segmentDirectory error:&dirError];
     if (dirError) {
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaFile | RptrLogAreaError, @"ERROR: Cannot list segment directory: %@", dirError);
+        RLog(RptrLogAreaError, @"ERROR: Cannot list segment directory: %@", dirError);
     } else {
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaFile | RptrLogAreaDebug, @"Files in segment directory (%@): %@", self.segmentDirectory, files);
+        RLog(RptrLogAreaProtocol, @"Files in segment directory (%@): %@", self.segmentDirectory, files);
     }
     
     // Check if file exists
     if (![[NSFileManager defaultManager] fileExistsAtPath:segmentPath]) {
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaFile | RptrLogAreaError, @"ERROR: Segment not found at path: %@", segmentPath);
+        RLog(RptrLogAreaError, @"ERROR: Segment not found at path: %@", segmentPath);
         [self sendErrorResponse:clientSocket code:404 message:@"Segment not found"];
         return;
     }
@@ -1808,7 +2055,7 @@
                         contentType,
                         (unsigned long)fileSize];
     
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaSegment | RptrLogAreaNetwork, @"Sending segment %@ (%lu bytes)", segmentName, (unsigned long)fileSize);
+    RLog(RptrLogAreaProtocol, @"Sending segment %@ (%lu bytes)", segmentName, (unsigned long)fileSize);
     
     send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
     
@@ -1837,7 +2084,7 @@
             }
         });
     } else {
-        RLog(RptrLogAreaHLS | RptrLogAreaFile | RptrLogAreaError, @"Failed to open segment file: %@", segmentPath);
+        RLog(RptrLogAreaError, @"Failed to open segment file: %@", segmentPath);
     }
 }
 
@@ -1858,7 +2105,7 @@
                         @"\r\n",
                         (unsigned long)self.initializationSegmentData.length];
     
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaSegment | RptrLogAreaNetwork, @"Sending initialization segment (%lu bytes)", (unsigned long)self.initializationSegmentData.length);
+    RLog(RptrLogAreaProtocol, @"Sending initialization segment (%lu bytes)", (unsigned long)self.initializationSegmentData.length);
     
     send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
     
@@ -1888,20 +2135,73 @@
     
     // Debug: log all available segments
     NSArray *allSegmentKeys = [self.segmentData allKeys];
-    RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Looking for segment: %@, available segments: %@", 
+    // Log for protocol debugging
+    RLog(RptrLogAreaProtocol, @"Looking for segment: %@, available segments: %@", 
          segmentName, [allSegmentKeys componentsJoinedByString:@", "]);
+    
+    // Track segment request with observer
+    NSInteger sequenceNum = -1;
+    if ([segmentName hasPrefix:@"segment_"] && [segmentName hasSuffix:@".m4s"]) {
+        NSString *numberStr = [segmentName substringWithRange:NSMakeRange(8, segmentName.length - 12)];
+        sequenceNum = [numberStr integerValue];
+    }
+    [[HLSSegmentObserver sharedObserver] trackSegmentEvent:HLSSegmentEventRequested
+                                               segmentName:segmentName
+                                            sequenceNumber:sequenceNum
+                                                      size:0
+                                                 segmentID:nil];
+    
+    // If not found, try alternative naming (for transition period between numbering schemes)
+    if (!segmentData && [segmentName hasPrefix:@"segment_"] && [segmentName hasSuffix:@".m4s"]) {
+        // Extract the number from the segment name
+        NSString *numberStr = [segmentName substringWithRange:NSMakeRange(8, segmentName.length - 12)];
+        long requestedNumber = [numberStr integerValue];
+        
+        // Try with currentSegmentIndex-based name (old scheme)
+        for (NSString *key in allSegmentKeys) {
+            if ([key hasPrefix:@"segment_"] && [key hasSuffix:@".m4s"]) {
+                NSString *keyNumberStr = [key substringWithRange:NSMakeRange(8, key.length - 12)];
+                long keyNumber = [keyNumberStr integerValue];
+                
+                // Check if this might be the segment we're looking for
+                // This is a heuristic - might need adjustment based on actual mapping
+                if (keyNumber == requestedNumber || 
+                    keyNumber == requestedNumber - (self.mediaSequenceNumber - self.currentSegmentIndex)) {
+                    segmentData = [self.segmentData objectForKey:key];
+                    if (segmentData) {
+                        RLog(RptrLogAreaProtocol, @"Found segment with alternative key: %@ for requested: %@", key, segmentName);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     
     [self.segmentDataLock unlock];
     
     if (!segmentData) {
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaError, @"Segment not found: %@ (current index: %ld)", segmentName, (long)self.currentSegmentIndex);
+        NSString *seqStr = @"???";
+        if ([segmentName hasPrefix:@"segment_"] && [segmentName hasSuffix:@".m4s"]) {
+            seqStr = [segmentName substringWithRange:NSMakeRange(8, segmentName.length - 12)];
+        }
+        RLog(RptrLogAreaError, @"[SEG-REQ-%@] NOT FOUND: %@ (404 - current_idx=%ld, media_seq=%ld)", 
+             seqStr, segmentName, (long)self.currentSegmentIndex, (long)self.mediaSequenceNumber);
+        
+        // Track segment not found with observer
+        NSInteger seqNum = [seqStr integerValue];
+        [[HLSSegmentObserver sharedObserver] trackSegmentEvent:HLSSegmentEventNotFound
+                                                   segmentName:segmentName
+                                                sequenceNumber:seqNum
+                                                          size:0
+                                                     segmentID:nil];
+        
         [self sendErrorResponse:clientSocket code:404 message:@"Segment not found"];
         return;
     }
     
     NSString *headers = [NSString stringWithFormat:
                         @"HTTP/1.1 200 OK\r\n"
-                        @"Content-Type: video/iso.segment\r\n"
+                        @"Content-Type: video/mp4\r\n"
                         @"Content-Length: %lu\r\n"
                         @"Access-Control-Allow-Origin: *\r\n"
                         @"Access-Control-Allow-Methods: GET, OPTIONS\r\n"
@@ -1910,7 +2210,20 @@
                         @"\r\n",
                         (unsigned long)segmentData.length];
     
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaSegment | RptrLogAreaNetwork, @"Sending delegate segment %@ (%lu bytes)", segmentName, (unsigned long)segmentData.length);
+    NSString *seqStrFinal = @"???";
+    if ([segmentName hasPrefix:@"segment_"] && [segmentName hasSuffix:@".m4s"]) {
+        seqStrFinal = [segmentName substringWithRange:NSMakeRange(8, segmentName.length - 12)];
+    }
+    RLog(RptrLogAreaProtocol, @"[SEG-REQ-%@] SERVING: %@ (%lu bytes) to socket=%d", 
+         seqStrFinal, segmentName, (unsigned long)segmentData.length, clientSocket);
+    
+    // Track successful segment serving with observer
+    NSInteger seqNumFinal = [seqStrFinal integerValue];
+    [[HLSSegmentObserver sharedObserver] trackSegmentEvent:HLSSegmentEventServed
+                                               segmentName:segmentName
+                                            sequenceNumber:seqNumFinal
+                                                      size:segmentData.length
+                                                 segmentID:nil];
     
     send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
     
@@ -1939,6 +2252,9 @@
                          @"HTTP/1.1 %ld %@\r\n"
                          @"Content-Type: text/plain\r\n"
                          @"Content-Length: %lu\r\n"
+                         @"Access-Control-Allow-Origin: *\r\n"
+                         @"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                         @"Access-Control-Allow-Headers: Content-Type, Range, Accept, Origin\r\n"
                          @"Connection: close\r\n"
                          @"\r\n"
                          @"%@",
@@ -1947,6 +2263,20 @@
                          message];
     
     send(clientSocket, response.UTF8String, response.length, MSG_NOSIGNAL);
+}
+
+- (void)sendOptionsResponse:(int)clientSocket {
+    NSString *response = @"HTTP/1.1 200 OK\r\n"
+                        @"Access-Control-Allow-Origin: *\r\n"
+                        @"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                        @"Access-Control-Allow-Headers: Content-Type, Range, Accept, Origin\r\n"
+                        @"Access-Control-Max-Age: 3600\r\n"
+                        @"Content-Length: 0\r\n"
+                        @"Connection: close\r\n"
+                        @"\r\n";
+    
+    send(clientSocket, response.UTF8String, response.length, MSG_NOSIGNAL);
+    RLog(RptrLogAreaProtocol, @"Sent OPTIONS response for CORS preflight");
 }
 
 - (void)sendDebugResponse:(int)clientSocket {
@@ -1996,7 +2326,7 @@
 }
 
 - (void)sendLocationResponse:(int)clientSocket {
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Location request received");
+    RLog(RptrLogAreaProtocol, @"Location request received");
     
     // Get location from delegate
     NSDictionary *locationData = nil;
@@ -2035,15 +2365,15 @@
 }
 
 - (void)sendStatusResponse:(int)clientSocket {
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Status request received from socket: %d", clientSocket);
+    RLog(RptrLogAreaProtocol, @"Status request received from socket: %d", clientSocket);
     
     // Get location from delegate
     NSDictionary *locationData = nil;
     if ([self.delegate respondsToSelector:@selector(hlsServerRequestsLocation:)]) {
         locationData = [self.delegate hlsServerRequestsLocation:self];
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"Location data received: %@", locationData);
+        RLog(RptrLogAreaProtocol, @"Location data received: %@", locationData);
     } else {
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"Delegate does not respond to hlsServerRequestsLocation");
+        RLog(RptrLogAreaProtocol, @"Delegate does not respond to hlsServerRequestsLocation");
     }
     
     NSMutableDictionary *statusData = [NSMutableDictionary dictionary];
@@ -2062,7 +2392,7 @@
     // Add stream title - use thread-safe getter
     NSString *currentTitle = [self getStreamTitle];
     statusData[@"title"] = currentTitle ?: @"Share Stream";
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Sending status with title: %@", statusData[@"title"]);
+    RLog(RptrLogAreaProtocol, @"Sending status with title: %@", statusData[@"title"]);
     
     NSError *error = nil;
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:statusData options:NSJSONWritingPrettyPrinted error:&error];
@@ -2086,8 +2416,125 @@
     send(clientSocket, jsonData.bytes, jsonData.length, MSG_NOSIGNAL);
 }
 
-- (void)sendTestPageResponse:(int)clientSocket {
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"Serving view page from template for socket: %d", clientSocket);
+- (void)handleLogRequest:(int)clientSocket request:(NSString *)request {
+    // Parse POST body for log message
+    NSArray *lines = [request componentsSeparatedByString:@"\r\n"];
+    NSString *body = [lines lastObject];
+    
+    if (body && body.length > 0) {
+        // Forward to UDP logger
+        [[RptrUDPLogger sharedLogger] logWithSource:@"CLIENT" message:body];
+    }
+    
+    // Send simple OK response
+    NSString *response = @"HTTP/1.1 200 OK\r\n"
+                        @"Content-Length: 0\r\n"
+                        @"Access-Control-Allow-Origin: *\r\n"
+                        @"Connection: close\r\n"
+                        @"\r\n";
+    
+    send(clientSocket, response.UTF8String, response.length, MSG_NOSIGNAL);
+}
+
+- (void)handleClientEventReport:(int)clientSocket {
+    // For beacon API, we just acknowledge receipt
+    // The actual event data would need to be read from POST body
+    // For now, just log that we received a client event
+    RLog(RptrLogAreaProtocol, @"[CLIENT-EVENT] Received client tracking event");
+    
+    // Send minimal response for beacon API
+    NSString *response = @"HTTP/1.1 204 No Content\r\n"
+                        @"Access-Control-Allow-Origin: *\r\n"
+                        @"Connection: close\r\n"
+                        @"\r\n";
+    send(clientSocket, response.UTF8String, response.length, MSG_NOSIGNAL);
+}
+
+- (void)sendHealthResponse:(int)clientSocket {
+    RLog(RptrLogAreaProtocol, @"Health report request received from socket: %d", clientSocket);
+    
+    // Get health report from observer
+    NSString *healthReport = [[HLSSegmentObserver sharedObserver] getSegmentHealthReport];
+    
+    // Get protocol compliance violations
+    NSArray *violations = [[HLSSegmentObserver sharedObserver] checkProtocolCompliance];
+    
+    // Build response
+    NSMutableString *response = [NSMutableString string];
+    [response appendString:@"<!DOCTYPE html>\n<html>\n<head>\n"];
+    [response appendString:@"<title>HLS Server Health Report</title>\n"];
+    [response appendString:@"<style>body{font-family:monospace;white-space:pre;padding:20px;background:#1a1a1a;color:#0f0;}</style>\n"];
+    [response appendString:@"</head>\n<body>\n"];
+    
+    // Add timestamp
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
+    [response appendFormat:@"Report Generated: %@\n", [formatter stringFromDate:[NSDate date]]];
+    
+    // Add server info
+    [response appendFormat:@"Server Port: %lu\n", (unsigned long)self.port];
+    [response appendFormat:@"Stream Path: %@\n", self.randomPath];
+    [response appendFormat:@"Streaming Active: %@\n", self.isWriting ? @"YES" : @"NO"];
+    
+    // Add segment info
+    [self.segmentDataLock lock];
+    NSUInteger segmentCount = self.segmentData.count;
+    NSUInteger totalMemory = 0;
+    for (NSData *data in self.segmentData.allValues) {
+        totalMemory += data.length;
+    }
+    [self.segmentDataLock unlock];
+    
+    [response appendFormat:@"\n=== IN-MEMORY SEGMENTS ===\n"];
+    [response appendFormat:@"Count: %lu\n", (unsigned long)segmentCount];
+    [response appendFormat:@"Total Memory: %.2f MB\n", totalMemory / (1024.0 * 1024.0)];
+    [response appendFormat:@"Current Index: %ld\n", (long)self.currentSegmentIndex];
+    [response appendFormat:@"Media Sequence: %ld\n", (long)self.mediaSequenceNumber];
+    
+    // Add observer health report
+    [response appendString:healthReport];
+    
+    // Add protocol violations
+    if (violations.count > 0) {
+        [response appendString:@"\n=== PROTOCOL VIOLATIONS ===\n"];
+        for (NSString *violation in violations) {
+            [response appendFormat:@"  ⚠️  %@\n", violation];
+        }
+    } else {
+        [response appendString:@"\n=== PROTOCOL COMPLIANCE ===\n"];
+        [response appendString:@"  ✅ No violations detected\n"];
+    }
+    
+    // Add recent issues
+    NSArray *recentIssues = [[HLSSegmentObserver sharedObserver] getRecentIssues];
+    if (recentIssues.count > 0) {
+        [response appendString:@"\n=== RECENT ISSUES ===\n"];
+        NSInteger showCount = MIN(20, recentIssues.count);
+        for (NSInteger i = recentIssues.count - showCount; i < recentIssues.count; i++) {
+            [response appendFormat:@"  %@\n", recentIssues[i]];
+        }
+    }
+    
+    [response appendString:@"</body>\n</html>\n"];
+    
+    NSData *htmlData = [response dataUsingEncoding:NSUTF8StringEncoding];
+    
+    NSString *headers = [NSString stringWithFormat:
+                        @"HTTP/1.1 200 OK\r\n"
+                        @"Content-Type: text/html; charset=utf-8\r\n"
+                        @"Content-Length: %lu\r\n"
+                        @"Cache-Control: no-cache\r\n"
+                        @"Connection: close\r\n"
+                        @"\r\n",
+                        (unsigned long)htmlData.length];
+    
+    NSData *responseData = [headers dataUsingEncoding:NSUTF8StringEncoding];
+    send(clientSocket, responseData.bytes, responseData.length, MSG_NOSIGNAL);
+    send(clientSocket, htmlData.bytes, htmlData.length, MSG_NOSIGNAL);
+}
+
+- (void)sendViewPageResponse:(int)clientSocket {
+    RLog(RptrLogAreaProtocol, @"Serving view page from template for socket: %d", clientSocket);
     
     @try {
         // Load template from bundle
@@ -2095,12 +2542,12 @@
                                                                   ofType:@"html" 
                                                             inDirectory:@"WebResources"];
         
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Looking for template at path: %@", templatePath);
+        RLog(RptrLogAreaProtocol, @"Looking for template at path: %@", templatePath);
         
         if (!templatePath) {
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaError, @"HTML template not found in bundle - using embedded fallback");
+            RLog(RptrLogAreaError, @"HTML template not found in bundle - using embedded fallback");
             // Fall back to embedded HTML
-            [self sendEmbeddedTestPageResponse:clientSocket];
+            [self sendEmbeddedViewPageResponse:clientSocket];
             return;
         }
         
@@ -2110,24 +2557,27 @@
                                                               error:&error];
         
         if (error) {
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaError, @"Error loading template: %@", error);
-            [self sendEmbeddedTestPageResponse:clientSocket];
+            RLog(RptrLogAreaError, @"Error loading template: %@", error);
+            [self sendEmbeddedViewPageResponse:clientSocket];
             return;
         }
         
         // Create placeholder dictionary
+        NSString *pathComponent = self.randomPath;
         NSDictionary *placeholders = @{
             @"{{APP_TITLE}}": @"Rptr Live Stream",
             @"{{PAGE_TITLE}}": [self getStreamTitle] ?: @"Share Stream",
-            @"{{STREAM_URL}}": [NSString stringWithFormat:@"/stream/%@/playlist.m3u8", self.randomPath],
+            @"{{STREAM_URL}}": [NSString stringWithFormat:@"/stream/%@/playlist.m3u8", pathComponent],
             @"{{SERVER_PORT}}": [NSString stringWithFormat:@"%lu", (unsigned long)self.port],
+            @"{{WEBSOCKET_PATH}}": [NSString stringWithFormat:@"/ws/%@", pathComponent],
+            @"{{WEBSOCKET_PORT}}": @"8081",
             @"{{LOCATION_ENDPOINT}}": @"/location",
             @"{{INITIAL_STATUS}}": @"Connecting to stream..."
         };
         
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"DEBUG: Template placeholders:");
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"  STREAM_URL: %@", placeholders[@"{{STREAM_URL}}"]);
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"  randomPath: %@", self.randomPath);
+        RLog(RptrLogAreaProtocol, @"DEBUG: Template placeholders:");
+        RLog(RptrLogAreaProtocol, @"  STREAM_URL: %@", placeholders[@"{{STREAM_URL}}"]);
+        RLog(RptrLogAreaProtocol, @"  randomPath: %@", self.randomPath);
         
         // Replace placeholders
         NSMutableString *processedHTML = [htmlTemplate mutableCopy];
@@ -2140,18 +2590,18 @@
         
         NSString *html = processedHTML;
     
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"3. HTML string created, length: %lu", (unsigned long)[html length]);
+        RLog(RptrLogAreaProtocol, @"3. HTML string created, length: %lu", (unsigned long)[html length]);
         
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"4. Converting HTML to NSData...");
+        RLog(RptrLogAreaProtocol, @"4. Converting HTML to NSData...");
         NSData *htmlData = [html dataUsingEncoding:NSUTF8StringEncoding];
         if (!htmlData) {
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaError, @"ERROR: Failed to encode HTML data");
+            RLog(RptrLogAreaError, @"ERROR: Failed to encode HTML data");
             [self sendErrorResponse:clientSocket code:500 message:@"Internal Server Error"];
             return;
         }
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"5. HTML data created, size: %lu bytes", (unsigned long)htmlData.length);
+        RLog(RptrLogAreaProtocol, @"5. HTML data created, size: %lu bytes", (unsigned long)htmlData.length);
     
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"6. Creating HTTP headers...");
+        RLog(RptrLogAreaProtocol, @"6. Creating HTTP headers...");
         NSString *headers = [NSString stringWithFormat:
                             @"HTTP/1.1 200 OK\r\n"
                             @"Content-Type: text/html\r\n"
@@ -2160,89 +2610,49 @@
                             @"\r\n",
                             (unsigned long)htmlData.length];
         
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"7. Headers created, length: %lu", (unsigned long)headers.length);
+        RLog(RptrLogAreaProtocol, @"7. Headers created, length: %lu", (unsigned long)headers.length);
         
         // Send with error checking
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"8. Sending headers...");
+        RLog(RptrLogAreaProtocol, @"8. Sending headers...");
         ssize_t headersSent = send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
         if (headersSent < 0) {
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaError, @"ERROR: Failed to send headers: %s (errno: %d)", strerror(errno), errno);
+            RLog(RptrLogAreaError, @"ERROR: Failed to send headers: %s (errno: %d)", strerror(errno), errno);
             return;
         }
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"9. Headers sent: %zd bytes", headersSent);
+        RLog(RptrLogAreaProtocol, @"9. Headers sent: %zd bytes", headersSent);
     
         // Send data in chunks to avoid large buffer issues
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"10. Preparing to send HTML data in chunks...");
+        RLog(RptrLogAreaProtocol, @"10. Preparing to send HTML data in chunks...");
         NSUInteger totalSent = 0;
         NSUInteger dataLength = htmlData.length;
         const uint8_t *bytes = htmlData.bytes;
         
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"11. Total data to send: %lu bytes", (unsigned long)dataLength);
+        RLog(RptrLogAreaProtocol, @"11. Total data to send: %lu bytes", (unsigned long)dataLength);
         
         while (totalSent < dataLength) {
             NSUInteger chunkSize = MIN(8192, dataLength - totalSent);
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"Sending chunk: offset=%lu, size=%lu", (unsigned long)totalSent, (unsigned long)chunkSize);
+            RLog(RptrLogAreaProtocol, @"Sending chunk: offset=%lu, size=%lu", (unsigned long)totalSent, (unsigned long)chunkSize);
             ssize_t sent = send(clientSocket, bytes + totalSent, chunkSize, MSG_NOSIGNAL);
             if (sent < 0) {
-                RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaError, @"ERROR: Failed to send data: %s (errno: %d)", strerror(errno), errno);
+                RLog(RptrLogAreaError, @"ERROR: Failed to send data: %s (errno: %d)", strerror(errno), errno);
                 break;
             }
             totalSent += sent;
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"Chunk sent: %zd bytes, total sent: %lu/%lu", sent, (unsigned long)totalSent, (unsigned long)dataLength);
+            RLog(RptrLogAreaProtocol, @"Chunk sent: %zd bytes, total sent: %lu/%lu", sent, (unsigned long)totalSent, (unsigned long)dataLength);
         }
         
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork | RptrLogAreaDebug, @"14. All data sent successfully: %lu bytes", (unsigned long)totalSent);
+        RLog(RptrLogAreaProtocol, @"14. All data sent successfully: %lu bytes", (unsigned long)totalSent);
         
     } @catch (NSException *exception) {
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaError, @"EXCEPTION: %@", exception);
-        RLog(RptrLogAreaHLS | RptrLogAreaError, @"Exception reason: %@", exception.reason);
-        RLog(RptrLogAreaHLS | RptrLogAreaError | RptrLogAreaDebug, @"Stack trace: %@", exception.callStackSymbols);
+        RLog(RptrLogAreaError, @"EXCEPTION: %@", exception);
+        RLog(RptrLogAreaError, @"Exception reason: %@", exception.reason);
+        RLog(RptrLogAreaError, @"Stack trace: %@", exception.callStackSymbols);
         [self sendErrorResponse:clientSocket code:500 message:@"Internal Server Error"];
     } @finally {
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaDebug, @"15. Exiting sendTestPageResponse for socket: %d", clientSocket);
+        RLog(RptrLogAreaProtocol, @"15. Exiting sendViewPageResponse for socket: %d", clientSocket);
     }
 }
 
-- (void)sendExternalTestPageResponse:(int)clientSocket {
-    NSString *html = @"<!DOCTYPE html>\n"
-                     @"<html>\n"
-                     @"<head>\n"
-                     @"<title>HLS External Test</title>\n"
-                     @"<meta name='viewport' content='width=device-width, initial-scale=1'>\n"
-                     @"</head>\n"
-                     @"<body>\n"
-                     @"<h1>Testing with External HLS Stream</h1>\n"
-                     @"<p>This tests HLS.js with a known-good stream to verify the player works.</p>\n"
-                     @"<video id='video' controls autoplay style='width:100%;max-width:800px;'></video>\n"
-                     @"<div id='info'>Loading external test stream...</div>\n"
-                     @"<script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>\n"
-                     @"<script>\n"
-                     @"var video = document.getElementById('video');\n"
-                     @"var testUrl = 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8';\n"
-                     @"if (Hls.isSupported()) {\n"
-                     @"  var hls = new Hls();\n"
-                     @"  hls.loadSource(testUrl);\n"
-                     @"  hls.attachMedia(video);\n"
-                     @"  hls.on(Hls.Events.MANIFEST_PARSED, function() {\n"
-                     @"    document.getElementById('info').innerHTML = 'External stream loaded successfully! HLS.js is working.';\n"
-                     @"  });\n"
-                     @"}\n"
-                     @"</script>\n"
-                     @"</body>\n"
-                     @"</html>\n";
-    
-    NSData *htmlData = [html dataUsingEncoding:NSUTF8StringEncoding];
-    NSString *headers = [NSString stringWithFormat:
-                        @"HTTP/1.1 200 OK\r\n"
-                        @"Content-Type: text/html\r\n"
-                        @"Content-Length: %lu\r\n"
-                        @"Connection: close\r\n"
-                        @"\r\n",
-                        (unsigned long)htmlData.length];
-    
-    send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
-    send(clientSocket, htmlData.bytes, htmlData.length, MSG_NOSIGNAL);
-}
 
 #pragma mark - Utilities
 
@@ -2277,15 +2687,15 @@
                         [interfaceName hasPrefix:@"en2"]) {
                         // Cellular interface
                         [cellularURLs addObject:url];
-                        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Found cellular interface %@ with IP %@", interfaceName, ipString);
+                        RLog(RptrLogAreaProtocol, @"Found cellular interface %@ with IP %@", interfaceName, ipString);
                     } else if ([interfaceName isEqualToString:@"en0"]) {
                         // WiFi interface
                         [wifiURLs addObject:url];
-                        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Found WiFi interface %@ with IP %@", interfaceName, ipString);
+                        RLog(RptrLogAreaProtocol, @"Found WiFi interface %@ with IP %@", interfaceName, ipString);
                     } else {
                         // Other interfaces (e.g., en1, etc.)
                         [otherURLs addObject:url];
-                        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Found other interface %@ with IP %@", interfaceName, ipString);
+                        RLog(RptrLogAreaProtocol, @"Found other interface %@ with IP %@", interfaceName, ipString);
                     }
                 }
             }
@@ -2301,9 +2711,9 @@
     [urls addObjectsFromArray:otherURLs];
     
     if (urls.count == 0) {
-        RLog(RptrLogAreaHLS | RptrLogAreaNetwork | RptrLogAreaError, @"No network interfaces found!");
+        RLog(RptrLogAreaError, @"No network interfaces found!");
     } else {
-        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Server URLs ordered by priority: %@", urls);
+        RLog(RptrLogAreaProtocol, @"Server URLs ordered by priority: %@", urls);
     }
     
     return urls;
@@ -2333,7 +2743,7 @@
         // Remove inactive clients
         for (NSString *clientAddress in inactiveClients) {
             [self.activeClients removeObjectForKey:clientAddress];
-            RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaNetwork, @"Removing inactive client: %@", clientAddress);
+            RLog(RptrLogAreaProtocol, @"Removing inactive client: %@", clientAddress);
             
             // Notify delegate
             if ([self.delegate respondsToSelector:@selector(hlsServer:clientDisconnected:)]) {
@@ -2394,7 +2804,7 @@
 #pragma mark - Memory Management
 
 - (void)handleMemoryWarning:(NSNotification *)notification {
-    RLog(RptrLogAreaHLS | RptrLogAreaMemory, @"Received memory warning - cleaning up segments");
+    RLog(RptrLogAreaProtocol, @"Received memory warning - cleaning up segments");
     
     dispatch_async(self.writerQueue, ^{
         // Clean up more aggressively during memory pressure
@@ -2415,7 +2825,7 @@
                     for (NSInteger i = 0; i < removeCount; i++) {
                         HLSSegmentInfo *segment = sortedSegments[i];
                         [self.segmentData removeObjectForKey:segment.filename];
-                        RLog(RptrLogAreaHLS | RptrLogAreaMemory, @"Removed segment from memory: %@", segment.filename);
+                        RLog(RptrLogAreaProtocol, @"Removed segment from memory: %@", segment.filename);
                     }
                 }
             });
@@ -2424,10 +2834,10 @@
         // Clear initialization segment if we're under severe pressure
         if (segmentDataCount > 5) {
             self.initializationSegmentData = nil;
-            RLog(RptrLogAreaHLS | RptrLogAreaMemory, @"Cleared initialization segment from memory");
+            RLog(RptrLogAreaProtocol, @"Cleared initialization segment from memory");
         }
         
-        RLog(RptrLogAreaHLS | RptrLogAreaMemory, @"Memory cleanup complete - segments in memory: %lu -> %lu",
+        RLog(RptrLogAreaProtocol, @"Memory cleanup complete - segments in memory: %lu -> %lu",
              (unsigned long)segmentDataCount, (unsigned long)self.segmentData.count);
         [self.segmentDataLock unlock];
     });
@@ -2438,21 +2848,21 @@
 #ifdef DEBUG
 - (void)logWriterState {
     dispatch_async(self.writerQueue, ^{
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"=== Writer State ===");
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Server running: %@", self.running ? @"YES" : @"NO");
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Is writing: %@", self.isWriting ? @"YES" : @"NO");
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Session started: %@", self.sessionStarted ? @"YES" : @"NO");
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Asset writer: %@", self.assetWriter ? @"EXISTS" : @"NIL");
+        RLog(RptrLogAreaProtocol, @"=== Writer State ===");
+        RLog(RptrLogAreaProtocol, @"Server running: %@", self.running ? @"YES" : @"NO");
+        RLog(RptrLogAreaProtocol, @"Is writing: %@", self.isWriting ? @"YES" : @"NO");
+        RLog(RptrLogAreaProtocol, @"Session started: %@", self.sessionStarted ? @"YES" : @"NO");
+        RLog(RptrLogAreaProtocol, @"Asset writer: %@", self.assetWriter ? @"EXISTS" : @"NIL");
         if (self.assetWriter) {
-            RLog(RptrLogAreaHLS | RptrLogAreaDebug | RptrLogAreaError, @"Writer status: %ld", (long)self.assetWriter.status);
-            RLog(RptrLogAreaHLS | RptrLogAreaError | RptrLogAreaDebug, @"Writer error: %@", self.assetWriter.error);
+            RLog(RptrLogAreaError, @"Writer status: %ld", (long)self.assetWriter.status);
+            RLog(RptrLogAreaError, @"Writer error: %@", self.assetWriter.error);
         }
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Video input: %@", self.videoInput ? @"EXISTS" : @"NIL");
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Frames processed: %ld", (long)self.framesProcessed);
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Frames dropped: %ld", (long)self.framesDropped);
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Current segment: %ld", (long)self.currentSegmentIndex);
-        RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"Segments count: %lu", (unsigned long)self.segments.count);
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"==================");
+        RLog(RptrLogAreaVideoParams, @"Video input: %@", self.videoInput ? @"EXISTS" : @"NIL");
+        RLog(RptrLogAreaVideoParams, @"Frames processed: %ld", (long)self.framesProcessed);
+        RLog(RptrLogAreaProtocol, @"Frames dropped: %ld", (long)self.framesDropped);
+        RLog(RptrLogAreaProtocol, @"Current segment: %ld", (long)self.currentSegmentIndex);
+        RLog(RptrLogAreaProtocol, @"Segments count: %lu", (unsigned long)self.segments.count);
+        RLog(RptrLogAreaProtocol, @"==================");
     });
 }
 #else
@@ -2465,34 +2875,193 @@
 
 - (void)assetWriter:(AVAssetWriter *)writer didOutputSegmentData:(NSData *)segmentData segmentType:(AVAssetSegmentType)segmentType segmentReport:(AVAssetSegmentReport *)segmentReport {
     NSString *segmentTypeStr = (segmentType == AVAssetSegmentTypeInitialization) ? @"INIT" : @"MEDIA";
-    RLog(RptrLogAreaHLS | RptrLogAreaSegment | RptrLogAreaDebug, @"[DELEGATE] Received %@ segment: %lu bytes", segmentTypeStr, (unsigned long)segmentData.length);
+    
+    // Calculate time since last segment for automatic segmentation tracking
+    NSTimeInterval timeSinceLastSegment = 0;
+    if (self.currentSegmentStartTime) {
+        timeSinceLastSegment = [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime];
+    }
+    
+    RLog(RptrLogAreaProtocol, @"[DELEGATE] ========== AUTOMATIC SEGMENT OUTPUT ==========");
+    RLog(RptrLogAreaProtocol, @"[DELEGATE] Type: %@, Size: %lu bytes", segmentTypeStr, (unsigned long)segmentData.length);
+    RLog(RptrLogAreaProtocol, @"[DELEGATE] Time since last segment: %.2f seconds", timeSinceLastSegment);
+    RLog(RptrLogAreaProtocol, @"[DELEGATE] Frames in segment: %ld", (long)self.framesProcessed);
+    RLog(RptrLogAreaProtocol, @"[DELEGATE] Report available: %@", segmentReport ? @"YES" : @"NO");
+    
+    // TEST 3: Track delegate callback timing with 6-second intervals
+    static NSDate *lastDelegateCall = nil;
+    static int delegateCallCount = 0;
+    delegateCallCount++;
+    
+    if (lastDelegateCall) {
+        NSTimeInterval interval = [[NSDate date] timeIntervalSinceDate:lastDelegateCall];
+        RLog(RptrLogAreaProtocol, @"[TEST3] Delegate callback #%d, %.2fs since last callback (target: 6.0s)", 
+             delegateCallCount, interval);
+        if (interval > 5.0 && interval < 7.0) {
+            RLog(RptrLogAreaProtocol, @"[TEST3-SUCCESS] Segment output at expected interval!");
+        }
+    } else {
+        RLog(RptrLogAreaProtocol, @"[TEST3] First delegate callback (#%d) - automatic segmentation is working!", delegateCallCount);
+    }
+    lastDelegateCall = [NSDate date];
+    
+    // Log segment report details if available (per Apple best practices)
+    if (segmentReport && segmentType == AVAssetSegmentTypeSeparable) {
+        for (AVAssetSegmentTrackReport *trackReport in segmentReport.trackReports) {
+            RLog(RptrLogAreaVideoParams, @"[SEGMENT REPORT] Track ID: %d", trackReport.trackID);
+            RLog(RptrLogAreaVideoParams, @"[SEGMENT REPORT] Media type: %@", trackReport.mediaType);
+            RLog(RptrLogAreaVideoParams, @"[SEGMENT REPORT] Duration: %.3f", CMTimeGetSeconds(trackReport.duration));
+            RLog(RptrLogAreaVideoParams, @"[SEGMENT REPORT] First frame PTS: %.3f", CMTimeGetSeconds(trackReport.earliestPresentationTimeStamp));
+        }
+    }
     
     dispatch_async(self.writerQueue, ^{
         if (segmentType == AVAssetSegmentTypeInitialization) {
-            // Store initialization segment
+            // Check if this is a duplicate init segment from writer recreation
+            if (self.hasGeneratedInitSegment && self.savedInitSegmentData) {
+                RLog(RptrLogAreaProtocol, @"[INIT SEGMENT] Ignoring duplicate init segment from writer recreation");
+                RLog(RptrLogAreaProtocol, @"[INIT SEGMENT] Using preserved init segment (%lu bytes)", (unsigned long)self.savedInitSegmentData.length);
+                // Use the saved init segment instead
+                self.initializationSegmentData = self.savedInitSegmentData;
+                return;
+            }
+            
+            // First init segment - save it for reuse
             self.initializationSegmentData = segmentData;
-            RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Stored initialization segment: %lu bytes", (unsigned long)segmentData.length);
+            self.savedInitSegmentData = segmentData;
+            self.hasGeneratedInitSegment = YES;
+            RLog(RptrLogAreaProtocol, @"[INIT SEGMENT] Stored FIRST initialization segment: %lu bytes", (unsigned long)segmentData.length);
+            RLog(RptrLogAreaProtocol, @"[INIT SEGMENT] Will preserve this for all future segments");
+            
+            // DEBUG: Analyze init segment box structure
+            if (segmentData.length >= 32) {
+                const uint8_t *bytes = (const uint8_t *)segmentData.bytes;
+                
+                // Parse first box (should be 'ftyp' for init segments)
+                uint32_t box1Size = (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+                NSString *box1Type = [[NSString alloc] initWithBytes:&bytes[4] length:4 encoding:NSASCIIStringEncoding];
+                
+                // Parse second box if there's space
+                NSString *box2Type = @"";
+                if (segmentData.length > box1Size + 8) {
+                    uint32_t box2Offset = box1Size;
+                    box2Type = [[NSString alloc] initWithBytes:&bytes[box2Offset+4] length:4 encoding:NSASCIIStringEncoding];
+                }
+                
+                RLog(RptrLogAreaProtocol, @"[fMP4-INIT] Init segment boxes: [%@:%u bytes] [%@]", 
+                     box1Type, box1Size, box2Type);
+                
+                // Check for proper fMP4 init structure
+                if (![box1Type isEqualToString:@"ftyp"]) {
+                    RLog(RptrLogAreaError, @"[fMP4-ERROR] Init segment does not start with 'ftyp' box! Found: %@", box1Type);
+                }
+            }
             
         } else if (segmentType == AVAssetSegmentTypeSeparable) {
-            // Store media segment
-            NSString *segmentName = [NSString stringWithFormat:@"segment_%03ld.m4s", (long)self.currentSegmentIndex];
+            // Generate unique segment ID for tracing
+            NSString *segmentID = [[NSUUID UUID] UUIDString].lowercaseString;
+            NSString *shortID = [segmentID substringToIndex:8]; // First 8 chars for brevity
+            
+            // Store media segment using mediaSequenceNumber to ensure playlist references match
+            NSString *segmentName = [NSString stringWithFormat:@"segment_%03ld.m4s", (long)self.mediaSequenceNumber];
+            
+            // Log segment lifecycle: CREATED
+            RLog(RptrLogAreaProtocol, @"[SEG-%@] CREATED: seq=%ld, name=%@, size=%lu bytes", 
+                 shortID, (long)self.mediaSequenceNumber, segmentName, (unsigned long)segmentData.length);
+            RLog(RptrLogAreaProtocol, @"[QoE] Segment %ld created successfully", (long)self.mediaSequenceNumber);
+            
+            // DEBUG: Analyze segment box structure for fMP4 compliance
+            if (segmentData.length >= 32) {
+                const uint8_t *bytes = (const uint8_t *)segmentData.bytes;
+                
+                // Parse first box (should be 'moof' for media segments)
+                uint32_t box1Size = (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3];
+                NSString *box1Type = [[NSString alloc] initWithBytes:&bytes[4] length:4 encoding:NSASCIIStringEncoding];
+                
+                // Parse second box if there's space
+                NSString *box2Type = @"";
+                if (segmentData.length > box1Size + 8) {
+                    uint32_t box2Offset = box1Size;
+                    // uint32_t box2Size = (bytes[box2Offset] << 24) | (bytes[box2Offset+1] << 16) | 
+                    //                    (bytes[box2Offset+2] << 8) | bytes[box2Offset+3];
+                    box2Type = [[NSString alloc] initWithBytes:&bytes[box2Offset+4] length:4 encoding:NSASCIIStringEncoding];
+                }
+                
+                RLog(RptrLogAreaProtocol, @"[fMP4-STRUCTURE] Segment %@ boxes: [%@:%u bytes] [%@]", 
+                     segmentName, box1Type, box1Size, box2Type);
+                
+                // Check for proper fMP4 structure
+                if (![box1Type isEqualToString:@"moof"]) {
+                    RLog(RptrLogAreaError, @"[fMP4-ERROR] Segment does not start with 'moof' box! Found: %@", box1Type);
+                }
+                if (![box2Type isEqualToString:@"mdat"] && box2Type.length > 0) {
+                    RLog(RptrLogAreaError, @"[fMP4-ERROR] Second box is not 'mdat'! Found: %@", box2Type);
+                }
+            }
+            
+            // Log segment lifecycle: STORING
+            RLog(RptrLogAreaProtocol, @"[SEG-%@] STORING: Adding to memory dictionary", shortID);
+            
             [self.segmentDataLock lock];
             [self.segmentData setObject:segmentData forKey:segmentName];
+            
+            // Track segment memory usage for diagnostics
+            NSUInteger totalSegmentMemory = 0;
+            for (NSData *data in self.segmentData.allValues) {
+                totalSegmentMemory += data.length;
+            }
             [self.segmentDataLock unlock];
             
-            // Create segment info
+            // Report to diagnostics
+            [[RptrDiagnostics sharedDiagnostics] updateSegmentMemoryUsage:totalSegmentMemory];
+            
+            // Create segment info with tracing ID
             HLSSegmentInfo *segmentInfo = [[HLSSegmentInfo alloc] init];
             segmentInfo.filename = segmentName;
-            segmentInfo.duration = segmentReport ? segmentReport.trackReports.firstObject.duration : CMTimeMakeWithSeconds(self.qualitySettings.segmentDuration, 1);
+            
+            // Calculate segment duration properly
+            CMTime segmentDuration = CMTimeMakeWithSeconds(self.qualitySettings.segmentDuration, 600);
+            if (segmentReport && segmentReport.trackReports.count > 0) {
+                CMTime reportedDuration = segmentReport.trackReports.firstObject.duration;
+                // Only use reported duration if it's valid and non-zero
+                if (CMTIME_IS_VALID(reportedDuration) && CMTimeGetSeconds(reportedDuration) > 0.1) {
+                    segmentDuration = reportedDuration;
+                } else {
+                    // Use elapsed time for segments with no valid duration
+                    NSTimeInterval elapsed = self.currentSegmentStartTime ? 
+                        [[NSDate date] timeIntervalSinceDate:self.currentSegmentStartTime] : 
+                        self.qualitySettings.segmentDuration;
+                    segmentDuration = CMTimeMakeWithSeconds(elapsed, 600);
+                    RLog(RptrLogAreaProtocol, @"[SEG-%@] Using elapsed time for duration: %.2fs", shortID, elapsed);
+                }
+            }
+            
+            segmentInfo.duration = segmentDuration;
             segmentInfo.sequenceNumber = self.mediaSequenceNumber;
             segmentInfo.createdAt = [NSDate date];
             segmentInfo.fileSize = segmentData.length;
+            segmentInfo.segmentID = shortID;
+            
+            // Track with observer for lifecycle monitoring
+            [[HLSSegmentObserver sharedObserver] trackSegmentEvent:HLSSegmentEventCreated
+                                                       segmentName:segmentName
+                                                    sequenceNumber:self.mediaSequenceNumber
+                                                              size:segmentData.length
+                                                         segmentID:shortID];
             
             dispatch_barrier_async(self.segmentsQueue, ^{
                 [self.segments addObject:segmentInfo];
                 
-                RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Stored media segment: %@ (%lu bytes, %.2fs)", 
-                      segmentName, (unsigned long)segmentData.length, CMTimeGetSeconds(segmentInfo.duration));
+                // Log segment lifecycle: STORED
+                RLog(RptrLogAreaProtocol, @"[SEG-%@] STORED: Added to segments array (total=%lu)", 
+                     shortID, (unsigned long)self.segments.count);
+                
+                // Track storage event with observer
+                [[HLSSegmentObserver sharedObserver] trackSegmentEvent:HLSSegmentEventStored
+                                                           segmentName:segmentInfo.filename
+                                                        sequenceNumber:segmentInfo.sequenceNumber
+                                                                  size:segmentInfo.fileSize
+                                                             segmentID:segmentInfo.segmentID];
                 
                 // Clean up old segments to prevent memory buildup
                 if (self.segments.count > self.qualitySettings.maxSegments) {
@@ -2500,21 +3069,57 @@
                     for (NSInteger i = 0; i < removeCount; i++) {
                         HLSSegmentInfo *oldSegment = self.segments[0];
                         [self.segmentDataLock lock];
-                        [self.segmentData removeObjectForKey:oldSegment.filename];
+                        
+                        // Try removing with the stored filename first
+                        if ([self.segmentData objectForKey:oldSegment.filename]) {
+                            [self.segmentData removeObjectForKey:oldSegment.filename];
+                            RLog(RptrLogAreaProtocol, @"[SEG-%@] REMOVED: %@ (seq=%ld) to maintain max=%ld segments", 
+                                 oldSegment.segmentID ?: @"UNKNOWN", oldSegment.filename, (long)oldSegment.sequenceNumber, (long)self.qualitySettings.maxSegments);
+                            
+                            // Track removal event with observer
+                            [[HLSSegmentObserver sharedObserver] trackSegmentEvent:HLSSegmentEventRemoved
+                                                                       segmentName:oldSegment.filename
+                                                                    sequenceNumber:oldSegment.sequenceNumber
+                                                                              size:oldSegment.fileSize
+                                                                         segmentID:oldSegment.segmentID];
+                        } else {
+                            // Also try with sequence number based name (for transition period)
+                            NSString *altName = [NSString stringWithFormat:@"segment_%03ld.m4s", (long)oldSegment.sequenceNumber];
+                            if ([self.segmentData objectForKey:altName]) {
+                                [self.segmentData removeObjectForKey:altName];
+                                RLog(RptrLogAreaProtocol, @"Removed old segment with alt name: %@", altName);
+                            }
+                        }
+                        
                         [self.segmentDataLock unlock];
                         [self.segments removeObjectAtIndex:0];
-                        RLog(RptrLogAreaHLS | RptrLogAreaSegment, @"Removed old segment: %@", oldSegment.filename);
                     }
                 }
             });
             
-            self.currentSegmentIndex++;
-            self.mediaSequenceNumber++;
+            // Log segment lifecycle: PLAYLIST UPDATE
+            RLog(RptrLogAreaProtocol, @"[SEG-%@] PLAYLIST: Updating playlist with new segment", shortID);
             
-            // Update playlist
+            // Update playlist with current segment
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self updatePlaylist];
             });
+            
+            // Now increment counter for the next segment
+            self.mediaSequenceNumber++;
+            
+            // Reset segment start time for tracking automatic segmentation
+            self.currentSegmentStartTime = [NSDate date];
+            self.framesProcessed = 0; // Reset frame counter for next segment
+            
+            RLog(RptrLogAreaProtocol, @"[SEG-%@] COMPLETE: Ready for next segment (nextSeq=%ld)", 
+                 shortID, (long)self.mediaSequenceNumber);
+            RLog(RptrLogAreaProtocol, @"[AUTO-SEG] Automatic segmentation continuing - next segment will output in ~%.1fs", 
+                 self.qualitySettings.segmentDuration);
+            
+            // Log QoE metrics per Apple best practices
+            RLog(RptrLogAreaProtocol, @"[QoE] Total segments created: %ld", (long)self.mediaSequenceNumber);
+            RLog(RptrLogAreaProtocol, @"[QoE] Segments in memory: %lu", (unsigned long)self.segmentData.count);
             
             // Clean up old segments
             [self cleanupOldSegments];
@@ -2524,9 +3129,9 @@
 
 #pragma mark - Template Methods
 
-- (void)sendEmbeddedTestPageResponse:(int)clientSocket {
+- (void)sendEmbeddedViewPageResponse:(int)clientSocket {
     // Fallback embedded HTML when template is not available
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Using embedded fallback HTML");
+    RLog(RptrLogAreaProtocol, @"Using embedded fallback HTML");
     
     // Use the original embedded HTML that was working
     NSString *html = @"<!DOCTYPE html>\n"
@@ -2570,11 +3175,17 @@
                      @"<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css' />\n"
                      @"<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>\n"
                      @"<script src='https://cdn.jsdelivr.net/npm/hls.js@latest'></script>\n"
+                     @"<script src='/js/udp_logger.js'></script>\n"
                      @"<script>\n"
+                     @"console.log('Script starting - HLS.js version:', typeof Hls !== 'undefined' ? Hls.version : 'NOT LOADED');\n"
+                     @"console.log('Page URL:', window.location.href);\n"
+                     @"\n"
                      @"var video = document.getElementById('video');\n"
                      @"var status = document.getElementById('status');\n"
                      @"var connectionStatus = document.getElementById('connectionStatus');\n"
                      @"var videoSrc = window.location.origin + '/stream/' + window.location.pathname.split('/')[2] + '/playlist.m3u8';\n"
+                     @"console.log('Stream URL:', videoSrc);\n"
+                     @"\n"
                      @"var hls = null;\n"
                      @"var map = null;\n"
                      @"\n"
@@ -2604,10 +3215,13 @@
                      @"}\n"
                      @"\n"
                      @"function initHLS() {\n"
+                     @"  console.log('initHLS called');\n"
                      @"  if (hls) {\n"
+                     @"    console.log('Destroying existing HLS instance');\n"
                      @"    hls.destroy();\n"
                      @"  }\n"
                      @"  \n"
+                     @"  console.log('Checking HLS support...');\n"
                      @"  if (!Hls.isSupported()) {\n"
                      @"    if (video.canPlayType('application/vnd.apple.mpegurl')) {\n"
                      @"      video.src = videoSrc;\n"
@@ -2620,21 +3234,29 @@
                      @"    return;\n"
                      @"  }\n"
                      @"  \n"
+                     @"  console.log('Creating HLS instance with debug enabled');\n"
                      @"  hls = new Hls({\n"
-                     @"    debug: false,\n"
+                     @"    debug: true,  // Enable full debugging to diagnose issues\n"
                      @"    enableWorker: true,\n"
                      @"    lowLatencyMode: false,\n"
                      @"    maxBufferLength: 60,\n"
-                     @"    liveSyncDurationCount: 4\n"
+                     @"    liveSyncDurationCount: 4,\n"
+                     @"    fragLoadingTimeOut: 20000,\n"
+                     @"    fragLoadingMaxRetry: 6,\n"
+                     @"    manifestLoadingTimeOut: 10000,\n"
+                     @"    manifestLoadingMaxRetry: 4\n"
                      @"  });\n"
+                     @"  console.log('HLS instance created:', hls);\n"
                      @"  \n"
                      @"  setConnectionStatus('connecting');\n"
                      @"  status.innerHTML = 'Connecting to stream...';\n"
                      @"  \n"
+                     @"  console.log('Loading source:', videoSrc);\n"
                      @"  hls.loadSource(videoSrc);\n"
+                     @"  console.log('Attaching to video element');\n"
                      @"  hls.attachMedia(video);\n"
                      @"  \n"
-                     @"  hls.on(Hls.Events.MANIFEST_PARSED, function() {\n"
+                     @"  hls.on(Hls.Events ? Hls.Events.MANIFEST_PARSED : 'hlsManifestParsed', function() {\n"
                      @"    status.innerHTML = 'Stream connected';\n"
                      @"    setConnectionStatus('');\n"
                      @"    video.play().catch(function(e) {\n"
@@ -2642,8 +3264,106 @@
                      @"    });\n"
                      @"  });\n"
                      @"  \n"
-                     @"  hls.on(Hls.Events.ERROR, function (event, data) {\n"
-                     @"    console.log('HLS error:', data.type, data.details);\n"
+                     @"  // Segment tracking for integrated traceability\n"
+                     @"  var segmentTracker = {\n"
+                     @"    segments: {},\n"
+                     @"    currentSegment: null,\n"
+                     @"    \n"
+                     @"    reportEvent: function(eventType, segmentNum, details) {\n"
+                     @"      var event = {\n"
+                     @"        type: eventType,\n"
+                     @"        segment: segmentNum,\n"
+                     @"        timestamp: new Date().toISOString(),\n"
+                     @"        details: details\n"
+                     @"      };\n"
+                     @"      \n"
+                     @"      // Log locally\n"
+                     @"      console.log('[CLIENT-SEG-' + segmentNum + '] ' + eventType + ':', details);\n"
+                     @"      \n"
+                     @"      // Could report to server via beacon API if needed\n"
+                     @"      // For now, console logging is sufficient for debugging\n"
+                     @"    },\n"
+                     @"    \n"
+                     @"    extractSegmentNumber: function(url) {\n"
+                     @"      var match = url.match(/segment_(\\d+)\\.m4s/);\n"
+                     @"      return match ? parseInt(match[1]) : -1;\n"
+                     @"    }\n"
+                     @"  };\n"
+                     @"  \n"
+                     @"  // Track fragment loading\n"
+                     @"  hls.on(Hls.Events ? Hls.Events.FRAG_LOADING : 'hlsFragLoading', function(event, data) {\n"
+                     @"    var segNum = segmentTracker.extractSegmentNumber(data.frag.url);\n"
+                     @"    if (segNum >= 0) {\n"
+                     @"      segmentTracker.currentSegment = segNum;\n"
+                     @"      segmentTracker.segments[segNum] = {\n"
+                     @"        requestStart: Date.now(),\n"
+                     @"        url: data.frag.url\n"
+                     @"      };\n"
+                     @"      segmentTracker.reportEvent('REQUESTING', segNum, {\n"
+                     @"        url: data.frag.url,\n"
+                     @"        sn: data.frag.sn\n"
+                     @"      });\n"
+                     @"    }\n"
+                     @"  });\n"
+                     @"  \n"
+                     @"  // Track fragment loaded\n"
+                     @"  hls.on(Hls.Events ? Hls.Events.FRAG_LOADED : 'hlsFragLoaded', function(event, data) {\n"
+                     @"    var segNum = segmentTracker.extractSegmentNumber(data.frag.url);\n"
+                     @"    if (segNum >= 0 && segmentTracker.segments[segNum]) {\n"
+                     @"      var loadTime = Date.now() - segmentTracker.segments[segNum].requestStart;\n"
+                     @"      segmentTracker.segments[segNum].loadTime = loadTime;\n"
+                     @"      segmentTracker.reportEvent('RECEIVED', segNum, {\n"
+                     @"        duration: data.frag.duration,\n"
+                     @"        loadTime: loadTime + 'ms',\n"
+                     @"        bytes: data.stats.total\n"
+                     @"      });\n"
+                     @"    }\n"
+                     @"  });\n"
+                     @"  \n"
+                     @"  // Track buffer appending\n"
+                     @"  hls.on(Hls.Events ? Hls.Events.BUFFER_APPENDING : 'hlsBufferAppending', function(event, data) {\n"
+                     @"    if (segmentTracker.currentSegment !== null) {\n"
+                     @"      segmentTracker.reportEvent('BUFFERING', segmentTracker.currentSegment, {\n"
+                     @"        type: data.type,\n"
+                     @"        bytes: data.data ? data.data.length : 0\n"
+                     @"      });\n"
+                     @"    }\n"
+                     @"  });\n"
+                     @"  \n"
+                     @"  // Track buffer appended (playback ready)\n"
+                     @"  hls.on(Hls.Events ? Hls.Events.BUFFER_APPENDED : 'hlsBufferAppended', function(event, data) {\n"
+                     @"    if (segmentTracker.currentSegment !== null) {\n"
+                     @"      segmentTracker.reportEvent('PLAYING', segmentTracker.currentSegment, {\n"
+                     @"        timeRange: data.timeRanges\n"
+                     @"      });\n"
+                     @"    }\n"
+                     @"  });\n"
+                     @"  \n"
+                     @"  // Track errors\n"
+                     @"  hls.on(Hls.Events ? Hls.Events.FRAG_LOAD_ERROR : 'hlsFragLoadError', function(event, data) {\n"
+                     @"    var segNum = segmentTracker.extractSegmentNumber(data.frag.url);\n"
+                     @"    if (segNum >= 0) {\n"
+                     @"      segmentTracker.reportEvent('ERROR', segNum, {\n"
+                     @"        type: 'LOAD_ERROR',\n"
+                     @"        details: data.details,\n"
+                     @"        response: data.response ? data.response.code : 'unknown'\n"
+                     @"      });\n"
+                     @"    }\n"
+                     @"  });\n"
+                     @"  \n"
+                     @"  // Track stalls\n"
+                     @"  hls.on(Hls.Events ? Hls.Events.BUFFER_STALLED_ERROR : 'hlsBufferStalledError', function(event, data) {\n"
+                     @"    segmentTracker.reportEvent('STALLED', segmentTracker.currentSegment || -1, {\n"
+                     @"      buffer: data.buffer\n"
+                     @"    });\n"
+                     @"  });\n"
+                     @"  \n"
+                     @"  hls.on(Hls.Events ? Hls.Events.LEVEL_UPDATED : 'hlsLevelUpdated', function(event, data) {\n"
+                     @"    console.log('Level updated, fragments:', data.details.fragments.length);\n"
+                     @"  });\n"
+                     @"  \n"
+                     @"  hls.on(Hls.Events ? Hls.Events.ERROR : 'hlsError', function (event, data) {\n"
+                     @"    console.error('HLS ERROR:', data.type, data.details, data);\n"
                      @"    if (data.fatal) {\n"
                      @"      status.innerHTML = 'Connection lost - Reconnecting...';\n"
                      @"      setConnectionStatus('error');\n"
@@ -2736,7 +3456,10 @@
                      @"}\n"
                      @"\n"
                      @"// Initialize on load\n"
+                     @"console.log('Initializing application...');\n"
+                     @"console.log('Calling initializeMap()...');\n"
                      @"initializeMap();\n"
+                     @"console.log('Calling initHLS()...');\n"
                      @"initHLS();\n"
                      @"\n"
                      @"// Start status polling every 10 seconds\n"
@@ -2779,7 +3502,7 @@
     }
     
     if (!resourcePath) {
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaError, @"Resource not found: %@", path);
+        RLog(RptrLogAreaError, @"Resource not found: %@", path);
         [self sendErrorResponse:clientSocket code:404 message:@"Resource not found"];
         return;
     }
@@ -2788,7 +3511,7 @@
     NSData *data = [NSData dataWithContentsOfFile:resourcePath options:0 error:&error];
     
     if (error || !data) {
-        RLog(RptrLogAreaHLS | RptrLogAreaHTTP | RptrLogAreaError, @"Error reading resource %@: %@", path, error);
+        RLog(RptrLogAreaError, @"Error reading resource %@: %@", path, error);
         [self sendErrorResponse:clientSocket code:500 message:@"Error reading resource"];
         return;
     }
@@ -2813,7 +3536,9 @@
                         @"HTTP/1.1 200 OK\r\n"
                         @"Content-Type: %@\r\n"
                         @"Content-Length: %lu\r\n"
-                        @"Cache-Control: max-age=86400\r\n"
+                        @"Cache-Control: no-cache, no-store, must-revalidate\r\n"
+                        @"Pragma: no-cache\r\n"
+                        @"Expires: 0\r\n"
                         @"Connection: close\r\n"
                         @"\r\n",
                         mimeType,
@@ -2822,7 +3547,7 @@
     send(clientSocket, headers.UTF8String, headers.length, MSG_NOSIGNAL);
     send(clientSocket, data.bytes, data.length, MSG_NOSIGNAL);
     
-    RLog(RptrLogAreaHLS | RptrLogAreaHTTP, @"Served bundled resource: %@ (%@ bytes)", path, @(data.length));
+    RLog(RptrLogAreaProtocol, @"Served bundled resource: %@ (%@ bytes)", path, @(data.length));
 }
 
 - (NSString *)generateRandomString:(NSInteger)length {
@@ -2843,7 +3568,7 @@
     
     // Generate new random path
     _randomPath = [self generateRandomString:10];
-    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Regenerated randomized URL path: %@ (was: %@)", _randomPath, self.previousRandomPath);
+    RLog(RptrLogAreaProtocol, @"Regenerated randomized URL path: %@ (was: %@)", _randomPath, self.previousRandomPath);
     
     // Clear all active clients
     dispatch_barrier_async(self.clientsQueue, ^{
@@ -2853,7 +3578,7 @@
     // Clear the previous path after a delay to allow final 410 responses
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         self.previousRandomPath = nil;
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Cleared previous random path - old URLs will now get 404");
+        RLog(RptrLogAreaProtocol, @"Cleared previous random path - old URLs will now get 404");
     });
     
     // Clear segment data to force fresh start with new path
@@ -2869,7 +3594,9 @@
     // Use current timestamp to ensure unique segment numbers
     self.currentSegmentIndex = (NSInteger)([[NSDate date] timeIntervalSince1970] / 100) % 1000;
     self.mediaSequenceNumber = self.currentSegmentIndex;
-    RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Reset segment index to %ld to avoid conflicts", (long)self.currentSegmentIndex);
+    RLog(RptrLogAreaProtocol, @"Reset segment counters to %ld", (long)self.mediaSequenceNumber);
+    RLog(RptrLogAreaProtocol, @"[COUNTER RESET] currentSegmentIndex=%ld, mediaSequenceNumber=%ld", 
+         (long)self.currentSegmentIndex, (long)self.mediaSequenceNumber);
     
     // Clear playlist file if it exists
     NSString *playlistPath = [self.baseDirectory stringByAppendingPathComponent:@"playlist.m3u8"];
@@ -2877,7 +3604,7 @@
     
     // Stop current writer if active
     if (self.isWriting) {
-        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Stopping active writer before path regeneration");
+        RLog(RptrLogAreaProtocol, @"Stopping active writer before path regeneration");
         dispatch_async(self.writerQueue, ^{
             [self stopAssetWriter];
         });
@@ -2887,7 +3614,7 @@
     // This ensures clients get a valid (but empty) playlist instead of 404
     [self updatePlaylist];
     
-    RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Path regeneration complete - all segments cleared, empty playlist created");
+    RLog(RptrLogAreaProtocol, @"Path regeneration complete - all segments cleared, empty playlist created");
     
     // Notify delegate if needed
     if ([self.delegate respondsToSelector:@selector(hlsServerDidStart:)]) {
@@ -2910,7 +3637,7 @@
     // Since streamTitle is atomic, we can safely set it directly
     // The atomic property ensures thread safety for simple assignment
     self.streamTitle = title;
-    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Stream title updated to: %@", title);
+    RLog(RptrLogAreaProtocol, @"Stream title updated to: %@", title);
 }
 
 - (void)updateQualitySettings:(RptrVideoQualitySettings *)settings {
@@ -2954,6 +3681,65 @@
                                         userInfo:@{NSLocalizedDescriptionKey: @"Streaming stopped for quality change"}];
         [self.delegate hlsServer:self didEncounterError:error];
     }
+}
+
+#pragma mark - Test 4: Manual Flush Support
+
+- (void)scheduleManualFlushTimer {
+    // TEST 4: Schedule timer to call flushSegment every 1 second
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.flushTimer) {
+            [self.flushTimer invalidate];
+            self.flushTimer = nil;
+        }
+        
+        self.flushTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                           target:self
+                                                         selector:@selector(manualFlushSegment)
+                                                         userInfo:nil
+                                                          repeats:YES];
+        RLog(RptrLogAreaProtocol, @"[TEST4-TIMER] Scheduled manual flush timer (1 second interval)");
+    });
+}
+
+- (void)manualFlushSegment {
+    // TEST 4: Manual segment flush for passthrough mode
+    dispatch_async(self.writerQueue, ^{
+        if (!self.assetWriter || self.assetWriter.status != AVAssetWriterStatusWriting) {
+            RLog(RptrLogAreaProtocol, @"[TEST4-FLUSH] Writer not ready for flush (status: %ld)", 
+                 self.assetWriter ? (long)self.assetWriter.status : -1);
+            return;
+        }
+        
+        @try {
+            // Call flushSegment to force segment output in passthrough mode
+            [self.assetWriter flushSegment];
+            RLog(RptrLogAreaProtocol, @"[TEST4-FLUSH] flushSegment called successfully");
+            
+            // Update segment timing
+            self.currentSegmentStartTime = [NSDate date];
+            
+            // Log current state
+            RLog(RptrLogAreaProtocol, @"[TEST4-FLUSH] Segment index: %ld", (long)self.currentSegmentIndex);
+            RLog(RptrLogAreaProtocol, @"[TEST4-FLUSH] Writer status: %ld", (long)self.assetWriter.status);
+            
+        } @catch (NSException *exception) {
+            RLog(RptrLogAreaError, @"[TEST4-FLUSH] Exception calling flushSegment: %@", exception);
+            RLog(RptrLogAreaError, @"[TEST4-FLUSH] Exception reason: %@", exception.reason);
+            RLog(RptrLogAreaError, @"[TEST4-FLUSH] This likely means flushSegment is not available in encoding mode");
+        }
+    });
+}
+
+- (void)invalidateFlushTimer {
+    // Clean up the flush timer
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.flushTimer) {
+            [self.flushTimer invalidate];
+            self.flushTimer = nil;
+            RLog(RptrLogAreaProtocol, @"[TEST4-TIMER] Manual flush timer invalidated");
+        }
+    });
 }
 
 @end

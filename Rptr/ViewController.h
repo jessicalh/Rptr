@@ -9,9 +9,11 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreLocation/CoreLocation.h>
 #import "HLSAssetWriterServer.h"
+#import "RptrDIYHLSServer.h"
 #import "RptrVideoQualitySettings.h"
+#import "RptrDiagnostics.h"
 
-@interface ViewController : UIViewController <AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, CLLocationManagerDelegate, HLSAssetWriterServerDelegate>
+@interface ViewController : UIViewController <AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, CLLocationManagerDelegate, HLSAssetWriterServerDelegate, RptrDIYHLSServerDelegate, RptrDiagnosticsDelegate>
 
 @property (nonatomic, strong) NSMutableDictionary<NSString *, AVCaptureSession *> *captureSessions;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, AVCaptureMovieFileOutput *> *movieFileOutputs;
@@ -52,6 +54,8 @@
 
 // HLS Streaming
 @property (nonatomic, strong) HLSAssetWriterServer *hlsServer;
+@property (nonatomic, strong) RptrDIYHLSServer *diyHLSServer; // DIY implementation
+@property (nonatomic, assign) BOOL useDIYServer; // Toggle for testing
 @property (nonatomic, strong) UIButton *streamButton;
 @property (nonatomic, strong) UILabel *streamStatusLabel;
 @property (nonatomic, assign) BOOL isStreaming;
@@ -60,12 +64,28 @@
 @property (nonatomic, strong) UIButton *qualityButton;
 @property (nonatomic, assign) RptrVideoQualityMode currentQualityMode;
 
+// Title button
+@property (nonatomic, strong) UIButton *titleButton;
+
+// Share button
+@property (nonatomic, strong) UIButton *shareButton;
+
 
 // Streaming indicators
 @property (nonatomic, strong) UIView *streamingLED;
 @property (nonatomic, strong) UIView *audioLevelMeter;
 @property (nonatomic, strong) NSMutableArray<UIView *> *audioLevelBars;
 @property (nonatomic, assign) float currentAudioLevel;
+
+// Feedback display
+@property (nonatomic, strong) UILabel *feedbackLabel;
+@property (nonatomic, strong) NSTimer *feedbackDismissTimer;
+@property (nonatomic, strong) NSMutableArray<NSString *> *feedbackQueue;
+@property (nonatomic, strong) dispatch_queue_t feedbackQueueLock;
+@property (nonatomic, assign) BOOL isDisplayingFeedback;
+
+// Cached icons
+@property (nonatomic, strong) UIImage *cachedCopyIcon;
 
 @end
 

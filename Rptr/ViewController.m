@@ -8,6 +8,7 @@
 #import "ViewController.h"
 #import "PermissionManager.h"
 #import "RptrLogger.h"
+#import "RptrDiagnostics.h"
 #import <ifaddrs.h>
 #import <arpa/inet.h>
 #import <CoreMedia/CoreMedia.h>
@@ -29,7 +30,7 @@
     [super loadView];
     self.view.backgroundColor = [UIColor blackColor];
     
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"loadView - Using default view creation");
+    RLog(RptrLogAreaInfo, @"loadView - Using default view creation");
 }
 
 - (void)viewDidLoad {
@@ -60,12 +61,12 @@
     self.currentQualityMode = RptrVideoQualityModeReliable;
     
     // Log the initial view frame for debugging
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLoad - View frame: %@", NSStringFromCGRect(self.view.frame));
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLoad - Screen bounds: %@", NSStringFromCGRect([[UIScreen mainScreen] bounds]));
+    RLog(RptrLogAreaInfo, @"viewDidLoad - View frame: %@", NSStringFromCGRect(self.view.frame));
+    RLog(RptrLogAreaInfo, @"viewDidLoad - Screen bounds: %@", NSStringFromCGRect([[UIScreen mainScreen] bounds]));
     
     // Check iOS version
     if (@available(iOS 17.6, *)) {
-        RLog(RptrLogAreaUI, @"iOS version check passed: %@", [[UIDevice currentDevice] systemVersion]);
+        RLog(RptrLogAreaInfo, @"iOS version check passed: %@", [[UIDevice currentDevice] systemVersion]);
     } else {
         // Show alert for unsupported iOS version
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"iOS Version Not Supported"
@@ -74,15 +75,23 @@
         [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
             exit(0);
         }]];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self presentViewController:alert animated:YES completion:nil];
-        });
+        // Present immediately - no need for delay
+        [self presentViewController:alert animated:YES completion:^{
+            RLog(RptrLogAreaInfo, @"iOS version alert presented");
+        }];
         return;
     }
     
-    // Initialize immediately without delay
-        // Initialize overlay queue for thread-safe pixel buffer operations
-        self.overlayQueue = dispatch_queue_create("com.rptr.overlay.queue", DISPATCH_QUEUE_SERIAL);
+    // Initialize diagnostics monitoring
+    RptrDiagnostics *diagnostics = [RptrDiagnostics sharedDiagnostics];
+    diagnostics.delegate = self;
+    diagnostics.anrThreshold = 3.0;  // 3 seconds for streaming app
+    diagnostics.memoryCheckInterval = 10.0;  // Check every 10 seconds
+    [diagnostics startMonitoring];
+    RLogInfo(@"Diagnostics monitoring started");
+    
+    // Initialize overlay queue for thread-safe pixel buffer operations
+    self.overlayQueue = dispatch_queue_create("com.rptr.overlay.queue", DISPATCH_QUEUE_SERIAL);
         
         // Initialize motion manager to detect actual device orientation
         _motionManager = [[CMMotionManager alloc] init];
@@ -166,54 +175,55 @@
                                                          name:UIApplicationDidReceiveMemoryWarningNotification
                                                        object:nil];
         });
-        
-        // Delay permission check to ensure view is fully laid out
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self checkAndSetupIfPermissionsGranted];
-        });
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidAppear - View frame: %@", NSStringFromCGRect(self.view.frame));
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidAppear - Window bounds: %@", NSStringFromCGRect(self.view.window.bounds));
+    // Check permissions once view is fully visible
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        [self checkAndSetupIfPermissionsGranted];
+    });
+    
+    RLog(RptrLogAreaInfo, @"viewDidAppear - View frame: %@", NSStringFromCGRect(self.view.frame));
+    RLog(RptrLogAreaInfo, @"viewDidAppear - Window bounds: %@", NSStringFromCGRect(self.view.window.bounds));
     
     // Check parent view controller
     if (self.parentViewController) {
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Parent view controller: %@", NSStringFromClass([self.parentViewController class]));
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Parent view frame: %@", NSStringFromCGRect(self.parentViewController.view.frame));
+        RLog(RptrLogAreaInfo, @"Parent view controller: %@", NSStringFromClass([self.parentViewController class]));
+        RLog(RptrLogAreaInfo, @"Parent view frame: %@", NSStringFromCGRect(self.parentViewController.view.frame));
     }
     
     // Check if we're in a container
     if (self.navigationController) {
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"In navigation controller");
+        RLog(RptrLogAreaInfo, @"In navigation controller");
     }
     if (self.tabBarController) {
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"In tab bar controller");
+        RLog(RptrLogAreaInfo, @"In tab bar controller");
     }
     if (self.splitViewController) {
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"In split view controller");
+        RLog(RptrLogAreaInfo, @"In split view controller");
     }
     
     // Log safe area insets
     if (@available(iOS 11.0, *)) {
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Safe area insets: %@", NSStringFromUIEdgeInsets(self.view.safeAreaInsets));
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Layout margins: %@", NSStringFromUIEdgeInsets(self.view.layoutMargins));
+        RLog(RptrLogAreaInfo, @"Safe area insets: %@", NSStringFromUIEdgeInsets(self.view.safeAreaInsets));
+        RLog(RptrLogAreaInfo, @"Layout margins: %@", NSStringFromUIEdgeInsets(self.view.layoutMargins));
     }
     
     // If view isn't filling window, force it
     if (!CGRectEqualToRect(self.view.frame, self.view.window.bounds)) {
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"View not filling window, forcing resize");
+        RLog(RptrLogAreaInfo, @"View not filling window, forcing resize");
         self.view.frame = self.view.window.bounds;
         [self.view setNeedsLayout];
         [self.view layoutIfNeeded];
     }
     
     // Log all subviews to check hierarchy
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"View subviews count: %lu", (unsigned long)self.view.subviews.count);
+    RLog(RptrLogAreaInfo, @"View subviews count: %lu", (unsigned long)self.view.subviews.count);
     for (UIView *subview in self.view.subviews) {
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Subview: %@ frame: %@", NSStringFromClass([subview class]), NSStringFromCGRect(subview.frame));
+        RLog(RptrLogAreaInfo, @"Subview: %@ frame: %@", NSStringFromClass([subview class]), NSStringFromCGRect(subview.frame));
     }
     
     // Landscape orientation is already enforced by Info.plist and supported orientations
@@ -224,7 +234,7 @@
         [CATransaction setDisableActions:YES];
         self.previewLayer.frame = self.view.bounds;
         [CATransaction commit];
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidAppear - Updated preview layer frame: %@", NSStringFromCGRect(self.previewLayer.frame));
+        RLog(RptrLogAreaInfo, @"viewDidAppear - Updated preview layer frame: %@", NSStringFromCGRect(self.previewLayer.frame));
     }
 }
 
@@ -232,9 +242,9 @@
     [super viewDidLayoutSubviews];
     
     // Just log what's happening
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLayoutSubviews - View frame: %@", NSStringFromCGRect(self.view.frame));
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLayoutSubviews - View bounds: %@", NSStringFromCGRect(self.view.bounds));
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"viewDidLayoutSubviews - View transform: %@", NSStringFromCGAffineTransform(self.view.transform));
+    RLog(RptrLogAreaInfo, @"viewDidLayoutSubviews - View frame: %@", NSStringFromCGRect(self.view.frame));
+    RLog(RptrLogAreaInfo, @"viewDidLayoutSubviews - View bounds: %@", NSStringFromCGRect(self.view.bounds));
+    RLog(RptrLogAreaInfo, @"viewDidLayoutSubviews - View transform: %@", NSStringFromCGAffineTransform(self.view.transform));
     
     // CRITICAL: Ensure preview layer maintains landscape orientation
     if (self.previewLayer && !_isLockingOrientation) {
@@ -295,7 +305,7 @@
     self.videoDataOutputs = [NSMutableDictionary dictionary];
     
     // Only use single camera setup
-    RLog(RptrLogAreaCamera, @"Setting up single camera session");
+    RLog(RptrLogAreaInfo, @"Setting up single camera session");
     [self setupSingleCameraSession];
 }
 
@@ -310,7 +320,7 @@
     NSArray<AVCaptureDevice *> *cameras = discoverySession.devices;
     
     if (cameras.count == 0) {
-        RLog(RptrLogAreaCamera | RptrLogAreaError, @"No rear camera available");
+        RLog(RptrLogAreaError, @"No rear camera available");
         return;
     }
     
@@ -327,7 +337,7 @@
     // No movie file output needed - streaming only
     self.videoDataOutput = self.videoDataOutputs[rearCamera.uniqueID];
     
-    RLog(RptrLogAreaCamera, @"Rear camera selected: %@ (position: %ld, uniqueID: %@)", 
+    RLog(RptrLogAreaInfo, @"Rear camera selected: %@ (position: %ld, uniqueID: %@)", 
           rearCamera.localizedName, (long)rearCamera.position, rearCamera.uniqueID);
     
     // Defer preview layer creation to ensure proper bounds
@@ -337,9 +347,9 @@
         CGRect nativeBounds = [[UIScreen mainScreen] nativeBounds];
         CGFloat scale = [[UIScreen mainScreen] scale];
         CGFloat nativeScale = [[UIScreen mainScreen] nativeScale];
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Screen bounds: %@", NSStringFromCGRect(screenBounds));
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Native bounds: %@", NSStringFromCGRect(nativeBounds));
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Screen scale: %f, native scale: %f", scale, nativeScale);
+        RLog(RptrLogAreaInfo, @"Screen bounds: %@", NSStringFromCGRect(screenBounds));
+        RLog(RptrLogAreaInfo, @"Native bounds: %@", NSStringFromCGRect(nativeBounds));
+        RLog(RptrLogAreaInfo, @"Screen scale: %f, native scale: %f", scale, nativeScale);
         
         // Check current interface orientation using window scene (iOS 13+)
         UIInterfaceOrientation orientation = UIInterfaceOrientationUnknown;
@@ -350,7 +360,7 @@
         
         // Check if we're in zoomed display mode
         BOOL isZoomed = (screenBounds.size.width * scale != nativeBounds.size.width);
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Display zoomed: %@", isZoomed ? @"YES" : @"NO");
+        RLog(RptrLogAreaInfo, @"Display zoomed: %@", isZoomed ? @"YES" : @"NO");
         
         // Create preview layer with current session
         self.previewLayer = [AVCaptureVideoPreviewLayer layerWithSession:self.captureSession];
@@ -363,7 +373,7 @@
         if ([input isKindOfClass:[AVCaptureDeviceInput class]]) {
             AVCaptureDeviceInput *deviceInput = (AVCaptureDeviceInput *)input;
             CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(deviceInput.device.activeFormat.formatDescription);
-            RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Camera video dimensions: %d x %d", dimensions.width, dimensions.height);
+            RLog(RptrLogAreaInfo, @"Camera video dimensions: %d x %d", dimensions.width, dimensions.height);
         }
         
         // IMPORTANT: Connection might not exist yet when preview layer is first created
@@ -414,9 +424,9 @@
         [self.view setNeedsLayout];
         [self.view layoutIfNeeded];
         
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Preview layer created with frame: %@", NSStringFromCGRect(self.previewLayer.frame));
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"View layer bounds: %@", NSStringFromCGRect(self.view.layer.bounds));
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"View layer frame: %@", NSStringFromCGRect(self.view.layer.frame));
+        RLog(RptrLogAreaInfo, @"Preview layer created with frame: %@", NSStringFromCGRect(self.previewLayer.frame));
+        RLog(RptrLogAreaInfo, @"View layer bounds: %@", NSStringFromCGRect(self.view.layer.bounds));
+        RLog(RptrLogAreaInfo, @"View layer frame: %@", NSStringFromCGRect(self.view.layer.frame));
         
         // Try setting the layer bounds explicitly
         [CATransaction begin];
@@ -426,24 +436,27 @@
         // Don't apply transform - use connection rotation instead
         [CATransaction commit];
         
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"After explicit bounds set - Preview layer bounds: %@, position: %@", 
+        RLog(RptrLogAreaInfo, @"After explicit bounds set - Preview layer bounds: %@, position: %@", 
              NSStringFromCGRect(self.previewLayer.bounds), NSStringFromCGPoint(self.previewLayer.position));
     });
     
-    RLog(RptrLogAreaCamera, @"Main preview layer created with session: %@", self.captureSession);
+    RLog(RptrLogAreaInfo, @"Main preview layer created with session: %@", self.captureSession);
     
+    
+    // Add observer for session started notification
+    [[NSNotificationCenter defaultCenter] addObserver:self 
+                                             selector:@selector(sessionDidStartRunning:)
+                                                 name:AVCaptureSessionDidStartRunningNotification 
+                                               object:self.captureSession];
     
     // Start the session for single camera
     [self.captureSession startRunning];
     
-    // Set initial rotation based on current device orientation
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self updateCameraRotationForOrientation:self->_lastDeviceOrientation];
-    });
+    // Initial rotation will be set when session starts via notification
 }
 
 - (void)setupSessionForCamera:(AVCaptureDevice *)camera {
-    RLog(RptrLogAreaCamera, @"Setting up session for camera: %@", camera.localizedName);
+    RLog(RptrLogAreaInfo, @"Setting up session for camera: %@", camera.localizedName);
     
     // Create session for this camera
     AVCaptureSession *session = [[AVCaptureSession alloc] init];
@@ -451,13 +464,13 @@
     // Always use high preset for capture session
     // The actual encoding resolution is handled by the asset writer
     session.sessionPreset = AVCaptureSessionPresetHigh;
-    RLog(RptrLogAreaCamera, @"Using High preset for capture session");
+    RLog(RptrLogAreaInfo, @"Using High preset for capture session");
     
     // Create video input
     NSError *error = nil;
     AVCaptureDeviceInput *videoInput = [AVCaptureDeviceInput deviceInputWithDevice:camera error:&error];
     if (error) {
-        RLog(RptrLogAreaCamera | RptrLogAreaError, @"Error creating video input for %@: %@", camera.localizedName, error.localizedDescription);
+        RLog(RptrLogAreaError, @"Error creating video input for %@: %@", camera.localizedName, error.localizedDescription);
         return;
     }
     
@@ -471,7 +484,7 @@
             RptrVideoQualitySettings *settings = [RptrVideoQualitySettings settingsForMode:self.currentQualityMode];
             
             // Set the frame rate from quality settings
-            CMTime frameDuration = CMTimeMake(1, settings.videoFrameRate);
+            CMTime frameDuration = CMTimeMake(1, (int32_t)settings.videoFrameRate);
             camera.activeVideoMinFrameDuration = frameDuration;
             camera.activeVideoMaxFrameDuration = frameDuration;
             
@@ -501,14 +514,14 @@
             }
             
             [camera unlockForConfiguration];
-            RLog(RptrLogAreaCamera | RptrLogAreaVideo, @"Set frame rate to %d fps for %@ (quality mode: %@)", 
-                 settings.videoFrameRate, camera.localizedName, 
+            RLog(RptrLogAreaInfo, @"Set frame rate to %ld fps for %@ (quality mode: %@)", 
+                 (long)settings.videoFrameRate, camera.localizedName, 
                  self.currentQualityMode == RptrVideoQualityModeReliable ? @"Reliable" : @"Real-time");
         } else {
-            RLog(RptrLogAreaCamera | RptrLogAreaError, @"Could not lock camera for configuration: %@", error.localizedDescription);
+            RLog(RptrLogAreaError, @"Could not lock camera for configuration: %@", error.localizedDescription);
         }
     } else {
-        RLog(RptrLogAreaCamera | RptrLogAreaError, @"Cannot add video input to session for %@", camera.localizedName);
+        RLog(RptrLogAreaError, @"Cannot add video input to session for %@", camera.localizedName);
         return;
     }
     
@@ -518,14 +531,14 @@
     if (audioDevice) {
         audioInput = [AVCaptureDeviceInput deviceInputWithDevice:audioDevice error:&error];
         if (error) {
-            RLog(RptrLogAreaAudio | RptrLogAreaError, @"Error creating audio input: %@", error.localizedDescription);
+            RLog(RptrLogAreaError, @"Error creating audio input: %@", error.localizedDescription);
             error = nil;
         }
     }
     
     if (audioInput && [session canAddInput:audioInput]) {
         [session addInput:audioInput];
-        RLog(RptrLogAreaAudio, @"Added audio input to rear camera session");
+        RLog(RptrLogAreaInfo, @"Added audio input to rear camera session");
     }
     
     // No movie file output needed - this app only streams, never records
@@ -544,7 +557,7 @@
     
     if ([session canAddOutput:dataOutput]) {
         [session addOutput:dataOutput];
-        RLog(RptrLogAreaVideo, @"Video data output added for %@", camera.localizedName);
+        RLog(RptrLogAreaInfo, @"Video data output added for %@", camera.localizedName);
         
         // Set landscape orientation for rear camera streaming
         AVCaptureConnection *videoConnection = [dataOutput connectionWithMediaType:AVMediaTypeVideo];
@@ -570,7 +583,7 @@
     if ([session canAddOutput:audioDataOutput]) {
         [session addOutput:audioDataOutput];
         self.audioDataOutput = audioDataOutput;
-        RLog(RptrLogAreaAudio | RptrLogAreaHLS, @"Audio data output added for streaming");
+        RLog(RptrLogAreaProtocol, @"Audio data output added for streaming");
     }
     
     // Store in dictionaries
@@ -595,21 +608,70 @@
     self.endpointCopyButtons = [NSMutableArray array];
     
     // Initialize and start HLS server (not streaming yet)
-    if (!self.hlsServer) {
-        RLog(RptrLogAreaHLS, @"Initializing HLS server on app launch");
-        self.hlsServer = [[HLSAssetWriterServer alloc] initWithPort:8080];
-        self.hlsServer.delegate = self;
+    // Toggle this to test DIY implementation
+    self.useDIYServer = YES; // SET TO YES TO TEST DIY SERVER
+    
+    if (self.useDIYServer) {
+        // DIY HLS Server (NEW IMPLEMENTATION)
+        RLog(RptrLogAreaProtocol, @"Initializing DIY HLS server on app launch");
         
-        // Set initial quality settings
         RptrVideoQualitySettings *settings = [RptrVideoQualitySettings settingsForMode:self.currentQualityMode];
-        self.hlsServer.qualitySettings = settings;
         
-        NSError *error = nil;
-        BOOL started = [self.hlsServer startServer:&error];
+        self.diyHLSServer = [[RptrDIYHLSServer alloc] 
+            initWithWidth:settings.videoWidth
+                   height:settings.videoHeight
+                frameRate:settings.videoFrameRate
+                  bitrate:settings.videoBitrate];
+        
+        self.diyHLSServer.delegate = self;
+        self.diyHLSServer.segmentDuration = settings.segmentDuration;
+        self.diyHLSServer.playlistWindowSize = 10;
+        
+        BOOL started = [self.diyHLSServer startServerOnPort:8080];
         if (started) {
-            RLog(RptrLogAreaHLS, @"HLS server started successfully on port 8080");
+            RLog(RptrLogAreaProtocol, @"DIY HLS server started successfully on port 8080");
+            RLog(RptrLogAreaProtocol, @"DIY Playlist URL: %@", self.diyHLSServer.playlistURL);
+            
+            // Display streaming URLs in UI
+            [self displayDIYStreamingURLs];
+            
+            // AUTO-START STREAMING FOR AUTOMATED TESTING
+            // This allows Claude to test without manual button press
+            #ifdef DEBUG
+            BOOL autoStartEnabled = YES; // Set to YES for automated testing
+            if (autoStartEnabled) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    RLog(RptrLogAreaProtocol, @"[AUTO-START] Automatically starting streaming for debug testing");
+                    if (!self.isStreaming) {
+                        [self startStreaming];
+                    }
+                });
+            }
+            #endif
+            
+            // The server will call hlsServerDidStart delegate method automatically
+            // Don't call it manually here to avoid duplicate calls
         } else {
-            RLog(RptrLogAreaHLS | RptrLogAreaError, @"Failed to start HLS server: %@", error);
+            RLog(RptrLogAreaError, @"Failed to start DIY HLS server");
+        }
+    } else {
+        // Original HLS Server (FALLBACK)
+        if (!self.hlsServer) {
+            RLog(RptrLogAreaProtocol, @"Initializing original HLS server on app launch");
+            self.hlsServer = [[HLSAssetWriterServer alloc] initWithPort:8080];
+            self.hlsServer.delegate = self;
+            
+            // Set initial quality settings
+            RptrVideoQualitySettings *settings = [RptrVideoQualitySettings settingsForMode:self.currentQualityMode];
+            self.hlsServer.qualitySettings = settings;
+            
+            NSError *error = nil;
+            BOOL started = [self.hlsServer startServer:&error];
+            if (started) {
+                RLog(RptrLogAreaProtocol, @"Original HLS server started successfully on port 8080");
+            } else {
+                RLog(RptrLogAreaError, @"Failed to start original HLS server: %@", error);
+            }
         }
     }
     
@@ -677,6 +739,34 @@
     self.streamInfoLabel.hidden = YES;
     [self.view addSubview:self.streamInfoLabel];
     
+    // Feedback display label (lower right corner)
+    CGFloat feedbackWidth = 300;
+    CGFloat feedbackHeight = 60;
+    CGFloat feedbackPadding = 20;
+    self.feedbackLabel = [[UILabel alloc] initWithFrame:CGRectMake(
+        self.view.frame.size.width - feedbackWidth - feedbackPadding,
+        self.view.frame.size.height - feedbackHeight - feedbackPadding,
+        feedbackWidth,
+        feedbackHeight
+    )];
+    self.feedbackLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.8];
+    self.feedbackLabel.textColor = [UIColor whiteColor];
+    self.feedbackLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    self.feedbackLabel.textAlignment = NSTextAlignmentCenter;
+    self.feedbackLabel.numberOfLines = 2;
+    self.feedbackLabel.layer.cornerRadius = 8;
+    self.feedbackLabel.layer.masksToBounds = YES;
+    self.feedbackLabel.layer.borderWidth = 1;
+    self.feedbackLabel.layer.borderColor = [[UIColor colorWithWhite:1.0 alpha:0.3] CGColor];
+    self.feedbackLabel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+    self.feedbackLabel.hidden = YES;
+    [self.view addSubview:self.feedbackLabel];
+    
+    // Initialize feedback queue with thread safety
+    self.feedbackQueue = [NSMutableArray array];
+    self.feedbackQueueLock = dispatch_queue_create("com.rptr.feedback.queue", DISPATCH_QUEUE_SERIAL);
+    self.isDisplayingFeedback = NO;
+    
     // Start UTC timer
     self.utcTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(updateUTCTime) userInfo:nil repeats:YES];
     
@@ -716,13 +806,13 @@
     [self.view addSubview:self.streamButton];
     
     // Share button - positioned above regenerate button
-    UIButton *shareButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 200, streamButtonSize, streamButtonSize)];
-    shareButton.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.8];
-    shareButton.layer.cornerRadius = streamButtonSize / 2;
-    [shareButton setImage:[UIImage systemImageNamed:@"square.and.arrow.up"] forState:UIControlStateNormal];
-    shareButton.tintColor = [UIColor whiteColor];
-    [shareButton addTarget:self action:@selector(shareButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:shareButton];
+    self.shareButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 200, streamButtonSize, streamButtonSize)];
+    self.shareButton.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.8];
+    self.shareButton.layer.cornerRadius = streamButtonSize / 2;
+    [self.shareButton setImage:[UIImage systemImageNamed:@"square.and.arrow.up"] forState:UIControlStateNormal];
+    self.shareButton.tintColor = [UIColor whiteColor];
+    [self.shareButton addTarget:self action:@selector(shareButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.shareButton];
     
     // Regenerate URL button - positioned above title button
     UIButton *regenerateButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 150, streamButtonSize, streamButtonSize)];
@@ -734,14 +824,14 @@
     [self.view addSubview:regenerateButton];
     
     // Title button - positioned above stream button
-    UIButton *titleButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 100, streamButtonSize, streamButtonSize)];
-    titleButton.backgroundColor = [[UIColor systemGrayColor] colorWithAlphaComponent:0.8];
-    titleButton.layer.cornerRadius = streamButtonSize / 2;
-    [titleButton setTitle:@"T" forState:UIControlStateNormal];
-    titleButton.titleLabel.font = [UIFont boldSystemFontOfSize:20];
-    titleButton.tintColor = [UIColor whiteColor];
-    [titleButton addTarget:self action:@selector(titleButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:titleButton];
+    self.titleButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 100, streamButtonSize, streamButtonSize)];
+    self.titleButton.backgroundColor = [[UIColor systemGrayColor] colorWithAlphaComponent:0.8];
+    self.titleButton.layer.cornerRadius = streamButtonSize / 2;
+    [self.titleButton setTitle:@"T" forState:UIControlStateNormal];
+    self.titleButton.titleLabel.font = [UIFont boldSystemFontOfSize:20];
+    self.titleButton.tintColor = [UIColor whiteColor];
+    [self.titleButton addTarget:self action:@selector(titleButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.titleButton];
     
     // Quality toggle button - positioned above share button
     self.qualityButton = [[UIButton alloc] initWithFrame:CGRectMake(20, self.view.frame.size.height - streamButtonSize - 250, streamButtonSize, streamButtonSize)];
@@ -762,7 +852,7 @@
 #pragma mark - App Lifecycle
 
 - (void)appWillTerminate:(NSNotification *)notification {
-    RLog(RptrLogAreaHLS | RptrLogAreaLifecycle, @"App will terminate - stopping HLS server gracefully");
+    RLog(RptrLogAreaProtocol, @"App will terminate - stopping HLS server gracefully");
     
     // Stop streaming first
     if (self.isStreaming) {
@@ -772,7 +862,7 @@
     // Stop the HLS server
     if (self.hlsServer) {
         [self.hlsServer stopServer];
-        RLog(RptrLogAreaHLS, @"HLS server stopped");
+        RLog(RptrLogAreaProtocol, @"HLS server stopped");
     }
     
     // Stop location updates
@@ -788,16 +878,16 @@
         }
     }
     
-    RLog(RptrLogAreaHLS | RptrLogAreaLifecycle, @"App termination cleanup completed");
+    RLog(RptrLogAreaProtocol, @"App termination cleanup completed");
 }
 
 - (void)didReceiveMemoryWarning:(NSNotification *)notification {
-    RLog(RptrLogAreaMemory, @"Received memory warning in ViewController");
+    RLog(RptrLogAreaInfo, @"Received memory warning in ViewController");
     
     // Clear any cached CIContext
     if (self.ciContext) {
         self.ciContext = nil;
-        RLog(RptrLogAreaMemory, @"Cleared CIContext");
+        RLog(RptrLogAreaInfo, @"Cleared CIContext");
     }
     
     // Clear activity scores to free memory
@@ -809,7 +899,7 @@
         if (self.previewLayer) {
             [self.previewLayer removeFromSuperlayer];
             self.previewLayer = nil;
-            RLog(RptrLogAreaMemory, @"Removed preview layer to free GPU memory");
+            RLog(RptrLogAreaInfo, @"Removed preview layer to free GPU memory");
         }
     }
     
@@ -820,7 +910,7 @@
 }
 
 - (void)appDidEnterBackground:(NSNotification *)notification {
-    RLog(RptrLogAreaHLS | RptrLogAreaLifecycle, @"App entered background - pausing streaming");
+    RLog(RptrLogAreaProtocol, @"App entered background - pausing streaming");
     
     // Keep server running but pause streaming to save resources
     if (self.isStreaming) {
@@ -974,6 +1064,11 @@
 }
 
 - (UIImage *)copyIcon {
+    // Cache the icon to avoid recreating it
+    if (self.cachedCopyIcon) {
+        return self.cachedCopyIcon;
+    }
+    
     CGSize size = CGSizeMake(16, 16);
     UIGraphicsBeginImageContextWithOptions(size, NO, 0.0);
     
@@ -1001,6 +1096,9 @@
     UIImage *image2 = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     
+    // Cache the icon
+    self.cachedCopyIcon = image2;
+    
     return image2;
 }
 
@@ -1012,12 +1110,18 @@
         
         [[UIPasteboard generalPasteboard] setString:url];
         
-        // Flash the button to indicate copy
+        // Flash the button to indicate copy using animation completion
         UIColor *originalColor = sender.backgroundColor;
-        sender.backgroundColor = [[UIColor greenColor] colorWithAlphaComponent:0.6];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            sender.backgroundColor = originalColor;
-        });
+        [UIView animateWithDuration:0.1 
+                              delay:0 
+                            options:UIViewAnimationOptionAllowUserInteraction | UIViewAnimationOptionCurveEaseInOut
+                         animations:^{
+            sender.backgroundColor = [[UIColor greenColor] colorWithAlphaComponent:0.6];
+        } completion:^(BOOL finished) {
+            [UIView animateWithDuration:0.1 animations:^{
+                sender.backgroundColor = originalColor;
+            }];
+        }];
     }
 }
 
@@ -1029,8 +1133,8 @@
             [self startStreaming];
         }
     } @catch (NSException *exception) {
-        RLog(RptrLogAreaHLS | RptrLogAreaError, @"Exception in streamButtonTapped: %@", exception);
-        RLog(RptrLogAreaHLS | RptrLogAreaError | RptrLogAreaDebug, @"Stack trace: %@", exception.callStackSymbols);
+        RLog(RptrLogAreaError, @"Exception in streamButtonTapped: %@", exception);
+        RLog(RptrLogAreaError, @"Stack trace: %@", exception.callStackSymbols);
         // Try to recover
         self.isStreaming = NO;
         [self stopStreaming];
@@ -1038,16 +1142,6 @@
 }
 
 - (void)shareButtonTapped:(UIButton *)sender {
-    if (!self.isStreaming) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Stream Not Active"
-                                                                       message:@"Start streaming first to share the URL"
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil];
-        [alert addAction:okAction];
-        [self presentViewController:alert animated:YES completion:nil];
-        return;
-    }
-    
     // Construct the full stream URL
     NSArray<NSString *> *urls = [self.hlsServer getServerURLs];
     if (urls.count == 0) {
@@ -1095,7 +1189,7 @@
     
     // Present the share sheet
     [self presentViewController:activityVC animated:YES completion:^{
-        RLog(RptrLogAreaUI, @"Share sheet presented with URL: %@", fullStreamURL);
+        RLog(RptrLogAreaInfo, @"Share sheet presented with URL: %@", fullStreamURL);
     }];
 }
 
@@ -1106,7 +1200,7 @@
         return;
     }
     
-    RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Starting keyboard and alert controller preload...");
+    RLog(RptrLogAreaInfo, @"Starting keyboard and alert controller preload...");
     
     // First, preload UIAlertController with text field
     UIAlertController *dummyAlert = [UIAlertController alertControllerWithTitle:@""
@@ -1140,8 +1234,8 @@
     // Trigger keyboard load
     [dummyTextField becomeFirstResponder];
     
-    // Immediately dismiss it
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // Use main queue async instead of timer - executes on next run loop
+    dispatch_async(dispatch_get_main_queue(), ^{
         [dummyTextField resignFirstResponder];
         [dummyTextField removeFromSuperview];
         
@@ -1149,13 +1243,20 @@
         [UIView setAnimationsEnabled:YES];
         
         keyboardPreloaded = YES;
-        RLog(RptrLogAreaUI | RptrLogAreaDebug, @"Keyboard and alert controller preloaded successfully");
+        RLog(RptrLogAreaInfo, @"Keyboard and alert controller preloaded successfully");
     });
 }
 
 - (void)titleButtonTapped:(UIButton *)sender {
     // Disable the button immediately to prevent multiple taps
     sender.enabled = NO;
+    
+    // Check if we're already presenting something
+    if (self.presentedViewController) {
+        RLogWarning(@"Already presenting a view controller, ignoring title button tap");
+        sender.enabled = YES;
+        return;
+    }
     
     // Get current title directly - atomic property access is fast
     NSString *currentTitle = [self.hlsServer getStreamTitle];
@@ -1184,7 +1285,8 @@
         if (newTitle.length > 0 && weakSelf) {
             // Update the title using thread-safe method
             [weakSelf.hlsServer setStreamTitleAsync:newTitle];
-            RLog(RptrLogAreaUI, @"Stream title updated to: %@", newTitle);
+            RLog(RptrLogAreaInfo, @"Stream title updated to: %@", newTitle);
+            
         }
     }];
     
@@ -1216,17 +1318,18 @@
                                                              handler:^(UIAlertAction *action) {
         // Force stop streaming if active
         if (self.isStreaming) {
-            RLog(RptrLogAreaUI, @"Stopping streaming before URL regeneration");
+            RLog(RptrLogAreaInfo, @"Stopping streaming before URL regeneration");
             [self stopStreaming];
         }
         
         // Regenerate the random path
         [self.hlsServer regenerateRandomPath];
         
+        
         // Update the displayed URLs
         [self updateStreamingURLs];
         
-        RLog(RptrLogAreaUI, @"Stream URL regenerated");
+        RLog(RptrLogAreaInfo, @"Stream URL regenerated");
         
         // Show a brief confirmation
         UIAlertController *confirmAlert = [UIAlertController alertControllerWithTitle:@"URL Regenerated"
@@ -1251,19 +1354,53 @@
 }
 
 - (void)startStreaming {
-    RLog(RptrLogAreaHLS, @"startStreaming called");
+    RLog(RptrLogAreaProtocol, @"startStreaming called");
     
     // Server should already be running from app launch
-    if (!self.hlsServer) {
-        RLog(RptrLogAreaHLS | RptrLogAreaError, @"HLS server not initialized");
-        return;
+    if (self.useDIYServer) {
+        if (!self.diyHLSServer) {
+            RLog(RptrLogAreaError, @"DIY HLS server not initialized");
+            return;
+        }
+        // DIY server doesn't need prepareForStreaming
+    } else {
+        if (!self.hlsServer) {
+            RLog(RptrLogAreaError, @"HLS server not initialized");
+            return;
+        }
+        // Prepare the asset writer for streaming (needed after URL regeneration)
+        [self.hlsServer prepareForStreaming];
     }
     
-    // Prepare the asset writer for streaming (needed after URL regeneration)
-    [self.hlsServer prepareForStreaming];
+    // Disable title button during streaming
+    self.titleButton.enabled = NO;
+    self.titleButton.backgroundColor = [[UIColor systemGrayColor] colorWithAlphaComponent:0.4];
+    self.titleButton.alpha = 0.6;
     
-    // Just set the streaming flag - server is already running
-    self.isStreaming = YES;
+    // Disable share button during streaming (for privacy)
+    self.shareButton.enabled = NO;
+    self.shareButton.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.4];
+    self.shareButton.alpha = 0.6;
+    
+    // Start streaming based on server type
+    if (self.useDIYServer) {
+        // Start DIY HLS streaming
+        if ([self.diyHLSServer startStreaming]) {
+            RLog(RptrLogAreaProtocol, @"DIY HLS streaming started");
+            self.isStreaming = YES;
+            
+            // Display streaming URLs
+            [self displayDIYStreamingURLs];
+        } else {
+            RLog(RptrLogAreaError, @"Failed to start DIY HLS streaming");
+            return;
+        }
+    } else {
+        // Original server - just set the flag
+        self.isStreaming = YES;
+        RLog(RptrLogAreaProtocol, @"Original HLS streaming started (server already running)");
+    }
+    
     self.streamButton.backgroundColor = [[UIColor systemRedColor] colorWithAlphaComponent:0.8];
     
     // Update LED to green
@@ -1272,35 +1409,32 @@
     // Show audio meter
     self.audioLevelMeter.hidden = NO;
     
-    // Notify delegate to start accepting video/audio samples
-    RLog(RptrLogAreaHLS, @"Starting HLS streaming (server already running)");
-    
     // Debug: Verify video data output is ready
-    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"============ STREAMING STARTED ============");
-    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"self.videoDataOutput: %@", self.videoDataOutput);
-    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Delegate: %@", self.videoDataOutput.sampleBufferDelegate);
-    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"isStreaming: %@", self.isStreaming ? @"YES" : @"NO");
+    RLog(RptrLogAreaProtocol, @"============ STREAMING STARTED ============");
+    RLog(RptrLogAreaProtocol, @"self.videoDataOutput: %@", self.videoDataOutput);
+    RLog(RptrLogAreaProtocol, @"Delegate: %@", self.videoDataOutput.sampleBufferDelegate);
+    RLog(RptrLogAreaProtocol, @"isStreaming: %@", self.isStreaming ? @"YES" : @"NO");
     
     
     // Check all video data outputs
-    RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Checking all video data outputs:");
+    RLog(RptrLogAreaProtocol, @"Checking all video data outputs:");
     for (NSString *cameraID in self.videoDataOutputs) {
         AVCaptureVideoDataOutput *output = self.videoDataOutputs[cameraID];
-            RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"  Camera %@: Output=%@, Delegate=%@", 
+            RLog(RptrLogAreaProtocol, @"  Camera %@: Output=%@, Delegate=%@", 
                   cameraID, output, output.sampleBufferDelegate);
             
             // Check connection
             AVCaptureConnection *connection = [output connectionWithMediaType:AVMediaTypeVideo];
-            RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"  Connection: %@, Active: %@, Enabled: %@",
+            RLog(RptrLogAreaProtocol, @"  Connection: %@, Active: %@, Enabled: %@",
                   connection, 
                   connection.isActive ? @"YES" : @"NO",
                   connection.isEnabled ? @"YES" : @"NO");
         }
         
         // Check current capture session
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Current capture session: %@", self.captureSession);
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Session running: %@", self.captureSession.isRunning ? @"YES" : @"NO");
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"========================================");
+        RLog(RptrLogAreaProtocol, @"Current capture session: %@", self.captureSession);
+        RLog(RptrLogAreaProtocol, @"Session running: %@", self.captureSession.isRunning ? @"YES" : @"NO");
+        RLog(RptrLogAreaProtocol, @"========================================");
         
         // Add pulsing animation
         CABasicAnimation *animation = [CABasicAnimation animationWithKeyPath:@"opacity"];
@@ -1311,17 +1445,23 @@
         animation.toValue = @0.3;
         [self.streamButton.layer addAnimation:animation forKey:@"pulse"];
         
-        RLog(RptrLogAreaHLS, @"HLS streaming started on port %lu", (unsigned long)self.hlsServer.port);
+        RLog(RptrLogAreaProtocol, @"HLS streaming started on port %lu", (unsigned long)self.hlsServer.port);
         
         // Log network interface being used
         NSString *cellularIP = [self getCellularIPAddress];
         NSString *wifiIP = [self getWiFiIPAddress];
-        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Available interfaces - Cellular: %@, WiFi: %@", 
+        RLog(RptrLogAreaProtocol, @"Available interfaces - Cellular: %@, WiFi: %@", 
               cellularIP ?: @"Not available", 
               wifiIP ?: @"Not available");
 }
 
 - (void)stopStreaming {
+    // Stop streaming based on server type
+    if (self.useDIYServer) {
+        [self.diyHLSServer stopStreaming];
+        RLog(RptrLogAreaProtocol, @"DIY HLS streaming stopped");
+    }
+    
     // Stop streaming flag to prevent new frames being sent
     self.isStreaming = NO;
     
@@ -1330,18 +1470,31 @@
     [self.streamButton.layer removeAnimationForKey:@"pulse"];
     self.streamInfoLabel.hidden = YES;
     
+    // Re-enable title button
+    self.titleButton.enabled = YES;
+    self.titleButton.backgroundColor = [[UIColor systemGrayColor] colorWithAlphaComponent:0.8];
+    self.titleButton.alpha = 1.0;
+    
+    // Re-enable share button
+    self.shareButton.enabled = YES;
+    self.shareButton.backgroundColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.8];
+    self.shareButton.alpha = 1.0;
+    
     // Update LED to gray
     self.streamingLED.backgroundColor = [UIColor colorWithRed:0.5 green:0.5 blue:0.5 alpha:1.0];
     
     // Hide audio meter
     self.audioLevelMeter.hidden = YES;
     
+    // Clear feedback display and queue
+    [self clearFeedbackDisplay];
+    
     // Tell HLS server to stop asset writer (but keep HTTP server running)
     if (self.hlsServer) {
         [self.hlsServer stopStreaming];
     }
     
-    RLog(RptrLogAreaHLS, @"HLS streaming stopped (server still running)");
+    RLog(RptrLogAreaProtocol, @"HLS streaming stopped (server still running)");
 }
 
 - (void)updateStreamingURLs {
@@ -1357,84 +1510,117 @@
 #pragma mark - HLSAssetWriterServerDelegate
 
 - (void)hlsServerDidStart:(NSString *)baseURL {
-    NSArray *urls = [self.hlsServer getServerURLs];
+    // Diagnostic: Track UI update timing
+    CFAbsoluteTime startTime = CFAbsoluteTimeGetCurrent();
+    RLog(RptrLogAreaProtocol, @"hlsServerDidStart BEGIN on thread: %@", [NSThread isMainThread] ? @"main" : @"background");
     
-    dispatch_async(dispatch_get_main_queue(), ^{
-        // Remove old endpoint labels and buttons
-        for (UILabel *label in self.endpointLabels) {
-            [label removeFromSuperview];
-        }
-        for (UIButton *button in self.endpointCopyButtons) {
-            [button removeFromSuperview];
-        }
-        [self.endpointLabels removeAllObjects];
-        [self.endpointCopyButtons removeAllObjects];
+    // This should now always be called on main queue
+    if (![NSThread isMainThread]) {
+        RLog(RptrLogAreaError, @"WARNING: hlsServerDidStart called on background thread!");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self hlsServerDidStart:baseURL];
+        });
+        return;
+    }
+    
+    NSArray *urls = [self.hlsServer getServerURLs];
+    RLog(RptrLogAreaProtocol, @"Got %lu URLs", (unsigned long)urls.count);
+    
+    // Remove old endpoint labels and buttons
+    RLog(RptrLogAreaProtocol, @"Removing old labels...");
+    for (UILabel *label in self.endpointLabels) {
+        [label removeFromSuperview];
+    }
+    for (UIButton *button in self.endpointCopyButtons) {
+        [button removeFromSuperview];
+    }
+    [self.endpointLabels removeAllObjects];
+    [self.endpointCopyButtons removeAllObjects];
+    RLog(RptrLogAreaProtocol, @"Old labels removed");
+    
+    // Create endpoint label for /view with random path
+    NSString *viewPath = [NSString stringWithFormat:@"/view/%@", self.hlsServer.randomPath];
+    NSArray *endpoints = @[viewPath];
+    CGFloat yOffset = 40;
+    
+    RLog(RptrLogAreaProtocol, @"Creating labels for %lu URLs", (unsigned long)urls.count);
+    for (NSString *urlString in urls) {
+        RLog(RptrLogAreaProtocol, @"Processing URL: %@", urlString);
+        // Extract base URL (IP and port)
+        NSURL *url = [NSURL URLWithString:urlString];
+        NSString *baseURL = [NSString stringWithFormat:@"%@://%@:%@", 
+                            url.scheme ?: @"http",
+                            url.host ?: @"localhost",
+                            url.port ?: @(self.hlsServer.port)];
         
-        // Create endpoint label for /view with random path
-        NSString *viewPath = [NSString stringWithFormat:@"/view/%@", self.hlsServer.randomPath];
-        NSArray *endpoints = @[viewPath];
-        CGFloat yOffset = 40;
-        
-        for (NSString *urlString in urls) {
-            // Extract base URL (IP and port)
-            NSURL *url = [NSURL URLWithString:urlString];
-            NSString *baseURL = [NSString stringWithFormat:@"%@://%@:%@", 
-                                url.scheme ?: @"http",
-                                url.host ?: @"localhost",
-                                url.port ?: @(self.hlsServer.port)];
+        // Create labels for each endpoint
+        for (NSString *endpoint in endpoints) {
+            NSString *fullURL = [baseURL stringByAppendingString:endpoint];
             
-            // Create labels for each endpoint
-            for (NSString *endpoint in endpoints) {
-                NSString *fullURL = [baseURL stringByAppendingString:endpoint];
-                
-                // Calculate the actual text size
-                UIFont *urlFont = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
-                NSDictionary *attributes = @{NSFontAttributeName: urlFont};
-                CGSize textSize = [fullURL sizeWithAttributes:attributes];
-                
-                // Add some padding to the width
-                CGFloat labelWidth = textSize.width + 10;
-                CGFloat labelX = self.view.frame.size.width - labelWidth - 30; // 30 for copy button
-                
-                // Create label with calculated width
-                UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(labelX, yOffset, labelWidth, 22)];
-                label.text = fullURL;
-                label.textColor = [UIColor whiteColor];
-                label.font = urlFont;
-                label.textAlignment = NSTextAlignmentRight;
-                label.adjustsFontSizeToFitWidth = NO;  // Don't shrink font
-                label.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-                [self.view addSubview:label];
-                [self.endpointLabels addObject:label];
-                
-                // Create copy button
-                UIButton *copyButton = [UIButton buttonWithType:UIButtonTypeCustom];
-                copyButton.frame = CGRectMake(self.view.frame.size.width - 25, yOffset, 20, 22);
+            // Calculate the actual text size
+            UIFont *urlFont = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
+            NSDictionary *attributes = @{NSFontAttributeName: urlFont};
+            CGSize textSize = [fullURL sizeWithAttributes:attributes];
+            
+            // Add some padding to the width
+            CGFloat labelWidth = textSize.width + 10;
+            CGFloat labelX = self.view.frame.size.width - labelWidth - 30; // 30 for copy button
+            
+            // Create label with calculated width
+            UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(labelX, yOffset, labelWidth, 22)];
+            label.text = fullURL;
+            label.textColor = [UIColor whiteColor];
+            label.font = urlFont;
+            label.textAlignment = NSTextAlignmentRight;
+            label.adjustsFontSizeToFitWidth = NO;  // Don't shrink font
+            label.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+            [self.view addSubview:label];
+            [self.endpointLabels addObject:label];
+            
+            // Create copy button
+            UIButton *copyButton = [UIButton buttonWithType:UIButtonTypeCustom];
+            copyButton.frame = CGRectMake(self.view.frame.size.width - 25, yOffset, 20, 22);
+            
+            // Use system image instead of custom drawing to avoid ANR
+            if (@available(iOS 13.0, *)) {
+                UIImage *copyImage = [UIImage systemImageNamed:@"doc.on.doc"];
+                UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightRegular];
+                copyImage = [copyImage imageByApplyingSymbolConfiguration:config];
+                [copyButton setImage:copyImage forState:UIControlStateNormal];
+            } else {
+                // Fallback for older iOS versions
                 [copyButton setImage:[self copyIcon] forState:UIControlStateNormal];
-                copyButton.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.2];
-                copyButton.layer.cornerRadius = 4;
-                copyButton.tag = self.endpointLabels.count - 1;
-                [copyButton addTarget:self action:@selector(copyButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-                copyButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-                [self.view addSubview:copyButton];
-                [self.endpointCopyButtons addObject:copyButton];
-                
-                yOffset += 22;
             }
+            copyButton.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.2];
+            copyButton.layer.cornerRadius = 4;
+            copyButton.tag = self.endpointLabels.count - 1;
+            [copyButton addTarget:self action:@selector(copyButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+            copyButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+            [self.view addSubview:copyButton];
+            [self.endpointCopyButtons addObject:copyButton];
             
-            // Only show first URL's endpoints
-            break;
+            yOffset += 22;
         }
         
-        [self updateStreamInfoLabel];
-        self.streamInfoLabel.hidden = NO;
+        // Only show first URL's endpoints
+        break;
+    }
+    
+    [self updateStreamInfoLabel];
+    self.streamInfoLabel.hidden = NO;
+    
+    // Log the URLs but don't show alert - it might be blocking
+    RLog(RptrLogAreaProtocol, @"Stream started - URLs:");
+    for (NSString *url in urls) {
+        RLog(RptrLogAreaProtocol, @"  %@", url);
+    }
         
-        // Log the URLs but don't show alert - it might be blocking
-        RLog(RptrLogAreaHLS, @"Stream started - URLs:");
-        for (NSString *url in urls) {
-            RLog(RptrLogAreaHLS, @"  %@", url);
-        }
-    });
+    // Diagnostic: Log total UI update time
+    CFAbsoluteTime totalTime = CFAbsoluteTimeGetCurrent() - startTime;
+    if (totalTime > 0.1) {
+        RLog(RptrLogAreaError, @"WARNING: hlsServerDidStart UI update took %.3fs (potential ANR)", totalTime);
+    }
+    RLog(RptrLogAreaProtocol, @"hlsServerDidStart END");
 }
 
 - (NSDictionary *)hlsServerRequestsLocation:(id)server {
@@ -1446,7 +1632,7 @@
             @"accuracy": @(self.currentLocation.horizontalAccuracy)
         };
     } else {
-        return nil;
+        return @{}; // Return empty dictionary instead of nil
     }
 }
 
@@ -1468,20 +1654,23 @@
 
 - (void)hlsServer:(id)server clientConnected:(NSString *)clientAddress {
     dispatch_async(dispatch_get_main_queue(), ^{
-        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Client connected: %@", clientAddress);
+        RLog(RptrLogAreaProtocol, @"Client connected: %@", clientAddress);
         [self updateStreamInfoLabel];
+        
     });
 }
 
 - (void)hlsServer:(id)server clientDisconnected:(NSString *)clientAddress {
     dispatch_async(dispatch_get_main_queue(), ^{
-        RLog(RptrLogAreaHLS | RptrLogAreaNetwork, @"Client disconnected: %@", clientAddress);
+        RLog(RptrLogAreaProtocol, @"Client disconnected: %@", clientAddress);
         [self updateStreamInfoLabel];
+        
     });
 }
 
 - (void)hlsServer:(id)server didEncounterError:(NSError *)error {
     dispatch_async(dispatch_get_main_queue(), ^{
+        
         [self stopStreaming];
         
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"HLS Streaming Error"
@@ -1551,11 +1740,11 @@
         if (camera) {
             NSError *error = nil;
             if ([camera lockForConfiguration:&error]) {
-                CMTime frameDuration = CMTimeMake(1, settings.videoFrameRate);
+                CMTime frameDuration = CMTimeMake(1, (int32_t)settings.videoFrameRate);
                 camera.activeVideoMinFrameDuration = frameDuration;
                 camera.activeVideoMaxFrameDuration = frameDuration;
                 [camera unlockForConfiguration];
-                RLogVideo(@"Updated frame rate to %d fps for %@", settings.videoFrameRate, camera.localizedName);
+                RLogVideo(@"Updated frame rate to %ld fps for %@", (long)settings.videoFrameRate, camera.localizedName);
             } else {
                 RLogError(@"Could not update frame rate for %@: %@", camera.localizedName, error.localizedDescription);
             }
@@ -1575,14 +1764,104 @@
     }
     
     NSString *qualityMode = (self.currentQualityMode == RptrVideoQualityModeReliable) ? @"Reliable" : @"Real-time";
-    NSUInteger clientCount = self.hlsServer.connectedClients;
     
-    if (clientCount > 0) {
-        self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS %@: %lu clients", 
-                                     qualityMode, (unsigned long)clientCount];
+    if (self.useDIYServer) {
+        // DIY server info
+        self.streamInfoLabel.text = [NSString stringWithFormat:@"DIY HLS %@: Port 8080", qualityMode];
     } else {
-        self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS %@: Port %lu", 
-                                     qualityMode, (unsigned long)self.hlsServer.port];
+        // Original server info
+        NSUInteger clientCount = self.hlsServer.connectedClients;
+        
+        if (clientCount > 0) {
+            self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS %@: %lu clients", 
+                                         qualityMode, (unsigned long)clientCount];
+        } else {
+            self.streamInfoLabel.text = [NSString stringWithFormat:@"HLS %@: Port %lu", 
+                                         qualityMode, (unsigned long)self.hlsServer.port];
+        }
+    }
+}
+
+- (void)displayDIYStreamingURLs {
+    // Get network interfaces
+    NSMutableArray *urls = [NSMutableArray array];
+    
+    // Get primary IP address
+    NSString *ipAddress = [self getIPAddress];
+    if (ipAddress && ![ipAddress isEqualToString:@"error"]) {
+        // Show the secure view URL with random path, like the original server
+        NSString *url = [NSString stringWithFormat:@"http://%@:8080/view/%@", ipAddress, self.diyHLSServer.randomPath];
+        [urls addObject:url];
+        RLogDIY(@"Streaming URL: %@", url);
+    } else {
+        // Fallback to localhost
+        NSString *url = [NSString stringWithFormat:@"http://localhost:8080/view/%@", self.diyHLSServer.randomPath];
+        [urls addObject:url];
+        RLogDIY(@"Using localhost URL (no network IP found): %@", url);
+    }
+    
+    // Clear existing endpoint labels
+    for (UILabel *label in self.endpointLabels) {
+        [label removeFromSuperview];
+    }
+    [self.endpointLabels removeAllObjects];
+    
+    for (UIButton *button in self.endpointCopyButtons) {
+        [button removeFromSuperview];
+    }
+    [self.endpointCopyButtons removeAllObjects];
+    
+    // Display URLs in UI
+    CGFloat yOffset = 60;
+    CGFloat labelHeight = 25;
+    
+    for (NSString *url in urls) {
+        // Create endpoint label
+        UILabel *endpointLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, yOffset, self.view.bounds.size.width - 80, labelHeight)];
+        endpointLabel.text = url;
+        endpointLabel.textColor = [UIColor colorWithRed:0.0 green:1.0 blue:0.0 alpha:1.0];
+        endpointLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
+        endpointLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
+        endpointLabel.textAlignment = NSTextAlignmentLeft;
+        endpointLabel.layer.cornerRadius = 5;
+        endpointLabel.clipsToBounds = YES;
+        endpointLabel.userInteractionEnabled = YES;
+        endpointLabel.adjustsFontSizeToFitWidth = YES;
+        endpointLabel.minimumScaleFactor = 0.5;
+        
+        // Add padding
+        endpointLabel.text = [NSString stringWithFormat:@" %@", url];
+        
+        [self.view addSubview:endpointLabel];
+        [self.endpointLabels addObject:endpointLabel];
+        
+        // Create copy button
+        UIButton *copyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        copyButton.frame = CGRectMake(self.view.bounds.size.width - 55, yOffset, 50, labelHeight);
+        [copyButton setTitle:@"Copy" forState:UIControlStateNormal];
+        copyButton.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+        [copyButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        copyButton.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.8];
+        copyButton.layer.cornerRadius = 5;
+        copyButton.tag = self.endpointLabels.count - 1;
+        [copyButton addTarget:self action:@selector(copyEndpoint:) forControlEvents:UIControlEventTouchUpInside];
+        
+        [self.view addSubview:copyButton];
+        [self.endpointCopyButtons addObject:copyButton];
+        
+        yOffset += labelHeight + 5;
+        
+        // Only show first URL's endpoints
+        break;
+    }
+    
+    [self updateStreamInfoLabel];
+    self.streamInfoLabel.hidden = NO;
+    
+    // Log the URLs
+    RLogDIY(@"DIY HLS Stream URLs:");
+    for (NSString *url in urls) {
+        RLogDIY(@"  %@", url);
     }
 }
 
@@ -1595,9 +1874,12 @@
     return UIInterfaceOrientationLandscapeRight;
 }
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-implementations"
 - (BOOL)shouldAutorotate {
     return NO; // Prevent any rotation
 }
+#pragma clang diagnostic pop
 
 // Override motion handling to prevent any orientation changes
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
@@ -1620,8 +1902,9 @@
 
 // Override to prevent any automatic view adjustments based on orientation
 - (void)viewSafeAreaInsetsDidChange {
-    // Do NOT call super - prevent safe area adjustments
-    RLogUI(@"Blocking safe area insets change");
+    [super viewSafeAreaInsetsDidChange];
+    // Log but don't make adjustments based on safe area
+    RLogUI(@"Safe area insets changed but ignoring for full-screen experience");
 }
 
 - (BOOL)prefersHomeIndicatorAutoHidden {
@@ -1669,7 +1952,7 @@
     // Get the video orientation
     CGAffineTransform transform = videoTrack.preferredTransform;
     CGSize naturalSize = videoTrack.naturalSize;
-    CGSize renderSize = naturalSize;
+    CGSize renderSize;
     
     // Determine if video is rotated
     if (transform.a == 0 && transform.b == 1.0 && transform.c == -1.0 && transform.d == 0) {
@@ -1761,7 +2044,7 @@
         if (exportSession.status == AVAssetExportSessionStatusCompleted) {
             completion(outputURL);
         } else {
-            RLog(RptrLogAreaVideo | RptrLogAreaError, @"Export failed: %@", exportSession.error);
+            RLog(RptrLogAreaError, @"Export failed: %@", exportSession.error);
             completion(nil);
         }
     }];
@@ -1769,7 +2052,17 @@
 
 #pragma mark - Helper Methods
 
+- (void)sessionDidStartRunning:(NSNotification *)notification {
+    RLogVideo(@"AVCaptureSession started running - setting initial rotation");
+    // Set initial rotation when session actually starts
+    [self updateCameraRotationForOrientation:self->_lastDeviceOrientation];
+}
+
 - (void)updateCameraRotationForOrientation:(UIDeviceOrientation)orientation {
+    // Diagnostic: Track rotation update timing
+    CFAbsoluteTime startTime = CFAbsoluteTimeGetCurrent();
+    RLogVideo(@"updateCameraRotationForOrientation BEGIN for orientation %ld", (long)orientation);
+    
     // Calculate the rotation angle needed to compensate for device orientation
     CGFloat rotationAngle = 0.0;
     
@@ -1806,6 +2099,8 @@
                 }
             } else {
                 // For iOS 16 and below, map angle to orientation
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Wdeprecated-declarations"
                 AVCaptureVideoOrientation videoOrientation = AVCaptureVideoOrientationLandscapeRight;
                 switch ((int)rotationAngle) {
                     case 0:
@@ -1825,14 +2120,15 @@
                     previewConnection.videoOrientation = videoOrientation;
                     RLogVideo(@"Updated preview orientation to %ld", (long)videoOrientation);
                 }
+                #pragma clang diagnostic pop
             }
         }
     }
     
     // Update video data output connection
-    for (NSString *cameraID in self.videoDataOutputs) {
-        AVCaptureVideoDataOutput *output = self.videoDataOutputs[cameraID];
-        AVCaptureConnection *connection = [output connectionWithMediaType:AVMediaTypeVideo];
+    // Only update the active output, not all outputs
+    if (self.videoDataOutput) {
+        AVCaptureConnection *connection = [self.videoDataOutput connectionWithMediaType:AVMediaTypeVideo];
         if (connection) {
             if (@available(iOS 17.0, *)) {
                 if ([connection isVideoRotationAngleSupported:rotationAngle]) {
@@ -1841,6 +2137,8 @@
                 }
             } else {
                 // Same mapping for iOS 16 and below
+                #pragma clang diagnostic push
+                #pragma clang diagnostic ignored "-Wdeprecated-declarations"
                 AVCaptureVideoOrientation videoOrientation = AVCaptureVideoOrientationLandscapeRight;
                 switch ((int)rotationAngle) {
                     case 0:
@@ -1860,9 +2158,17 @@
                     connection.videoOrientation = videoOrientation;
                     RLogVideo(@"Updated video output orientation to %ld", (long)videoOrientation);
                 }
+                #pragma clang diagnostic pop
             }
         }
     }
+    
+    // Diagnostic: Log total rotation update time
+    CFAbsoluteTime totalTime = CFAbsoluteTimeGetCurrent() - startTime;
+    if (totalTime > 0.1) {
+        RLogVideo(@"WARNING: updateCameraRotationForOrientation took %.3fs (potential ANR)", totalTime);
+    }
+    RLogVideo(@"updateCameraRotationForOrientation END");
 }
 
 - (NSString *)getIPAddress {
@@ -1966,20 +2272,18 @@
     CLAuthorizationStatus locationStatus = self.locationManager.authorizationStatus;
     if (locationStatus == kCLAuthorizationStatusAuthorizedWhenInUse ||
         locationStatus == kCLAuthorizationStatusAuthorizedAlways) {
-        RLog(RptrLogAreaUI | RptrLogAreaLocation | RptrLogAreaDebug, @"Requesting location update");
+        RLog(RptrLogAreaInfo, @"Requesting location update");
         
         // Use requestLocation for a single update instead of continuous updates
         if ([self.locationManager respondsToSelector:@selector(requestLocation)]) {
             [self.locationManager requestLocation];
         } else {
-            // Fallback for older iOS versions - start and stop updates
+            // Fallback for older iOS versions - start updates
+            // Will stop after first location update in didUpdateLocations delegate
             [self.locationManager startUpdatingLocation];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [self.locationManager stopUpdatingLocation];
-            });
         }
     } else {
-        RLog(RptrLogAreaUI | RptrLogAreaLocation | RptrLogAreaDebug, @"Location permission not granted, skipping update");
+        RLog(RptrLogAreaInfo, @"Location permission not granted, skipping update");
     }
 }
 
@@ -1991,6 +2295,19 @@
         self.currentLocation = location;
         NSString *latLon = [NSString stringWithFormat:@"%.4f, %.4f", location.coordinate.latitude, location.coordinate.longitude];
         self.locationLabel.text = latLon;
+        
+        // Stop updates if we're using the fallback method (older iOS versions)
+        if (![self.locationManager respondsToSelector:@selector(requestLocation)]) {
+            [self.locationManager stopUpdatingLocation];
+        }
+        
+        // Broadcast location update via WebSocket
+        // NSDictionary *locationData = @{
+        //     @"latitude": @(location.coordinate.latitude),
+        //     @"longitude": @(location.coordinate.longitude),
+        //     @"accuracy": @(location.horizontalAccuracy),
+        //     @"timestamp": @(location.timestamp.timeIntervalSince1970)
+        // };
     }
 }
 
@@ -2014,7 +2331,7 @@
 }
 
 - (void)locationManager:(CLLocationManager *)manager didFailWithError:(NSError *)error {
-    RLog(RptrLogAreaUI | RptrLogAreaLocation | RptrLogAreaError, @"Location manager failed with error: %@", error.localizedDescription);
+    RLog(RptrLogAreaError, @"Location manager failed with error: %@", error.localizedDescription);
 }
 
 - (void)storeCameraPermissionStatus {
@@ -2050,20 +2367,20 @@
         }
     }
     
-    RLog(RptrLogAreaCamera | RptrLogAreaSession | RptrLogAreaError, @"Session interrupted for camera %@, reason: %ld", sessionID, (long)reason);
+    RLog(RptrLogAreaError, @"Session interrupted for camera %@, reason: %ld", sessionID, (long)reason);
     
     switch (reason) {
         case AVCaptureSessionInterruptionReasonVideoDeviceNotAvailableInBackground:
-            RLog(RptrLogAreaCamera | RptrLogAreaError, @"Video device not available in background");
+            RLog(RptrLogAreaError, @"Video device not available in background");
             break;
         case AVCaptureSessionInterruptionReasonAudioDeviceInUseByAnotherClient:
-            RLog(RptrLogAreaAudio | RptrLogAreaError, @"Audio device in use by another client");
+            RLog(RptrLogAreaError, @"Audio device in use by another client");
             break;
         case AVCaptureSessionInterruptionReasonVideoDeviceInUseByAnotherClient:
-            RLog(RptrLogAreaVideo | RptrLogAreaError, @"Video device in use by another client");
+            RLog(RptrLogAreaError, @"Video device in use by another client");
             break;
         case AVCaptureSessionInterruptionReasonVideoDeviceNotAvailableWithMultipleForegroundApps:
-            RLog(RptrLogAreaVideo | RptrLogAreaError, @"Video device not available with multiple foreground apps");
+            RLog(RptrLogAreaError, @"Video device not available with multiple foreground apps");
             break;
         default:
             break;
@@ -2072,7 +2389,7 @@
 
 - (void)sessionInterruptionEnded:(NSNotification *)notification {
     AVCaptureSession *session = notification.object;
-    RLog(RptrLogAreaCamera | RptrLogAreaSession, @"Session interruption ended for: %@", session);
+    RLog(RptrLogAreaStartup, @"Session interruption ended for: %@", session);
 }
 
 - (void)sessionRuntimeError:(NSNotification *)notification {
@@ -2100,32 +2417,32 @@
         }
     }
     
-    RLog(RptrLogAreaCamera | RptrLogAreaSession | RptrLogAreaError, @"Session runtime error for camera %@ (%@): %@", sessionID, cameraName, error.localizedDescription);
-    RLog(RptrLogAreaError | RptrLogAreaDebug, @"Error domain: %@, code: %ld", error.domain, (long)error.code);
-    RLog(RptrLogAreaError | RptrLogAreaDebug, @"Error userInfo: %@", error.userInfo);
+    RLog(RptrLogAreaError, @"Session runtime error for camera %@ (%@): %@", sessionID, cameraName, error.localizedDescription);
+    RLog(RptrLogAreaError, @"Error domain: %@, code: %ld", error.domain, (long)error.code);
+    RLog(RptrLogAreaError, @"Error userInfo: %@", error.userInfo);
     
     // Check if it's a multi-cam session
     if (@available(iOS 13.0, *)) {
         if ([session isKindOfClass:[AVCaptureMultiCamSession class]]) {
-            RLog(RptrLogAreaCamera | RptrLogAreaError, @"Error occurred in multi-cam session");
+            RLog(RptrLogAreaError, @"Error occurred in multi-cam session");
             
             // If recording error, check movie outputs
             if ([error.localizedDescription containsString:@"Cannot Record"]) {
-                RLog(RptrLogAreaVideo | RptrLogAreaError, @"Recording error detected. Checking movie outputs...");
+                RLog(RptrLogAreaError, @"Recording error detected. Checking movie outputs...");
                 
                 for (NSString *camID in self.movieFileOutputs) {
                     AVCaptureMovieFileOutput *output = self.movieFileOutputs[camID];
                     if (!output) {
-                        RLog(RptrLogAreaVideo | RptrLogAreaError | RptrLogAreaDebug, @"Movie output for %@: Not found", camID);
+                        RLog(RptrLogAreaError, @"Movie output for %@: Not found", camID);
                         continue;
                     }
-                    RLog(RptrLogAreaVideo | RptrLogAreaDebug, @"Movie output for %@:", camID);
-                    RLog(RptrLogAreaVideo | RptrLogAreaDebug, @"  - isRecording: %@", output.isRecording ? @"YES" : @"NO");
-                    RLog(RptrLogAreaVideo | RptrLogAreaDebug, @"  - connection count: %lu", (unsigned long)output.connections.count);
+                    RLog(RptrLogAreaInfo, @"Movie output for %@:", camID);
+                    RLog(RptrLogAreaInfo, @"  - isRecording: %@", output.isRecording ? @"YES" : @"NO");
+                    RLog(RptrLogAreaInfo, @"  - connection count: %lu", (unsigned long)output.connections.count);
                     
                     // Check each connection
                     for (AVCaptureConnection *connection in output.connections) {
-                        RLog(RptrLogAreaVideo | RptrLogAreaDebug, @"  - Connection active: %@, enabled: %@", 
+                        RLog(RptrLogAreaInfo, @"  - Connection active: %@, enabled: %@", 
                               connection.active ? @"YES" : @"NO",
                               connection.enabled ? @"YES" : @"NO");
                     }
@@ -2143,7 +2460,7 @@
         if (sampleBuffer) {
             CFRetain(sampleBuffer);
         } else {
-            RLog(RptrLogAreaHLS | RptrLogAreaError, @"ERROR: Received NULL sample buffer");
+            RLog(RptrLogAreaError, @"ERROR: Received NULL sample buffer");
             return;
         }
     
@@ -2173,7 +2490,7 @@
     static int totalCalls = 0;
     totalCalls++;
     if (totalCalls <= 5) {
-        RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"captureOutput called! Call #%d, Output class: %@", 
+        RLog(RptrLogAreaProtocol, @"captureOutput called! Call #%d, Output class: %@", 
               totalCalls, NSStringFromClass([output class]));
     }
     
@@ -2181,8 +2498,8 @@
     static BOOL firstFrameLogged = NO;
     if (!firstFrameLogged && output == self.videoDataOutput) {
         firstFrameLogged = YES;
-        RLog(RptrLogAreaHLS | RptrLogAreaVideo, @"FIRST FRAME RECEIVED - Video data output delegate is working!");
-        RLog(RptrLogAreaHLS | RptrLogAreaVideo | RptrLogAreaDebug, @"Output: %@, Connection active: %@, Streaming: %@",
+        RLog(RptrLogAreaProtocol, @"FIRST FRAME RECEIVED - Video data output delegate is working!");
+        RLog(RptrLogAreaProtocol, @"Output: %@, Connection active: %@, Streaming: %@",
               output, connection.isActive ? @"YES" : @"NO", self.isStreaming ? @"YES" : @"NO");
     }
     
@@ -2201,29 +2518,43 @@
         static int frameCount = 0;
         frameCount++;
         if (frameCount % 30 == 0) { // Log every 30 frames
-            RLog(RptrLogAreaHLS | RptrLogAreaVideo, @"ViewController sending frame %d to HLS server", frameCount);
-            RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"HLS server instance: %@", self.hlsServer);
-            RLog(RptrLogAreaHLS | RptrLogAreaDebug, @"Sample buffer valid: %@", sampleBuffer ? @"YES" : @"NO");
+            RLog(RptrLogAreaProtocol, @"ViewController sending frame %d to HLS server", frameCount);
+            RLog(RptrLogAreaProtocol, @"HLS server instance: %@", self.hlsServer);
+            RLog(RptrLogAreaProtocol, @"Sample buffer valid: %@", sampleBuffer ? @"YES" : @"NO");
         }
         
         // Ensure sample buffer is valid before processing
-        HLSAssetWriterServer *hlsServer = self.hlsServer; // Local strong reference
-        if (hlsServer && sampleBuffer && CMSampleBufferIsValid(sampleBuffer)) {
-            @try {
-                // Stream video directly without overlays
-                // Orientation is now forced to landscape at the connection level
-                [hlsServer processVideoSampleBuffer:sampleBuffer];
-            } @catch (NSException *exception) {
-                RLog(RptrLogAreaHLS | RptrLogAreaVideo | RptrLogAreaError, @"Exception processing video frame: %@", exception);
-                RLog(RptrLogAreaHLS | RptrLogAreaError | RptrLogAreaDebug, @"Reason: %@", exception.reason);
-                // Don't stop streaming on single frame error
+        if (self.useDIYServer) {
+            // DIY HLS Server
+            RptrDIYHLSServer *diyServer = self.diyHLSServer; // Local strong reference
+            if (diyServer && sampleBuffer && CMSampleBufferIsValid(sampleBuffer)) {
+                @try {
+                    [diyServer processVideoSampleBuffer:sampleBuffer];
+                } @catch (NSException *exception) {
+                    RLog(RptrLogAreaError, @"Exception processing video frame in DIY server: %@", exception);
+                    RLog(RptrLogAreaError, @"Reason: %@", exception.reason);
+                }
             }
         } else {
-            if (!CMSampleBufferIsValid(sampleBuffer)) {
-                RLog(RptrLogAreaHLS | RptrLogAreaVideo | RptrLogAreaError, @"WARNING: Invalid sample buffer received");
+            // Original HLS Server
+            HLSAssetWriterServer *hlsServer = self.hlsServer; // Local strong reference
+            if (hlsServer && sampleBuffer && CMSampleBufferIsValid(sampleBuffer)) {
+                @try {
+                    // Stream video directly without overlays
+                    // Orientation is now forced to landscape at the connection level
+                    [hlsServer processVideoSampleBuffer:sampleBuffer];
+                } @catch (NSException *exception) {
+                    RLog(RptrLogAreaError, @"Exception processing video frame: %@", exception);
+                    RLog(RptrLogAreaError, @"Reason: %@", exception.reason);
+                    // Don't stop streaming on single frame error
+                }
             } else {
-                RLog(RptrLogAreaHLS | RptrLogAreaVideo | RptrLogAreaError, @"WARNING: Cannot send frame - hlsServer=%@, sampleBuffer=%@", 
-                      self.hlsServer, sampleBuffer ? @"Valid" : @"NULL");
+                if (!CMSampleBufferIsValid(sampleBuffer)) {
+                    RLog(RptrLogAreaError, @"WARNING: Invalid sample buffer received");
+                } else {
+                    RLog(RptrLogAreaError, @"WARNING: Cannot send frame - hlsServer=%@, sampleBuffer=%@", 
+                          self.hlsServer, sampleBuffer ? @"Valid" : @"NULL");
+                }
             }
         }
     }
@@ -2238,7 +2569,7 @@
                 // Calculate audio level for meter
                 [self calculateAudioLevelFromSampleBuffer:sampleBuffer];
             } @catch (NSException *exception) {
-                RLog(RptrLogAreaHLS | RptrLogAreaAudio | RptrLogAreaError, @"Exception processing audio frame: %@", exception);
+                RLog(RptrLogAreaError, @"Exception processing audio frame: %@", exception);
                 // Don't stop streaming on single frame error
             }
         }
@@ -2300,8 +2631,11 @@
     
     CIImage *ciImage = [CIImage imageWithCVImageBuffer:imageBuffer];
     
-    // Calculate average brightness
-    CGFloat brightness = [self calculateBrightnessForImage:ciImage];
+    // Calculate average brightness with autorelease pool to prevent memory buildup
+    CGFloat brightness = 0;
+    @autoreleasepool {
+        brightness = [self calculateBrightnessForImage:ciImage];
+    }
     
     // Unlock the pixel buffer
     CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
@@ -2333,7 +2667,7 @@
     
     // Store score for this camera
     self.cameraActivityScores[cameraID] = @(activityScore);
-    RLog(RptrLogAreaCamera | RptrLogAreaDebug, @"Camera %@ activity score: %.3f (motion: %.1f, light: %.1f, brightness: %.3f)", 
+    RLog(RptrLogAreaInfo, @"Camera %@ activity score: %.3f (motion: %.1f, light: %.1f, brightness: %.3f)", 
           camera.localizedName, activityScore, motionScore, lightScore, brightness);
     
     // Update current camera's brightness if it's the active one
@@ -2350,7 +2684,7 @@
     NSParameterAssert(image != nil);
     
     if (!image) {
-        RLog(RptrLogAreaVideo | RptrLogAreaError, @"Cannot calculate brightness for nil image");
+        RLog(RptrLogAreaError, @"Cannot calculate brightness for nil image");
         return 0.0;
     }
     
@@ -2364,38 +2698,95 @@
     [filter setValue:extent forKey:kCIInputExtentKey];
     
     CIImage *outputImage = filter.outputImage;
-    
-    // Create CIContext if needed
-    if (!self.ciContext) {
-        self.ciContext = [CIContext context];
-        NSAssert(self.ciContext != nil, @"Failed to create CIContext");
-    }
-    
-    // Render to a 1x1 pixel to get average color
-    CGRect outputExtent = CGRectMake(0, 0, 1, 1);
-    CGImageRef cgImage = [self.ciContext createCGImage:outputImage fromRect:outputExtent];
-    
-    if (!cgImage) {
-        RLog(RptrLogAreaVideo | RptrLogAreaError, @"Failed to create CGImage from CIImage");
+    if (!outputImage) {
+        RLogError(@"CIAreaAverage filter failed to produce output");
         return 0;
     }
     
-    // Get pixel data
-    unsigned char pixel[4] = {0};
+    // Create CIContext if needed - use thread-safe approach
+    @synchronized(self) {
+        if (!self.ciContext) {
+            // Create context with software renderer for better stability
+            NSDictionary *options = @{
+                kCIContextUseSoftwareRenderer: @(YES),
+                kCIContextPriorityRequestLow: @(YES)
+            };
+            self.ciContext = [CIContext contextWithOptions:options];
+            if (!self.ciContext) {
+                RLogError(@"Failed to create CIContext for brightness calculation");
+                return 0;
+            }
+        }
+    }
+    
+    // Get the actual extent of the output image
+    CGRect imageExtent = [outputImage extent];
+    if (CGRectIsEmpty(imageExtent) || CGRectIsInfinite(imageExtent)) {
+        RLogError(@"Invalid image extent for brightness calculation");
+        return 0;
+    }
+    
+    // For CIAreaAverage, the output is typically 1x1 pixel, so use that directly
+    CGRect sampleRect = imageExtent;
+    
+    // Protect CIContext operations with @synchronized
+    CGImageRef cgImage = nil;
+    @synchronized(self.ciContext) {
+        cgImage = [self.ciContext createCGImage:outputImage fromRect:sampleRect];
+    }
+    
+    if (!cgImage) {
+        RLog(RptrLogAreaError, @"Failed to create CGImage from CIImage");
+        return 0;
+    }
+    
+    // Create a small bitmap context to sample the average color
+    size_t width = CGImageGetWidth(cgImage);
+    size_t height = CGImageGetHeight(cgImage);
+    size_t bytesPerRow = width * 4;
+    
+    unsigned char *pixelData = calloc(width * height * 4, sizeof(unsigned char));
+    if (!pixelData) {
+        CGImageRelease(cgImage);
+        RLogError(@"Failed to allocate pixel buffer for brightness calculation");
+        return 0;
+    }
+    
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGContextRef context = CGBitmapContextCreate(pixel,
-                                                 1, 1,
-                                                 8, 4,
+    CGContextRef context = CGBitmapContextCreate(pixelData,
+                                                 width, height,
+                                                 8, bytesPerRow,
                                                  colorSpace,
                                                  kCGImageAlphaPremultipliedLast);
     CGColorSpaceRelease(colorSpace);
     
-    CGContextDrawImage(context, CGRectMake(0, 0, 1, 1), cgImage);
+    if (!context) {
+        free(pixelData);
+        CGImageRelease(cgImage);
+        RLogError(@"Failed to create bitmap context for brightness calculation");
+        return 0;
+    }
+    
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), cgImage);
     CGContextRelease(context);
     CGImageRelease(cgImage);
     
-    // Calculate brightness from RGB values
-    CGFloat brightness = (pixel[0] * 0.299 + pixel[1] * 0.587 + pixel[2] * 0.114) / 255.0;
+    // Calculate average brightness from all pixels using luminance formula
+    double totalBrightness = 0;
+    size_t pixelCount = width * height;
+    
+    for (size_t i = 0; i < pixelCount; i++) {
+        size_t offset = i * 4;
+        // Use luminance formula: 0.299*R + 0.587*G + 0.114*B
+        double pixelBrightness = (pixelData[offset] * 0.299 + 
+                                 pixelData[offset + 1] * 0.587 + 
+                                 pixelData[offset + 2] * 0.114) / 255.0;
+        totalBrightness += pixelBrightness;
+    }
+    
+    free(pixelData);
+    
+    CGFloat brightness = totalBrightness / (double)pixelCount;
     return brightness;
 }
 
@@ -2442,13 +2833,13 @@
     
     // Motion detected if variance is above threshold
     BOOL motion = variance > 0.00005; // Lower threshold for better sensitivity
-    RLog(RptrLogAreaVideo | RptrLogAreaDebug, @"Motion variance: %.6f, detected: %@", variance, motion ? @"YES" : @"NO");
+    RLog(RptrLogAreaInfo, @"Motion variance: %.6f, detected: %@", variance, motion ? @"YES" : @"NO");
     return motion;
 }
 
 - (void)evaluateAndSwitchToBestCamera {
     
-    RLog(RptrLogAreaCamera | RptrLogAreaDebug, @"\n=== Camera Evaluation ===");
+    RLog(RptrLogAreaInfo, @"\n=== Camera Evaluation ===");
     
     // Apply decay to all camera scores to ensure fairness
     [self decayAllCameraScores];
@@ -2468,7 +2859,7 @@
     for (AVCaptureDevice *camera in cameras) {
         if (!self.cameraActivityScores[camera.uniqueID]) {
             allCamerasEvaluated = NO;
-            RLog(RptrLogAreaCamera | RptrLogAreaDebug, @"Camera %@ not yet evaluated", camera.localizedName);
+            RLog(RptrLogAreaInfo, @"Camera %@ not yet evaluated", camera.localizedName);
         }
     }
     
@@ -2485,9 +2876,9 @@
     
     for (AVCaptureDevice *camera in cameras) {
         NSNumber *scoreNumber = self.cameraActivityScores[camera.uniqueID];
-        CGFloat score = scoreNumber ? [scoreNumber floatValue] : 0.0;
+        CGFloat score = (scoreNumber != nil) ? [scoreNumber floatValue] : 0.0;
         
-        RLog(RptrLogAreaCamera | RptrLogAreaDebug, @"Camera %@ score: %.3f %@", 
+        RLog(RptrLogAreaInfo, @"Camera %@ score: %.3f %@", 
               camera.localizedName, score,
               [camera.uniqueID isEqualToString:self.currentCameraDevice.uniqueID] ? @"(current)" : @"");
         
@@ -2512,7 +2903,7 @@
     // AND at least 3 seconds have passed since switching to current camera
     if (bestCamera && ![bestCamera.uniqueID isEqualToString:self.currentCameraDevice.uniqueID] && 
         bestScore > threshold && timeSinceSwitch > 3.0) {
-        RLog(RptrLogAreaCamera, @"Switching to %@ (score: %.3f) from %@ (score: %.3f) - %.0f%% better", 
+        RLog(RptrLogAreaInfo, @"Switching to %@ (score: %.3f) from %@ (score: %.3f) - %.0f%% better", 
               bestCamera.localizedName, bestScore,
               self.currentCameraDevice.localizedName, currentScore,
               ((bestScore - currentScore) / currentScore) * 100);
@@ -2520,17 +2911,17 @@
         // Camera switching disabled
         // [self switchToCamera:bestCamera];
     } else {
-        RLog(RptrLogAreaCamera | RptrLogAreaDebug, @"Keeping current camera %@ (score: %.3f, best: %.3f)", 
+        RLog(RptrLogAreaInfo, @"Keeping current camera %@ (score: %.3f, best: %.3f)", 
               self.currentCameraDevice.localizedName, currentScore, bestScore);
         
         // If current camera has very low score, force evaluation of other camera
         if (currentScore < 0.1) {
-            RLog(RptrLogAreaCamera, @"Current camera has very low activity, forcing alternate camera");
+            RLog(RptrLogAreaInfo, @"Current camera has very low activity, forcing alternate camera");
             [self tryAlternateCameraWithEvaluation];
         }
     }
     
-    RLog(RptrLogAreaCamera | RptrLogAreaDebug, @"=== End Evaluation ===\n");
+    RLog(RptrLogAreaInfo, @"=== End Evaluation ===\n");
 }
 
 - (void)tryAlternateCameraWithEvaluation {
@@ -2544,7 +2935,7 @@
     // Find alternate camera
     for (AVCaptureDevice *camera in cameras) {
         if (![camera.uniqueID isEqualToString:self.currentCameraDevice.uniqueID]) {
-            RLog(RptrLogAreaCamera, @"Switching to alternate camera: %@ for evaluation", camera.localizedName);
+            RLog(RptrLogAreaInfo, @"Switching to alternate camera: %@ for evaluation", camera.localizedName);
             // Camera switching disabled
             // [self switchToCamera:camera];
             
@@ -2567,7 +2958,7 @@
             // Inactive cameras: decay by 20% each evaluation
             CGFloat decayedScore = score * 0.8;
             decayedScores[cameraID] = @(decayedScore);
-            RLog(RptrLogAreaCamera | RptrLogAreaDebug, @"Decaying inactive camera score: %.3f -> %.3f", score, decayedScore);
+            RLog(RptrLogAreaInfo, @"Decaying inactive camera score: %.3f -> %.3f", score, decayedScore);
         }
     }
     
@@ -2772,6 +3163,289 @@
             bar.alpha = 0.3;
             bar.backgroundColor = [UIColor greenColor];
         }
+    }
+}
+
+
+- (void)displayNextFeedback {
+    // Check if we should display feedback
+    if (!self.isStreaming) {
+        self.isDisplayingFeedback = NO;
+        return;
+    }
+    
+    // Thread-safe retrieval of next message
+    dispatch_async(self.feedbackQueueLock, ^{
+        if (self.feedbackQueue.count == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.isDisplayingFeedback = NO;
+            });
+            return;
+        }
+        
+        // Get next message from queue
+        NSString *message = [self.feedbackQueue firstObject];
+        [self.feedbackQueue removeObjectAtIndex:0];
+        NSUInteger remainingCount = self.feedbackQueue.count;
+        
+        RLogNetwork(@"Displaying feedback: %@ (queue size: %lu)", message, (unsigned long)remainingCount);
+        
+        // Update UI on main thread
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.isDisplayingFeedback = YES;
+            
+            // Update feedback label text
+            self.feedbackLabel.text = message;
+            
+            // Animate the feedback label appearance
+            if (self.feedbackLabel.hidden) {
+                self.feedbackLabel.alpha = 0;
+                self.feedbackLabel.hidden = NO;
+                
+                [UIView animateWithDuration:0.3 animations:^{
+                    self.feedbackLabel.alpha = 1.0;
+                }];
+            } else {
+                // Already visible, just update text with subtle animation
+                [UIView transitionWithView:self.feedbackLabel
+                                  duration:0.2
+                                   options:UIViewAnimationOptionTransitionCrossDissolve
+                                animations:^{
+                                    self.feedbackLabel.text = message;
+                                }
+                                completion:nil];
+            }
+            
+            // Cancel any existing dismiss timer
+            if (self.feedbackDismissTimer) {
+                [self.feedbackDismissTimer invalidate];
+                self.feedbackDismissTimer = nil;
+            }
+            
+            // Set timer to auto-dismiss after 10 seconds
+            self.feedbackDismissTimer = [NSTimer scheduledTimerWithTimeInterval:10.0
+                                                                          target:self
+                                                                        selector:@selector(dismissFeedback)
+                                                                        userInfo:nil
+                                                                         repeats:NO];
+        });
+    });
+}
+
+- (void)dismissFeedback {
+    // Thread-safe check for more messages
+    dispatch_async(self.feedbackQueueLock, ^{
+        BOOL hasMoreMessages = self.feedbackQueue.count > 0;
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (hasMoreMessages && self.isStreaming) {
+                // Display next message immediately
+                [self displayNextFeedback];
+            } else {
+                // No more messages, hide the label
+                [UIView animateWithDuration:0.3 animations:^{
+                    self.feedbackLabel.alpha = 0;
+                } completion:^(BOOL finished) {
+                    self.feedbackLabel.hidden = YES;
+                    self.feedbackLabel.text = @"";
+                    self.isDisplayingFeedback = NO;
+                }];
+                
+                // Clear the timer reference
+                self.feedbackDismissTimer = nil;
+            }
+        });
+    });
+}
+
+- (void)clearFeedbackDisplay {
+    // Cancel timer
+    if (self.feedbackDismissTimer) {
+        [self.feedbackDismissTimer invalidate];
+        self.feedbackDismissTimer = nil;
+    }
+    
+    // Thread-safe queue clear
+    dispatch_async(self.feedbackQueueLock, ^{
+        [self.feedbackQueue removeAllObjects];
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // Hide feedback label immediately
+            self.feedbackLabel.hidden = YES;
+            self.feedbackLabel.text = @"";
+            self.feedbackLabel.alpha = 0;
+            self.isDisplayingFeedback = NO;
+            
+            RLogNetwork(@"Cleared feedback display and queue");
+        });
+    });
+}
+
+#pragma mark - RptrDiagnosticsDelegate
+
+- (void)diagnostics:(RptrDiagnostics *)diagnostics didDetectMemoryPressure:(RptrMemoryPressureLevel)level stats:(RptrMemoryStats *)stats {
+    RLogWarning(@"Memory pressure detected: Level=%ld, Available=%.1fMB, Footprint=%.1fMB", 
+                (long)level,
+                stats.availableBytes / (1024.0 * 1024.0),
+                stats.footprintBytes / (1024.0 * 1024.0));
+    
+    // Take action based on pressure level
+    switch (level) {
+        case RptrMemoryPressureWarning:
+            // Reduce quality if in real-time mode
+            if (self.currentQualityMode == RptrVideoQualityModeRealtime && self.isStreaming) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    self.currentQualityMode = RptrVideoQualityModeReliable;
+                    RptrVideoQualitySettings *settings = [RptrVideoQualitySettings settingsForMode:RptrVideoQualityModeReliable];
+                    [self.hlsServer updateQualitySettings:settings];
+                    RLogInfo(@"Switched to reliable mode due to memory pressure");
+                });
+            }
+            break;
+            
+        case RptrMemoryPressureCritical:
+            // Clear old segments more aggressively
+            if (self.hlsServer) {
+                [self.hlsServer cleanupOldSegments];
+            }
+            break;
+            
+        case RptrMemoryPressureTerminal:
+            // Emergency: stop streaming to avoid termination
+            if (self.isStreaming) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self stopStreaming];
+                    
+                    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Low Memory"
+                                                                                   message:@"Streaming stopped due to critically low memory"
+                                                                            preferredStyle:UIAlertControllerStyleAlert];
+                    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                    [self presentViewController:alert animated:YES completion:nil];
+                });
+            }
+            break;
+            
+        default:
+            break;
+    }
+}
+
+- (void)diagnostics:(RptrDiagnostics *)diagnostics didDetectANR:(RptrANREvent *)event {
+    RLogError(@"ANR detected! Duration: %.2fs, Severity: %ld", event.duration, (long)event.severity);
+    
+    // Log the stack trace for debugging
+    if (event.stackTrace.length > 0) {
+        RLogDebug(@"ANR Stack trace:\n%@", event.stackTrace);
+    }
+    
+    // If severe ANR during streaming, consider stopping
+    if (event.severity >= RptrANRSeveritySevere && self.isStreaming) {
+        RLogError(@"Severe ANR during streaming - consider stopping stream");
+        
+        // Update UI to show warning
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.streamStatusLabel) {
+                self.streamStatusLabel.text = @"⚠️ Performance Issue";
+                self.streamStatusLabel.textColor = [UIColor orangeColor];
+            }
+        });
+    }
+}
+
+- (void)diagnostics:(RptrDiagnostics *)diagnostics didRecoverFromANR:(RptrANREvent *)event {
+    RLogInfo(@"Recovered from ANR (duration: %.2fs)", event.duration);
+    
+    // Clear warning if shown
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.streamStatusLabel && [self.streamStatusLabel.text isEqualToString:@"⚠️ Performance Issue"]) {
+            self.streamStatusLabel.text = @"";
+            self.streamStatusLabel.textColor = [UIColor whiteColor];
+        }
+    });
+}
+
+- (void)diagnostics:(RptrDiagnostics *)diagnostics didReceiveMetricPayload:(MXMetricPayload *)payload {
+    if (@available(iOS 13.0, *)) {
+        // Log interesting metrics
+        if (payload.memoryMetrics) {
+            RLogInfo(@"MetricKit - Peak memory: %.1fMB over last 24h",
+                     payload.memoryMetrics.peakMemoryUsage.doubleValue / (1024.0 * 1024.0));
+        }
+        
+        if (@available(iOS 14.0, *)) {
+            if (payload.applicationExitMetrics) {
+                NSInteger foregroundExits = payload.applicationExitMetrics.foregroundExitData.cumulativeNormalAppExitCount;
+                NSInteger backgroundExits = payload.applicationExitMetrics.backgroundExitData.cumulativeNormalAppExitCount;
+                
+                if (foregroundExits > 0 || backgroundExits > 0) {
+                    RLogWarning(@"App terminations in last 24h - Foreground: %ld, Background: %ld",
+                                (long)foregroundExits, (long)backgroundExits);
+                }
+            }
+        }
+    }
+}
+
+#pragma mark - RptrDIYHLSServerDelegate
+
+- (void)diyServer:(RptrDIYHLSServer *)server didStartOnPort:(NSInteger)port {
+    RLogDIY(@"[DELEGATE] Server started on port %ld", (long)port);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // self.hlsServerStatus = [NSString stringWithFormat:@"DIY Server on :%ld", (long)port];
+        RLogDIY(@"[UI] Server status would update here");
+    });
+}
+
+- (void)diyServer:(RptrDIYHLSServer *)server didGenerateInitSegment:(NSData *)initSegment {
+    RLogDIY(@"[DELEGATE] Init segment generated: %lu bytes", 
+         (unsigned long)initSegment.length);
+}
+
+- (void)diyServer:(RptrDIYHLSServer *)server 
+didGenerateMediaSegment:(NSData *)segment 
+               duration:(NSTimeInterval)duration
+         sequenceNumber:(uint32_t)sequenceNumber {
+    RLogDIY(@"[DELEGATE] Segment %u: %.3fs, %lu bytes",
+         sequenceNumber, duration, (unsigned long)segment.length);
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // self.segmentCount = sequenceNumber + 1;
+        RLogDIY(@"[UI] Segment count: %u", sequenceNumber + 1);
+    });
+}
+
+- (void)diyServer:(RptrDIYHLSServer *)server didEncounterError:(NSError *)error {
+    RLog(RptrLogAreaError, @"[DIY-DELEGATE] Error: %@", error);
+}
+
+- (void)diyServerDidStop:(RptrDIYHLSServer *)server {
+    RLogDIY(@"[DELEGATE] Server stopped");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // self.hlsServerStatus = @"DIY Server Stopped";
+        RLogDIY(@"[UI] Server stopped status would update here");
+    });
+}
+
+#pragma mark - Button Actions
+
+- (void)copyEndpoint:(UIButton *)sender {
+    NSInteger index = sender.tag;
+    if (index < self.endpointLabels.count) {
+        UILabel *label = self.endpointLabels[index];
+        NSString *endpoint = label.text;
+        
+        UIPasteboard *pasteboard = [UIPasteboard generalPasteboard];
+        pasteboard.string = endpoint;
+        
+        // Visual feedback
+        UIColor *originalColor = sender.backgroundColor;
+        sender.backgroundColor = [UIColor systemGreenColor];
+        
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            sender.backgroundColor = originalColor;
+        });
+        
+        RLogUI(@"Copied endpoint to clipboard: %@", endpoint);
     }
 }
 
