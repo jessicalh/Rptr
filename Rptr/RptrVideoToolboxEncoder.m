@@ -96,7 +96,7 @@ static void compressionOutputCallback(void * _Nullable outputCallbackRefCon,
         kCFAllocatorDefault,
         (int32_t)self.width,
         (int32_t)self.height,
-        kCMVideoCodecType_H264,
+        kCMVideoCodecType_H264,  // H.264/AVC codec type
         encoderSpec,
         NULL, // pixelBufferAttributes
         NULL, // compressedDataAllocator
@@ -159,11 +159,14 @@ static void compressionOutputCallback(void * _Nullable outputCallbackRefCon,
 }
 
 - (void)configureCompressionSession {
+    // Real-time encoding mode - optimizes for low latency over compression efficiency
     VTSessionSetProperty(self.compressionSession,
         kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     
-    // Profile level - Main Profile like Apple's sample streams
-    // Apple's bipbop sample uses Main Profile (0x64) with Level 3.2 for 960x540
+    // Profile level - H.264 Main Profile Level 3.2
+    // Main Profile (0x64) supports B-frames and CABAC entropy coding
+    // Level 3.2 supports up to 5 Mbps bitrate and 1280x720@60fps
+    // Matches Apple's bipbop test stream configuration for 960x540 video
     VTSessionSetProperty(self.compressionSession,
         kVTCompressionPropertyKey_ProfileLevel,
         kVTProfileLevel_H264_Main_3_2);

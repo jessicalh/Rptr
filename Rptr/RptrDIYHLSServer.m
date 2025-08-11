@@ -86,8 +86,8 @@
         _frameRate = frameRate;
         _bitrate = bitrate;
         
-        _segmentDuration = 1.0;
-        _playlistWindowSize = 10;
+        _segmentDuration = 1.0;  // 1 second segments - Apple recommends 1-10 seconds for low latency HLS
+        _playlistWindowSize = 10;  // Keep 10 segments in sliding window - HLS spec recommends 3x target duration minimum
         
         _segments = [NSMutableArray array];
         _currentSegmentFrames = [NSMutableArray array];
@@ -99,7 +99,7 @@
         _currentSequenceNumber = 0;
         _mediaSequenceNumber = 0;
         
-        // Generate random path for security (8 chars like original)
+        // Generate random path for security - 8 characters provides sufficient entropy to prevent URL guessing
         _randomPath = [self generateRandomString:8];
         
         [self setupEncoder];
@@ -138,7 +138,7 @@
                                                          frameRate:self.frameRate
                                                            bitrate:self.bitrate];
     self.encoder.delegate = self;
-    self.encoder.keyframeInterval = self.frameRate; // Keyframe every second
+    self.encoder.keyframeInterval = self.frameRate; // Keyframe interval matches segment duration (1 keyframe per second at current framerate)
     
     RLogDIY(@"[DIY-HLS] VideoToolbox encoder configured");
 }
@@ -152,7 +152,7 @@
     videoTrack.mediaType = @"video";
     videoTrack.width = self.width;
     videoTrack.height = self.height;
-    videoTrack.timescale = 90000; // 90kHz standard for video (matches PTS/DTS)
+    videoTrack.timescale = 90000; // 90 kHz timescale - MPEG-TS standard for video timestamps, ensures compatibility with HLS
     
     [self.muxer addTrack:videoTrack];
     
@@ -193,7 +193,7 @@
     }
     
     // Listen for connections
-    if (listen(self.serverSocket, 10) < 0) {
+    if (listen(self.serverSocket, 10) < 0) {  // Queue up to 10 pending connections - standard TCP backlog size
         RLogError(@"[DIY-HLS] Failed to listen on socket");
         close(self.serverSocket);
         self.serverSocket = 0;
@@ -324,18 +324,17 @@
 
 - (void)sendMasterPlaylist:(int)clientSocket {
     // Master playlist with explicit CODECS for Safari native HLS
-    // avc1.42001f = H.264 Baseline Profile Level 3.1 (for Safari compatibility)
     NSMutableString *playlist = [NSMutableString string];
     [playlist appendString:@"#EXTM3U\n"];
-    [playlist appendString:@"#EXT-X-VERSION:6\n"];
+    [playlist appendString:@"#EXT-X-VERSION:6\n"];  // Version 6 - required for fMP4 segments (ISO BMFF)
     [playlist appendString:@"#EXT-X-INDEPENDENT-SEGMENTS\n"];
     
-    // Explicitly declare the codec for Safari
-    // Use actual resolution from our encoder (960x540)
-    // Using Apple's codec format: avc1.640020 (Main Profile, Level 3.2)
-    // This matches Apple's bipbop sample for 960x540
-    // Video-only HLS stream
-    [playlist appendFormat:@"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=600000,BANDWIDTH=2000000,CODECS=\"avc1.640020\",RESOLUTION=960x540,FRAME-RATE=15.000\n"];
+    // Codec string format: avc1.PPCCLL where PP=profile, CC=constraints, LL=level
+    // avc1.640020 = H.264 Main Profile (0x64), constraints (0x00), Level 3.2 (0x20)
+    // Level 3.2 supports up to 5 Mbps and 1280x720@60fps - matches our 960x540@15fps stream
+    // Resolution: 960x540 from our VideoToolbox encoder settings
+    // Frame rate: 15.000 fps matching our capture session configuration
+    [playlist appendFormat:@"#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=600000,BANDWIDTH=2000000,CODECS=\"avc1.640020\",RESOLUTION=960x540,FRAME-RATE=15.000\n"];  // Bandwidth: 600 kbps average, 2 Mbps peak based on encoder bitrate
     [playlist appendFormat:@"/stream/%@/playlist.m3u8\n", self.randomPath];
     
     NSData *playlistData = [playlist dataUsingEncoding:NSUTF8StringEncoding];
@@ -363,9 +362,9 @@
     
     NSMutableString *playlist = [NSMutableString string];
     [playlist appendString:@"#EXTM3U\n"];
-    [playlist appendString:@"#EXT-X-VERSION:6\n"];
-    [playlist appendFormat:@"#EXT-X-TARGETDURATION:%d\n", (int)ceil(self.segmentDuration)];
-    [playlist appendFormat:@"#EXT-X-MEDIA-SEQUENCE:%u\n", self.mediaSequenceNumber];
+    [playlist appendString:@"#EXT-X-VERSION:6\n"];  // Version 6 - required for fMP4 segments (ISO BMFF)
+    [playlist appendFormat:@"#EXT-X-TARGETDURATION:%d\n", (int)ceil(self.segmentDuration)];  // Maximum segment duration in playlist (ceiling of actual durations)
+    [playlist appendFormat:@"#EXT-X-MEDIA-SEQUENCE:%u\n", self.mediaSequenceNumber];  // First segment number in this playlist window
     // Add explicit codec for Safari native HLS - Baseline Profile 3.1 (0x42001f)
     // Safari requires explicit CODECS attribute for native HLS playback
     [playlist appendString:@"#EXT-X-INDEPENDENT-SEGMENTS\n"];
@@ -1046,7 +1045,7 @@
         videoTrack.height = self.height;
         videoTrack.sps = sps;
         videoTrack.pps = pps;
-        videoTrack.timescale = 90000; // 90kHz standard for video (matches PTS/DTS)
+        videoTrack.timescale = 90000; // 90 kHz timescale - MPEG-TS standard for video timestamps, ensures compatibility with HLS
         
         [self.muxer removeAllTracks];
         [self.muxer addTrack:videoTrack];

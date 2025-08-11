@@ -1246,48 +1246,11 @@
         // Just show the base URL
         NSString *fullURL = baseURL;
         
-        // Calculate the actual text size
-        UIFont *urlFont = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
-        NSDictionary *attributes = @{NSFontAttributeName: urlFont};
-        CGSize textSize = [fullURL sizeWithAttributes:attributes];
+        // OLD HLS server UI code disabled - this was creating overlapping UI elements
+        // The DIY server uses displayDIYStreamingURLs() method instead
+        RLog(RptrLogAreaProtocol, @"Skipping old HLS server UI for URL: %@", fullURL);
         
-        // Add some padding to the width
-        CGFloat labelWidth = textSize.width + 10;
-        CGFloat labelX = self.view.frame.size.width - labelWidth - 30; // 30 for copy button
-        
-        // Create label with calculated width
-        UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(labelX, yOffset, labelWidth, 22)];
-        label.text = fullURL;
-        label.textColor = [UIColor whiteColor];
-        label.font = urlFont;
-        label.textAlignment = NSTextAlignmentRight;
-        label.adjustsFontSizeToFitWidth = NO;  // Don't shrink font
-        label.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-        [self.view addSubview:label];
-        [self.endpointLabels addObject:label];
-        
-        // Create copy button
-        UIButton *copyButton = [UIButton buttonWithType:UIButtonTypeCustom];
-        copyButton.frame = CGRectMake(self.view.frame.size.width - 25, yOffset, 20, 22);
-        
-        // Use system image instead of custom drawing to avoid ANR
-        if (@available(iOS 13.0, *)) {
-            UIImage *copyImage = [UIImage systemImageNamed:@"doc.on.doc"];
-            UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightRegular];
-            copyImage = [copyImage imageByApplyingSymbolConfiguration:config];
-            [copyButton setImage:copyImage forState:UIControlStateNormal];
-        } else {
-            // Fallback for older iOS versions
-            [copyButton setImage:[self copyIcon] forState:UIControlStateNormal];
-        }
-        copyButton.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.2];
-        copyButton.layer.cornerRadius = 4;
-        copyButton.tag = self.endpointLabels.count - 1;
-        [copyButton addTarget:self action:@selector(copyButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-        copyButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-        [self.view addSubview:copyButton];
-        [self.endpointCopyButtons addObject:copyButton];
-        
+        // Just increment yOffset to maintain any dependent layout
         yOffset += 22;
         
         // Only show first URL's endpoints
@@ -1395,45 +1358,99 @@
     }
     [self.endpointCopyButtons removeAllObjects];
     
-    // Display URLs in UI
-    CGFloat yOffset = 60;
-    CGFloat labelHeight = 25;
+    // Display URLs in UI - FORCE explicit positioning
+    CGFloat screenWidth = self.view.bounds.size.width;
+    CGFloat screenHeight = self.view.bounds.size.height;
+    RLogDIY(@"Screen dimensions: %.0f x %.0f", screenWidth, screenHeight);
+    
+    // Force position to be clearly different - move significantly inward
+    CGFloat topMargin = 80.0;  // Move down from top to be clearly visible
+    CGFloat labelHeight = 35;  // Height for larger font
+    CGFloat buttonWidth = 35;  // Square button for icon
     
     for (NSString *url in urls) {
-        // Create endpoint label
-        UILabel *endpointLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, yOffset, self.view.bounds.size.width - 80, labelHeight)];
+        // FORCE positions to be VERY different - aggressive inward positioning
+        CGFloat labelX = 100.0;  // Move 100 points from left - VERY noticeable
+        CGFloat labelWidth = screenWidth - 250.0;  // Much smaller width to ensure button fits
+        
+        RLogDIY(@"Label frame: x=%.0f, y=%.0f, w=%.0f, h=%.0f", labelX, topMargin, labelWidth, labelHeight);
+        
+        // Create endpoint label with hard-coded frame
+        UILabel *endpointLabel = [[UILabel alloc] initWithFrame:CGRectMake(labelX, topMargin, labelWidth, labelHeight)];
         endpointLabel.text = url;
         endpointLabel.textColor = [UIColor colorWithRed:0.0 green:1.0 blue:0.0 alpha:1.0];
-        endpointLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
-        endpointLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
+        endpointLabel.backgroundColor = [UIColor clearColor];  // Transparent background
+        endpointLabel.font = [UIFont monospacedSystemFontOfSize:18 weight:UIFontWeightMedium];  // Larger font
         endpointLabel.textAlignment = NSTextAlignmentLeft;
-        endpointLabel.layer.cornerRadius = 5;
-        endpointLabel.clipsToBounds = YES;
         endpointLabel.userInteractionEnabled = YES;
         endpointLabel.adjustsFontSizeToFitWidth = YES;
-        endpointLabel.minimumScaleFactor = 0.5;
+        endpointLabel.minimumScaleFactor = 0.7;
         
-        // Add padding
-        endpointLabel.text = [NSString stringWithFormat:@" %@", url];
+        // Add shadow for better visibility
+        endpointLabel.layer.shadowColor = [UIColor blackColor].CGColor;
+        endpointLabel.layer.shadowOffset = CGSizeMake(1, 1);
+        endpointLabel.layer.shadowOpacity = 0.8;
+        endpointLabel.layer.shadowRadius = 2.0;
         
         [self.view addSubview:endpointLabel];
         [self.endpointLabels addObject:endpointLabel];
         
-        // Create copy button
-        UIButton *copyButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        copyButton.frame = CGRectMake(self.view.bounds.size.width - 55, yOffset, 50, labelHeight);
-        [copyButton setTitle:@"Copy" forState:UIControlStateNormal];
-        copyButton.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-        [copyButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        copyButton.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.8];
-        copyButton.layer.cornerRadius = 5;
+        // FORCE button position to be clearly visible and different
+        CGFloat buttonX = screenWidth - 150.0;  // Move 150 points from right - VERY noticeable
+        
+        RLogDIY(@"Button frame: x=%.0f, y=%.0f, w=%.0f, h=%.0f", buttonX, topMargin, buttonWidth, labelHeight);
+        
+        // Create copy button with icon (two offset squares)
+        UIButton *copyButton = [UIButton buttonWithType:UIButtonTypeCustom];
+        copyButton.frame = CGRectMake(buttonX, topMargin, buttonWidth, labelHeight);
+        copyButton.backgroundColor = [UIColor clearColor];  // Transparent background
         copyButton.tag = self.endpointLabels.count - 1;
         [copyButton addTarget:self action:@selector(copyEndpoint:) forControlEvents:UIControlEventTouchUpInside];
+        
+        // Create copy icon using CAShapeLayer (two offset squares)
+        CAShapeLayer *copyIconLayer = [CAShapeLayer layer];
+        UIBezierPath *path = [UIBezierPath bezierPath];
+        
+        // First square (back)
+        CGFloat squareSize = 16;
+        CGFloat offset = 4;
+        CGFloat centerX = 17.5;  // Center in 35pt button
+        CGFloat centerY = 17.5;
+        
+        // Adjust vertical centering to align with text baseline
+        centerY = labelHeight / 2;  // Center vertically in button
+        
+        // Back square
+        [path moveToPoint:CGPointMake(centerX - squareSize/2 + offset, centerY - squareSize/2 + offset)];
+        [path addLineToPoint:CGPointMake(centerX + squareSize/2 + offset, centerY - squareSize/2 + offset)];
+        [path addLineToPoint:CGPointMake(centerX + squareSize/2 + offset, centerY + squareSize/2 + offset)];
+        [path addLineToPoint:CGPointMake(centerX - squareSize/2 + offset, centerY + squareSize/2 + offset)];
+        [path closePath];
+        
+        // Front square
+        [path moveToPoint:CGPointMake(centerX - squareSize/2, centerY - squareSize/2)];
+        [path addLineToPoint:CGPointMake(centerX + squareSize/2, centerY - squareSize/2)];
+        [path addLineToPoint:CGPointMake(centerX + squareSize/2, centerY + squareSize/2)];
+        [path addLineToPoint:CGPointMake(centerX - squareSize/2, centerY + squareSize/2)];
+        [path closePath];
+        
+        copyIconLayer.path = path.CGPath;
+        copyIconLayer.strokeColor = [UIColor whiteColor].CGColor;
+        copyIconLayer.fillColor = [UIColor clearColor].CGColor;
+        copyIconLayer.lineWidth = 2.0;
+        
+        // Add shadow to icon for visibility
+        copyIconLayer.shadowColor = [UIColor blackColor].CGColor;
+        copyIconLayer.shadowOffset = CGSizeMake(1, 1);
+        copyIconLayer.shadowOpacity = 0.8;
+        copyIconLayer.shadowRadius = 2.0;
+        
+        [copyButton.layer addSublayer:copyIconLayer];
         
         [self.view addSubview:copyButton];
         [self.endpointCopyButtons addObject:copyButton];
         
-        yOffset += labelHeight + 5;
+        topMargin += labelHeight + 10;  // More spacing for larger elements
         
         // Only show first URL's endpoints
         break;

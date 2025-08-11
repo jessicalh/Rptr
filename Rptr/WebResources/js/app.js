@@ -247,35 +247,35 @@ function initHLS() {
   }
   
   hls = new Hls({
-    debug: false, // Disable debug for production
-    enableWorker: true,
-    lowLatencyMode: false, // Disable aggressive low latency
-    liveBackBufferLength: 24, // Keep 24 seconds of back buffer (6 segments)
-    liveSyncDurationCount: 2, // Stay 2 segments (8 seconds) from edge
-    liveMaxLatencyDurationCount: 6, // Allow up to 6 segments latency (24 seconds)
-    maxBufferLength: 32, // Buffer up to 32 seconds (8 segments)
-    maxMaxBufferLength: 80, // Allow up to 80 seconds (20 segments)
-    maxBufferSize: 30 * 1024 * 1024, // 30 MB buffer size (reduced for mobile)
-    maxBufferHole: 0.5, // More tolerant of gaps
-    highBufferWatchdogPeriod: 3,
-    nudgeOffset: 0.5, // Less aggressive nudging
-    nudgeMaxRetry: 5,
-    maxFragLookUpTolerance: 0.5,
-    liveDurationInfinity: true,
-    startLevel: -1,
-    fragLoadingTimeOut: 30000, // 30 second timeout for 6-second segments
-    fragLoadingMaxRetry: 10,
-    fragLoadingRetryDelay: 2000, // 2 second retry delay
-    manifestLoadingTimeOut: 15000, // 15 second manifest timeout
-    manifestLoadingMaxRetry: 5,
-    manifestLoadingRetryDelay: 1000,
+    debug: false, // Disable debug logging for production
+    enableWorker: true,  // Use Web Worker for demuxing to prevent UI blocking
+    lowLatencyMode: false, // Disable aggressive low latency for stability
+    liveBackBufferLength: 24, // Keep 24 seconds of past video in buffer
+    liveSyncDurationCount: 2, // Target playback position: 2 segments from live edge
+    liveMaxLatencyDurationCount: 6, // Maximum allowed latency: 6 segments from live edge
+    maxBufferLength: 32, // Forward buffer: 32 seconds of upcoming video
+    maxMaxBufferLength: 80, // Maximum total buffer: 80 seconds
+    maxBufferSize: 30 * 1024 * 1024, // 30 MB buffer size limit for memory management
+    maxBufferHole: 0.5, // Skip gaps up to 0.5 seconds in buffer
+    highBufferWatchdogPeriod: 3,  // Check every 3 seconds if buffer is too high
+    nudgeOffset: 0.5, // Nudge playback by 0.5 seconds when catching up to live
+    nudgeMaxRetry: 5,  // Try nudging up to 5 times before giving up
+    maxFragLookUpTolerance: 0.5,  // Fragment lookup tolerance: 0.5 seconds
+    liveDurationInfinity: true,  // Treat live streams as having infinite duration
+    startLevel: -1,  // Auto-select quality level (-1 = automatic)
+    fragLoadingTimeOut: 30000, // Fragment load timeout: 30 seconds
+    fragLoadingMaxRetry: 10,  // Retry fragment loading up to 10 times
+    fragLoadingRetryDelay: 2000, // Wait 2 seconds between fragment retries
+    manifestLoadingTimeOut: 15000, // Playlist load timeout: 15 seconds
+    manifestLoadingMaxRetry: 5,  // Retry playlist loading up to 5 times
+    manifestLoadingRetryDelay: 1000,  // Wait 1 second between playlist retries
     // Additional settings to prevent stalling
-    initialLiveManifestSize: 2, // Wait for 2 segments before starting
-    stretchShortVideoTrack: true,
-    forceKeyFrameOnDiscontinuity: true,
+    initialLiveManifestSize: 2, // Wait for 2 segments in playlist before starting
+    stretchShortVideoTrack: true,  // Stretch video if duration mismatches audio
+    forceKeyFrameOnDiscontinuity: true,  // Force keyframe at discontinuities
     // Stall detection settings
-    stallDebounceMs: 1000,
-    jumpThreshold: 0.5
+    stallDebounceMs: 1000,  // Wait 1 second before declaring a stall
+    jumpThreshold: 0.5  // Jump forward if stalled for more than 0.5 seconds
   });
   
   setConnectionStatus('connecting');

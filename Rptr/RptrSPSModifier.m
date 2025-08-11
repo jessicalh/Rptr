@@ -20,6 +20,8 @@
     NSUInteger length = originalSPS.length;
     
     // Skip NAL header if present
+    // 0x27 = NAL type 7 (SPS) with forbidden_zero_bit=0, nal_ref_idc=1
+    // 0x67 = NAL type 7 (SPS) with forbidden_zero_bit=0, nal_ref_idc=3
     NSUInteger startOffset = 0;
     if (bytes[0] == 0x27 || bytes[0] == 0x67) {
         startOffset = 1;
@@ -29,9 +31,11 @@
     // For our typical 10-byte SPS, the vui_parameters_present_flag is in the last byte
     uint8_t lastByte = bytes[length - 1];
     
-    // Our SPS typically ends with 0x68 (0110 1000 in binary)
-    // The last '0' before the rbsp_trailing_bits (1000) is the vui_parameters_present_flag
-    // We need to change it to '1' and add VUI data
+    // Our SPS typically ends with 0x68 (binary: 0110 1000)
+    // Bit pattern breakdown:
+    // - Bits 0-3: 1000 = rbsp_trailing_bits (stop bit '1' followed by alignment '000')
+    // - Bit 4: 0 = vui_parameters_present_flag (needs to be set to 1)
+    // - Bits 5-7: 011 = other SPS fields
     
     NSMutableData *modifiedSPS = [NSMutableData dataWithData:originalSPS];
     
@@ -44,7 +48,8 @@
     // 2. Remove the rbsp_trailing_bits (1000) since we'll add them after VUI
     
     if (originalLastByte == 0x68) {
-        // Change to 0x6C (set vui_parameters_present_flag = 1, keep other bits)
+        // Change 0x68 to 0x6C: sets vui_parameters_present_flag from 0 to 1
+        // 0x68 = 0110 1000 -> 0x6C = 0110 1100 (bit 2 changed from 0 to 1)
         mutableBytes[length - 1] = 0x6C;
         
         // Now append minimal VUI parameters
@@ -61,13 +66,17 @@
         // video_signal_type_present_flag = 0
         // chroma_loc_info_present_flag = 0
         // timing_info_present_flag = 1
-        // First byte: 0000 0001 (only timing_info_present_flag set)
+        // VUI flags byte: 0x01 = 0000 0001
+        // Bit 0: timing_info_present_flag = 1 (we're adding timing info)
+        // Bits 1-7: all other VUI flags = 0 (not present)
         uint8_t vuiByte1 = 0x01;
         [vuiBuffer appendBytes:&vuiByte1 length:1];
         
-        // Now add timing information
-        // num_units_in_tick (32 bits) - for 15 fps: 1000
-        // time_scale (32 bits) - for 15 fps: 30000 (15 * 2 * 1000)
+        // Timing information per H.264 spec Annex E.1.1:
+        // Frame rate = time_scale / (2 * num_units_in_tick)
+        // For 15 fps: 30000 / (2 * 1000) = 15
+        // num_units_in_tick = 1000 (clock ticks between frames/2)
+        // time_scale = frameRate * 2 * 1000 (total ticks per second)
         uint32_t num_units_in_tick = 1000;
         uint32_t time_scale = (uint32_t)(frameRate * 2 * 1000);
         
@@ -83,8 +92,10 @@
         // vcl_hrd_parameters_present_flag = 0
         // pic_struct_present_flag = 0
         // bitstream_restriction_flag = 0
-        // Then rbsp_trailing_bits (10000000)
-        uint8_t vuiEnd = 0x80; // 1000 0000 (rbsp_stop_bit + alignment)
+        // RBSP trailing bits per H.264 spec 7.3.2.1.1:
+        // First bit = 1 (rbsp_stop_one_bit)
+        // Remaining bits = 0 (rbsp_alignment_zero_bit) to byte-align
+        uint8_t vuiEnd = 0x80; // 1000 0000
         [vuiBuffer appendBytes:&vuiEnd length:1];
         
         // Append VUI data to modified SPS
@@ -100,9 +111,9 @@
         
         return modifiedSPS;
     } else if (originalLastByte == 0xBF) {
-        // For Baseline profile SPS ending with 0xBF (1011 1111)
-        // This indicates vui_parameters_present_flag might already be 1
-        // or the structure is different
+        // SPS ending with 0xBF (binary: 1011 1111)
+        // This pattern suggests vui_parameters_present_flag may already be set
+        // or indicates a different profile/level combination
         RLogDIY(@"[SPS-MODIFIER] SPS ends with 0x%02X, might have different structure", originalLastByte);
         
         // Try a different approach for 0xBF ending
@@ -146,8 +157,9 @@
     
     // Basic analysis
     uint8_t nalHeader = bytes[0];
-    if (nalHeader == 0x27 || nalHeader == 0x67) {
-        uint8_t profile = bytes[1];
+    // NAL header format: forbidden_zero_bit (1) | nal_ref_idc (2) | nal_unit_type (5)
+    if (nalHeader == 0x27 || nalHeader == 0x67) {  // Both are NAL type 7 (SPS)
+        uint8_t profile = bytes[1];  // profile_idc field from SPS
         uint8_t constraints = bytes[2];
         uint8_t level = bytes[3];
         

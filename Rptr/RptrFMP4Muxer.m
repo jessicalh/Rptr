@@ -125,13 +125,14 @@
 - (NSData *)createFtypBox {
     NSMutableData *ftyp = [NSMutableData data];
     
-    // Match Apple's ftyp box for better compatibility
-    [self writeFourCC:@"mp42" to:ftyp];     // Major brand - mp42 like Apple's
-    [self writeUInt32:1 to:ftyp];            // Minor version 1
-    [self writeFourCC:@"mp41" to:ftyp];     // Compatible brands
-    [self writeFourCC:@"mp42" to:ftyp];
-    [self writeFourCC:@"isom" to:ftyp];
-    [self writeFourCC:@"hlsf" to:ftyp];     // HLS fragmented
+    // File type box - identifies this as an MP4 file compatible with HLS
+    // mp42 = ISO Base Media File Format v2 - standard for HLS fragmented MP4
+    [self writeFourCC:@"mp42" to:ftyp];     // Major brand - ISO MP4 v2 spec
+    [self writeUInt32:1 to:ftyp];            // Minor version 1 - indicates file format version
+    [self writeFourCC:@"mp41" to:ftyp];     // Compatible with ISO MP4 v1
+    [self writeFourCC:@"mp42" to:ftyp];     // Compatible with ISO MP4 v2
+    [self writeFourCC:@"isom" to:ftyp];     // ISO Base Media File Format
+    [self writeFourCC:@"hlsf" to:ftyp];     // HLS fragmented MP4 - Apple-specific brand for fMP4 HLS
     
     return [self wrapInBox:@"ftyp" data:ftyp];
 }
@@ -164,19 +165,20 @@
     
     [self writeUInt32:0 to:mvhd];          // Creation time
     [self writeUInt32:0 to:mvhd];          // Modification time
-    [self writeUInt32:90000 to:mvhd];      // Timescale (90kHz for video)
-    [self writeUInt32:0 to:mvhd];          // Duration (0 for live)
+    [self writeUInt32:90000 to:mvhd];      // Timescale - 90000 Hz (90 kHz) standard for MPEG-TS compatibility
+    [self writeUInt32:0 to:mvhd];          // Duration - 0 for live streams (unknown duration)
     
-    [self writeUInt32:0x00010000 to:mvhd]; // Rate (1.0)
-    [self writeUInt16:0x0100 to:mvhd];     // Volume (1.0)
+    [self writeUInt32:0x00010000 to:mvhd]; // Playback rate - 0x00010000 = 1.0 in 16.16 fixed-point
+    [self writeUInt16:0x0100 to:mvhd];     // Volume - 0x0100 = 1.0 in 8.8 fixed-point format
     [self writeUInt16:0 to:mvhd];          // Reserved
     [self writeUInt32:0 to:mvhd];          // Reserved
     [self writeUInt32:0 to:mvhd];          // Reserved
     
-    // Matrix (identity)
-    [self writeUInt32:0x00010000 to:mvhd]; [self writeUInt32:0 to:mvhd]; [self writeUInt32:0 to:mvhd];
-    [self writeUInt32:0 to:mvhd]; [self writeUInt32:0x00010000 to:mvhd]; [self writeUInt32:0 to:mvhd];
-    [self writeUInt32:0 to:mvhd]; [self writeUInt32:0 to:mvhd]; [self writeUInt32:0x40000000 to:mvhd];
+    // Transformation matrix - identity matrix for no transformation
+    // Format: 3x3 matrix in 16.16 fixed-point (except last row which is 2.30 fixed-point)
+    [self writeUInt32:0x00010000 to:mvhd]; [self writeUInt32:0 to:mvhd]; [self writeUInt32:0 to:mvhd];  // [1.0, 0, 0]
+    [self writeUInt32:0 to:mvhd]; [self writeUInt32:0x00010000 to:mvhd]; [self writeUInt32:0 to:mvhd];  // [0, 1.0, 0]
+    [self writeUInt32:0 to:mvhd]; [self writeUInt32:0 to:mvhd]; [self writeUInt32:0x40000000 to:mvhd];  // [0, 0, 1.0] - 0x40000000 = 1.0 in 2.30 format
     
     // Pre-defined
     for (int i = 0; i < 6; i++) {
@@ -431,8 +433,8 @@
     [self writeUInt16:track.width to:avc1];
     [self writeUInt16:track.height to:avc1];
     
-    [self writeUInt32:0x00480000 to:avc1]; // H resolution (72 dpi)
-    [self writeUInt32:0x00480000 to:avc1]; // V resolution (72 dpi)
+    [self writeUInt32:0x00480000 to:avc1]; // Horizontal resolution - 0x00480000 = 72.0 DPI in 16.16 fixed-point
+    [self writeUInt32:0x00480000 to:avc1]; // Vertical resolution - 0x00480000 = 72.0 DPI in 16.16 fixed-point
     
     [self writeUInt32:0 to:avc1];          // Reserved
     [self writeUInt16:1 to:avc1];          // Frame count
@@ -442,8 +444,8 @@
         [self writeUInt8:0 to:avc1];
     }
     
-    [self writeUInt16:0x0018 to:avc1];     // Depth
-    [self writeUInt16:0xFFFF to:avc1];     // Pre-defined
+    [self writeUInt16:0x0018 to:avc1];     // Color depth - 0x0018 = 24 bits (standard RGB)
+    [self writeUInt16:0xFFFF to:avc1];     // Pre-defined - always -1 (0xFFFF) per ISO spec
     
     // Add avcC box with SPS/PPS
     if (track.sps && track.pps) {
@@ -476,15 +478,15 @@
     
     NSMutableData *avcC = [NSMutableData data];
     
-    [self writeUInt8:1 to:avcC];           // Configuration version
+    [self writeUInt8:1 to:avcC];           // Configuration version - always 1 for avcC format
     
     // Check if SPS is valid and has enough bytes
     if (sps.length < 4) {
         RLogError(@"[FMP4-MUXER] SPS too short: %lu bytes", (unsigned long)sps.length);
         // Use default values for baseline profile
-        [self writeUInt8:0x42 to:avcC];    // Profile (Baseline)
-        [self writeUInt8:0x00 to:avcC];    // Profile compatibility
-        [self writeUInt8:0x1E to:avcC];    // Level 3.0
+        [self writeUInt8:0x42 to:avcC];    // Profile - 0x42 = 66 = Baseline Profile
+        [self writeUInt8:0x00 to:avcC];    // Profile compatibility - no constraints
+        [self writeUInt8:0x1E to:avcC];    // Level - 0x1E = 30 = Level 3.0
     } else {
         const uint8_t *spsBytes = [sps bytes];
         // SPS NALU starts with header byte, profile is at index 1
@@ -492,15 +494,15 @@
         [self writeUInt8:spsBytes[2] to:avcC]; // Profile compatibility
         [self writeUInt8:spsBytes[3] to:avcC]; // Level
     }
-    [self writeUInt8:0xFF to:avcC];        // Length size minus one (4 bytes)
+    [self writeUInt8:0xFF to:avcC];        // NALU length size minus one - 0xFF = 3, so 4-byte length prefixes
     
     // SPS
-    [self writeUInt8:0xE1 to:avcC];        // Number of SPS (1)
+    [self writeUInt8:0xE1 to:avcC];        // Number of SPS NALUs - 0xE1 = 0b11100001, lower 5 bits = 1 SPS
     [self writeUInt16:sps.length to:avcC];
     [avcC appendData:sps];
     
     // PPS
-    [self writeUInt8:1 to:avcC];           // Number of PPS
+    [self writeUInt8:1 to:avcC];           // Number of PPS NALUs - 1 PPS
     [self writeUInt16:pps.length to:avcC];
     [avcC appendData:pps];
     
@@ -524,19 +526,19 @@
     for (int i = 0; i < 6; i++) {
         [self writeUInt8:0 to:mp4a];
     }
-    [self writeUInt16:1 to:mp4a];          // Data reference index
+    [self writeUInt16:1 to:mp4a];          // Data reference index - points to first entry in dref box
     
     // Audio specific
     [self writeUInt32:0 to:mp4a];          // Reserved
     [self writeUInt32:0 to:mp4a];          // Reserved
     
     [self writeUInt16:track.channelCount to:mp4a];
-    [self writeUInt16:16 to:mp4a];         // Sample size
+    [self writeUInt16:16 to:mp4a];         // Sample size - 16 bits per sample (standard for AAC)
     
     [self writeUInt16:0 to:mp4a];          // Pre-defined
     [self writeUInt16:0 to:mp4a];          // Reserved
     
-    [self writeUInt32:(uint32_t)(track.sampleRate << 16) to:mp4a]; // Sample rate (16.16)
+    [self writeUInt32:(uint32_t)(track.sampleRate << 16) to:mp4a]; // Sample rate in 16.16 fixed-point format (e.g., 48000 Hz << 16)
     
     // Add esds box with audio config
     if (track.audioSpecificConfig) {
@@ -761,7 +763,7 @@
     
     // Add tfhd (track fragment header)
     NSMutableData *tfhd = [NSMutableData data];
-    uint32_t tfhdFlags = 0x020000; // Default base is moof
+    uint32_t tfhdFlags = 0x020000; // 0x020000 = default-base-is-moof flag - data offsets relative to moof start
     [self writeUInt8:0 to:tfhd];           // Version
     [self writeUInt8:(tfhdFlags >> 16) & 0xFF to:tfhd];  // Flags
     [self writeUInt8:(tfhdFlags >> 8) & 0xFF to:tfhd];
@@ -773,7 +775,7 @@
     if (samples.count > 0) {
         RptrFMP4Sample *firstSample = samples[0];
         NSMutableData *tfdt = [NSMutableData data];
-        [self writeUInt8:1 to:tfdt];       // Version 1 (64-bit)
+        [self writeUInt8:1 to:tfdt];       // Version 1 - use 64-bit baseMediaDecodeTime for large timestamps
         [self writeUInt8:0 to:tfdt];       // Flags
         [self writeUInt16:0 to:tfdt];
         
@@ -788,7 +790,7 @@
             
             // Calculate time offset from stream start
             CMTime relativeTime = CMTimeSubtract(firstSample.decodeTime, self.streamStartTime);
-            // Convert to 90kHz timescale
+            // Convert to 90 kHz timescale - standard for MPEG-TS/HLS video timestamps
             CMTime relativeTimeScaled = CMTimeConvertScale(relativeTime, 90000, kCMTimeRoundingMethod_RoundTowardZero);
             decodeTime = (uint64_t)relativeTimeScaled.value;
             
@@ -816,9 +818,13 @@
                       baseDataOffset:(uint32_t)baseDataOffset {
     NSMutableData *trun = [NSMutableData data];
     
-    // Flags: data-offset (0x01), sample-duration (0x100), sample-size (0x200), sample-flags (0x400)
-    // No composition-time-offset (we don't have B-frames)
-    uint32_t flags = 0x000701;  // data-offset + duration + size + flags
+    // Trun flags bitmap: 
+    // 0x000001 = data-offset present
+    // 0x000100 = sample-duration present
+    // 0x000200 = sample-size present
+    // 0x000400 = sample-flags present
+    // 0x000800 = sample-composition-time-offset (not used - no B-frames)
+    uint32_t flags = 0x000701;  // 0x01 + 0x100 + 0x200 + 0x400 = all fields except composition offset
     
     [self writeUInt8:0 to:trun];           // Version 0
     [self writeUInt8:(flags >> 16) & 0xFF to:trun]; // Flags
@@ -839,11 +845,11 @@
         if (i < samples.count - 1) {
             RptrFMP4Sample *nextSample = samples[i + 1];
             CMTime diff = CMTimeSubtract(nextSample.decodeTime, sample.decodeTime);
-            CMTime diffScaled = CMTimeConvertScale(diff, 90000, kCMTimeRoundingMethod_RoundTowardZero);
+            CMTime diffScaled = CMTimeConvertScale(diff, 90000, kCMTimeRoundingMethod_RoundTowardZero);  // Convert to 90 kHz units
             duration = (uint32_t)diffScaled.value;
         } else {
             // Last sample - use the sample's duration
-            CMTime durationScaled = CMTimeConvertScale(sample.duration, 90000, kCMTimeRoundingMethod_RoundTowardZero);
+            CMTime durationScaled = CMTimeConvertScale(sample.duration, 90000, kCMTimeRoundingMethod_RoundTowardZero);  // Convert to 90 kHz units
             duration = (uint32_t)durationScaled.value;
         }
         [self writeUInt32:duration to:trun];
@@ -851,22 +857,24 @@
         // Sample size - use actual AVCC data size
         [self writeUInt32:(uint32_t)sample.data.length to:trun];
         
-        // Sample flags for H.264:
-        // is_leading (2 bits): 00 = unknown
-        // sample_depends_on (2 bits): 01 = depends on others (P-frame), 02 = does not depend (I-frame)
-        // sample_is_depended_on (2 bits): 01 = is depended on
-        // sample_has_redundancy (2 bits): 00 = unknown
-        // sample_padding_value (3 bits): 000
-        // sample_is_non_sync_sample (1 bit): 0 = sync (I-frame), 1 = non-sync (P-frame)
-        // sample_degradation_priority (16 bits): 0
+        // Sample flags bitmap (ISO/IEC 14496-12 Section 8.8.3.1):
+        // Bits 0-1: reserved = 00
+        // Bits 2-3: is_leading: 00 = unknown leading status
+        // Bits 4-5: sample_depends_on: 01 = depends on others (P-frame), 10 = does not depend (I-frame)
+        // Bits 6-7: sample_is_depended_on: 01 = other samples depend on this one
+        // Bits 8-9: sample_has_redundancy: 00 = unknown redundancy
+        // Bits 10-12: sample_padding_value: 000 = no padding
+        // Bit 13: sample_is_non_sync_sample: 0 = sync sample (I-frame), 1 = non-sync (P-frame)
+        // Bits 14-15: reserved = 00
+        // Bits 16-31: sample_degradation_priority: 0x0000 = no degradation priority
         
         uint32_t sampleFlags;
         if (sample.isSync) {
-            // I-frame: does not depend on others, is depended on, is sync
-            sampleFlags = 0x02010000;  // Binary: 0000 0010 0000 0001 0000 0000 0000 0000
+            // I-frame (sync sample): does not depend on others, is depended on, is sync
+            sampleFlags = 0x02010000;  // depends_on=10, is_depended_on=01, is_sync=0
         } else {
-            // P-frame: depends on others, is depended on, is non-sync
-            sampleFlags = 0x01010001;  // Binary: 0000 0001 0000 0001 0000 0000 0000 0001
+            // P-frame (non-sync): depends on others, is depended on, is non-sync  
+            sampleFlags = 0x01010001;  // depends_on=01, is_depended_on=01, is_non_sync=1
         }
         [self writeUInt32:sampleFlags to:trun];
     }
@@ -895,7 +903,7 @@
     NSUInteger length = avccData.length;
     NSUInteger offset = 0;
     
-    // Annex B start code
+    // Annex B start code - 0x00000001 is the H.264 NALU delimiter per ITU-T H.264 spec
     const uint8_t startCode[] = {0x00, 0x00, 0x00, 0x01};
     
     while (offset + 4 <= length) {
